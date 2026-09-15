@@ -46,6 +46,8 @@ const Session = struct {
     mcp_registry: ?*mcp_mod.Registry = null,
     skills: ?skills_mod.Catalog = null,
     executions: ?*executions_mod.Registry = null,
+    /// Stage of the most recent blocked lifecycle review (M2-T03 override target).
+    last_blocked_stage: ?[]const u8 = null,
 };
 
 pub fn run(
@@ -626,6 +628,8 @@ fn handleCommand(
             \\  /agents               list subagent reports
             \\  /mcp                  list MCP servers/tools
             \\  /exec                 list background executions
+            \\  /review override <r>  override last blocked review (audited)
+            \\  /reconcile <path>     spawn reconciliation agent for a path
             \\  /usage                session token usage
             \\  /compact              compact the conversation context
             \\  /sessions             list sessions (use `ifnh resume <id>`)
@@ -677,16 +681,22 @@ fn handleCommand(
             out(io, "usage: /lifecycle run <file.json>\n", .{}) catch {};
             return .none;
         }
-        const file_path = std.mem.trim(u8, rest[4..], " \t");
-        const text = fsutil.readSmallFile(cwd, io, arena, file_path, 256 * 1024) catch {
-            out(io, "cannot read {s}\n", .{file_path}) catch {};
+        var file_part = std.mem.trim(u8, rest[4..], " \t");
+        var start_stage: usize = 0;
+        if (std.mem.indexOf(u8, file_part, "--from ")) |pos| {
+            const stage_name = std.mem.trim(u8, file_part[pos + 7 ..], " \t");
+            file_part = std.mem.trim(u8, file_part[0..pos], " \t");
+            start_stage = std.fmt.parseInt(usize, stage_name, 10) catch 0;
+        }
+        const text = fsutil.readSmallFile(cwd, io, arena, file_part, 256 * 1024) catch {
+            out(io, "cannot read {s}\n", .{file_part}) catch {};
             return .none;
         };
         const lc = lifecycle_mod.parse(arena, text) catch {
-            out(io, "invalid lifecycle file {s}\n", .{file_path}) catch {};
+            out(io, "invalid lifecycle file {s}\n", .{file_part}) catch {};
             return .none;
         };
-        out(io, "running lifecycle '{s}' ({d} stages)\n", .{ lc.name, lc.stages.len }) catch {};
+        out(io, "running lifecycle '{s}' ({d} stages, from {d})\n", .{ lc.name, lc.stages.len, start_stage }) catch {};
 
         // Build a host for lifecycle children (reuses the turn host pieces).
         var cancel2 = std.atomic.Value(bool).init(false);
@@ -729,7 +739,7 @@ fn handleCommand(
             },
             .session_hint = sess.store.manifest.id,
         };
-        const outcomes = lifecycle_mod.run(arena, io, &host2, lc, 0, .{
+        const outcomes = lifecycle_mod.run(arena, io, &host2, lc, start_stage, .{
             .ctx = io.userdata.?,
             .on_stage_start = struct {
                 fn f(_: *anyopaque, stage: []const u8, role: []const u8) void {

@@ -464,6 +464,41 @@ pub const Journal = struct {
         }
     }
 
+    /// Collect the distinct content versions the journal holds for `path`
+    /// (before/after images across all groups). Used by the reconciliation
+    /// flow to present conflicting implementations (D045/046).
+    pub fn versionsForPath(self: *Journal, arena: std.mem.Allocator, path: []const u8) ![][]const u8 {
+        const text = try fsutil.readSmallFile(self.dir, self.io, arena, "journal.jsonl", max_journal_bytes);
+        var out: std.ArrayListUnmanaged([]const u8) = .empty;
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0 or std.mem.indexOf(u8, line, path) == null) continue;
+            const v = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch continue;
+            if (v != .object) continue;
+            const ops_v = v.object.get("ops") orelse continue;
+            if (ops_v != .array) continue;
+            for (ops_v.array.items) |op| {
+                if (op != .object) continue;
+                const p = op.object.get("path") orelse continue;
+                if (p != .string or !std.mem.eql(u8, p.string, path)) continue;
+                for ([_][]const u8{ "before", "after" }) |key| {
+                    if (op.object.get(key)) |content| {
+                        if (content != .string or content.string.len == 0) continue;
+                        var dup = false;
+                        for (out.items) |existing| {
+                            if (std.mem.eql(u8, existing, content.string)) {
+                                dup = true;
+                                break;
+                            }
+                        }
+                        if (!dup) try out.append(arena, content.string);
+                    }
+                }
+            }
+        }
+        return out.items;
+    }
+
     pub fn canUndo(self: *const Journal) bool {
         return self.undo_stack.items.len > 0;
     }
@@ -620,4 +655,28 @@ test "journal refuses unsafe paths and oversized images" {
     try std.testing.expectError(error.PathUnsafe, j.apply("x", &.{.{ .create = .{ .path = "/abs/path.txt", .after = "pwn" } }}));
     const big = "x" ** (max_before_image_bytes + 1);
     try std.testing.expectError(error.NotJournalable, j.apply("x", &.{.{ .create = .{ .path = "big.txt", .after = big } }}));
+}
+
+test "versionsForPath collects distinct competing versions" {
+    const io = std.testing.io;
+    var ts = try tmpJournal();
+    defer ts.tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try ts.dir.writeFile(io, .{ .sub_path = "x.txt", .data = "base" });
+    var j = try Journal.open(io, arena, ts.dir);
+    defer j.close();
+
+    try j.apply("a", &.{.{ .write = .{ .path = "x.txt", .before = "base", .after = "version-one" } }});
+    _ = try j.undo();
+    try j.apply("b", &.{.{ .write = .{ .path = "x.txt", .before = "base", .after = "version-two" } }});
+
+    const versions = try j.versionsForPath(arena, "x.txt");
+    // base, version-one, version-two — deduped.
+    try std.testing.expectEqual(@as(usize, 3), versions.len);
+    try std.testing.expectEqualStrings("base", versions[0]);
+    try std.testing.expectEqualStrings("version-one", versions[1]);
+    try std.testing.expectEqualStrings("version-two", versions[2]);
 }
