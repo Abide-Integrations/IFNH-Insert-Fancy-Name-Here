@@ -21,6 +21,7 @@ const skills_mod = @import("../core/skills.zig");
 const hooks_mod = @import("../core/hooks.zig");
 const compaction_mod = @import("../core/compaction.zig");
 const lifecycle_mod = @import("../core/lifecycle.zig");
+const executions_mod = @import("../core/executions.zig");
 const tool_mod = @import("../tools/tool.zig");
 const core_types = @import("../core/types.zig");
 const openai = @import("../providers/openai.zig");
@@ -44,6 +45,7 @@ const Session = struct {
     overrides: std.ArrayListUnmanaged(struct { path: []const u8, json: []const u8 }) = .empty,
     mcp_registry: ?*mcp_mod.Registry = null,
     skills: ?skills_mod.Catalog = null,
+    executions: ?*executions_mod.Registry = null,
 };
 
 pub fn run(
@@ -82,6 +84,7 @@ pub fn run(
         }
     };
     defer {
+        if (sess.executions) |reg| reg.deinit(); // kill background children (I125)
         if (sess.mcp_registry) |reg| reg.deinit();
         sess.store.close();
         sess.journal.close();
@@ -92,6 +95,13 @@ pub fn run(
         const user_dir = std.fmt.allocPrint(arena, "{s}/.config/ifnh/skills", .{environ.get("HOME") orelse ""}) catch break :blk null;
         const catalog = skills_mod.discover(cwd, io, arena, user_dir) catch break :blk null;
         break :blk catalog;
+    };
+
+    // ---- background executions (I123-125) ----
+    sess.executions = blk: {
+        const reg = arena.create(executions_mod.Registry) catch break :blk null;
+        reg.* = executions_mod.Registry.init(io, arena, cwd);
+        break :blk reg;
     };
 
     // ---- MCP registry (lazy servers, J137/138) ----
@@ -256,6 +266,9 @@ fn submitTurn(
         .mcp_ctx = sess.mcp_registry orelse mcp_registry_sentinel,
         .skill_load_fn = skillLoadHook,
         .skill_ctx = sess,
+        .exec_start_fn = execStartHook,
+        .exec_query_fn = execQueryHook,
+        .exec_ctx = sess,
     };
     tool_ctx.approval_ctx = &approver;
     tool_ctx.approval_fn = Approver.approve;
@@ -463,6 +476,58 @@ fn mcpListHook(ctx: *anyopaque, arena: std.mem.Allocator) []const u8 {
     return buf.items;
 }
 
+fn execStartHook(ctx: *anyopaque, arena: std.mem.Allocator, command: []const u8) []const u8 {
+    const sess: *Session = @ptrCast(@alignCast(ctx));
+    const reg = sess.executions orelse return "error: background executions unavailable";
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    argv.append(arena, "/bin/sh") catch return "error: oom";
+    argv.append(arena, "-c") catch return "error: oom";
+    argv.append(arena, command) catch return "error: oom";
+    const id = reg.start(argv.items) catch |err| {
+        return std.fmt.allocPrint(arena, "error: start failed: {s}", .{@errorName(err)}) catch "error: start failed";
+    };
+    return std.fmt.allocPrint(arena, "started background execution {d}; poll with exec action=status id={d}, output with action=output", .{ id, id }) catch "started";
+}
+
+fn execQueryHook(ctx: *anyopaque, arena: std.mem.Allocator, action: []const u8, id_str: []const u8) []const u8 {
+    const sess: *Session = @ptrCast(@alignCast(ctx));
+    const reg = sess.executions orelse return "error: background executions unavailable";
+    const id = std.fmt.parseInt(u32, id_str, 10) catch {
+        if (std.mem.eql(u8, action, "list")) {
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            for (&reg.slots) |*s| {
+                if (!s.used) continue;
+                buf.print(arena, "  exec {d}: {s}\n", .{ s.id, s.command[0..s.command_len] }) catch {};
+            }
+            if (buf.items.len == 0) return "no background executions";
+            return buf.items;
+        }
+        return "error: exec requires numeric id";
+    };
+    if (std.mem.eql(u8, action, "status")) {
+        const snap = reg.snapshot(id) orelse return "error: unknown execution id";
+        return std.fmt.allocPrint(arena, "exec {d}: {s} (exit: {any}), {d} bytes output in {s}", .{
+            snap.id, @tagName(snap.state), snap.exit_code, snap.output_bytes, snap.output_file,
+        }) catch "error: oom";
+    }
+    if (std.mem.eql(u8, action, "output")) {
+        return reg.readOutput(id, arena, 32 * 1024) orelse "error: no output available";
+    }
+    if (std.mem.eql(u8, action, "stop")) {
+        return if (reg.stop(id)) "stopped" else "error: unknown execution id";
+    }
+    return "error: unknown action (status|output|stop|list)";
+}
+
+fn u8ToStateLocal(v: u8) executions_mod.State {
+    return switch (v) {
+        1 => .completed,
+        2 => .stopped,
+        3 => .failed_spawn,
+        else => .running,
+    };
+}
+
 fn skillLoadHook(ctx: *anyopaque, arena: std.mem.Allocator, name: []const u8) ?[]const u8 {
     const sess: *Session = @ptrCast(@alignCast(ctx));
     const catalog = sess.skills orelse return null;
@@ -560,6 +625,7 @@ fn handleCommand(
             \\  /plan <title>         create a plan artifact in .ifnh/plans/
             \\  /agents               list subagent reports
             \\  /mcp                  list MCP servers/tools
+            \\  /exec                 list background executions
             \\  /usage                session token usage
             \\  /compact              compact the conversation context
             \\  /sessions             list sessions (use `ifnh resume <id>`)
@@ -694,6 +760,16 @@ fn handleCommand(
                 if (o.blockers > 0) " (blockers)" else "",
             }) catch {};
         }
+    } else if (std.mem.eql(u8, cmd, "exec")) {
+        if (sess.executions) |reg| {
+            _ = reg.reap();
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            for (&reg.slots) |*s| {
+                if (!s.used) continue;
+                buf.print(arena, "  exec {d}: {s} [{s}]\n", .{ s.id, s.command[0..s.command_len], @tagName(u8ToStateLocal(s.state.load(.acquire))) }) catch {};
+            }
+            if (buf.items.len == 0) out(io, "no background executions\n", .{}) catch {} else out(io, "{s}", .{buf.items}) catch {};
+        } else out(io, "background executions unavailable\n", .{}) catch {};
     } else if (std.mem.eql(u8, cmd, "usage")) {
         var total_in: u64 = 0;
         var total_out: u64 = 0;

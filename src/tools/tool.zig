@@ -47,6 +47,10 @@ pub const ToolContext = struct {
     /// Subagent runtime hook (wired by the host; null disables spawning).
     agent_spawn_fn: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, parent_depth: usize, arguments_json: []const u8) AgentSpawnResult = null,
     agent_spawn_ctx: ?*anyopaque = null,
+    /// Background-execution hooks (wired by the host; null disables them).
+    exec_start_fn: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, command: []const u8) []const u8 = null,
+    exec_query_fn: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, action: []const u8, id: []const u8) []const u8 = null,
+    exec_ctx: ?*anyopaque = null,
     /// Skill loader hook (wired by the host; null disables the tool).
     skill_load_fn: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, name: []const u8) ?[]const u8 = null,
     skill_ctx: ?*anyopaque = null,
@@ -121,6 +125,12 @@ pub const specs = [_]Spec{
     .{ .name = "agent", .description = "Delegate a self-contained task to a child agent. Roles: research (read-only), implement (may edit), review (read-only findings). The child works independently and returns a summary; its full report is stored under .ifnh/reports/.", .parameters_json =
     \\{"type":"object","properties":{"task":{"type":"string"},"role":{"type":"string","enum":["research","implement","review"]},"model":{"type":"string"}},"required":["task","role"]}
     },
+    .{ .name = "exec", .description = "Manage background executions: status/output/stop/list by execution id.", .parameters_json =
+    \\{"type":"object","properties":{"action":{"type":"string","enum":["status","output","stop","list"]},"id":{"type":"integer"}},"required":["action"]}
+    },
+    .{ .name = "read_tool_result", .description = "Read a stored oversized tool output artifact by id, with optional offset/limit paging.", .parameters_json =
+    \\{"type":"object","properties":{"id":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["id"]}
+    },
     .{ .name = "git", .description = "Run a git subcommand in the workspace (porcelain operations only).", .parameters_json =
     \\{"type":"object","properties":{"args":{"type":"array","items":{"type":"string"}}},"required":["args"]}
     },
@@ -194,7 +204,8 @@ pub fn execute(name: []const u8, args_json: []const u8, ctx: *ToolContext) ToolR
         return toolWrite(path, content, ctx);
     } else if (std.mem.eql(u8, name, "bash")) {
         const command = a.str("command") orelse return errResult(ctx.arena, "bash: missing command", .{});
-        return toolBash(command, ctx);
+        const background = if (a.obj.get("background")) |b| (b == .bool and b.bool) else false;
+        return toolBash(command, background, ctx);
     } else if (std.mem.eql(u8, name, "skill")) {
         const load_fn = ctx.skill_load_fn orelse
             return errResult(ctx.arena, "skill: skills not available", .{});
@@ -202,6 +213,23 @@ pub fn execute(name: []const u8, args_json: []const u8, ctx: *ToolContext) ToolR
         const body = load_fn(ctx.skill_ctx orelse ctx.approval_ctx, ctx.arena, skill_name) orelse
             return errResult(ctx.arena, "skill: '{s}' not found in catalog", .{skill_name});
         return .{ .output = body, .status = .ok };
+    } else if (std.mem.eql(u8, name, "exec")) {
+        const query_fn = ctx.exec_query_fn orelse
+            return errResult(ctx.arena, "exec: background executions not available", .{});
+        const action = a.str("action") orelse return errResult(ctx.arena, "exec: missing action", .{});
+        var id_buf: [32]u8 = undefined;
+        var id_str: []const u8 = "";
+        if (a.obj.get("id")) |idv| {
+            switch (idv) {
+                .integer => |n| id_str = std.fmt.bufPrint(&id_buf, "{d}", .{n}) catch "",
+                .string => |s| id_str = s,
+                else => {},
+            }
+        }
+        return .{ .output = query_fn(ctx.exec_ctx orelse ctx.approval_ctx, ctx.arena, action, id_str), .status = .ok };
+    } else if (std.mem.eql(u8, name, "read_tool_result")) {
+        const artifact_id = a.str("id") orelse return errResult(ctx.arena, "read_tool_result: missing id", .{});
+        return toolReadResult(artifact_id, a.int("offset"), a.int("limit"), ctx);
     } else if (std.mem.eql(u8, name, "mcp_list")) {
         const list_fn = ctx.mcp_list_fn orelse
             return errResult(ctx.arena, "mcp_list: MCP not configured", .{});
@@ -486,6 +514,50 @@ fn commitMutation(ctx: *ToolContext, path: []const u8, before: []const u8, after
     }
 }
 
+// ---------------------------------------------------------------- artifacts
+
+fn storeArtifact(ctx: *ToolContext, data: []const u8) []const u8 {
+    var id_buf: [16]u8 = undefined;
+    var rand_bytes: [8]u8 = undefined;
+    ctx.io.random(&rand_bytes);
+    const id = std.fmt.bufPrint(&id_buf, "a{x}", .{std.mem.readInt(u64, &rand_bytes, .little)}) catch return "";
+    const rel = std.fmt.allocPrint(ctx.arena, ".ifnh/cache/artifacts/{s}.txt", .{id}) catch return "";
+    ctx.workspace.createDirPath(ctx.io, ".ifnh/cache/artifacts") catch return "";
+    ctx.workspace.writeFile(ctx.io, .{ .sub_path = rel, .data = data }) catch return "";
+    return std.fmt.allocPrint(ctx.arena, "full output stored as artifact id {s} (read with read_tool_result)", .{id}) catch "";
+}
+
+fn toolReadResult(id: []const u8, offset: ?usize, limit: ?usize, ctx: *ToolContext) ToolResult {
+    for (id) |c| {
+        if (!std.ascii.isAlphanumeric(c)) return errResult(ctx.arena, "read_tool_result: invalid id", .{});
+    }
+    switch (ctx.engine.decidePath(.read, ".ifnh/cache/artifacts")) {
+        .allow => {},
+        else => return deniedResult(ctx.arena, "read artifact '{s}'", .{id}),
+    }
+    const rel = std.fmt.allocPrint(ctx.arena, ".ifnh/cache/artifacts/{s}.txt", .{id}) catch
+        return errResult(ctx.arena, "oom", .{});
+    const data = ctx.workspace.readFileAlloc(ctx.io, rel, ctx.arena, .limited(4 * 1024 * 1024)) catch
+        return errResult(ctx.arena, "read_tool_result: artifact '{s}' not found", .{id});
+
+    const start_line: usize = offset orelse 0;
+    var max_lines: usize = limit orelse 400;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var it = std.mem.splitScalar(u8, data, '\n');
+    var line_no: usize = 0;
+    while (it.next()) |line| : (line_no += 1) {
+        if (line_no < start_line) continue;
+        if (max_lines == 0) {
+            out.appendSlice(ctx.arena, "...[more lines; increase offset]") catch {};
+            break;
+        }
+        out.appendSlice(ctx.arena, line) catch {};
+        out.append(ctx.arena, '\n') catch {};
+        max_lines -= 1;
+    }
+    return .{ .output = out.items, .status = .ok };
+}
+
 // ---------------------------------------------------------------- bash / git
 
 fn runCaptured(ctx: *ToolContext, argv: []const []const u8, cwd: []const u8) ToolResult {
@@ -516,7 +588,11 @@ fn runCaptured(ctx: *ToolContext, argv: []const []const u8, cwd: []const u8) Too
         .stopped => |sig| out.print(ctx.arena, "stopped by signal {d}\n", .{sig}) catch {},
         .unknown => |code| out.print(ctx.arena, "exit status: {d}\n", .{code}) catch {},
     }
-    const body = truncateUtf8(ctx.arena, out.items, "command output") catch out.items;
+    var body = truncateUtf8(ctx.arena, out.items, "command output") catch out.items;
+    if (out.items.len > max_tool_output_bytes) {
+        const handle = storeArtifact(ctx, out.items);
+        body = std.fmt.allocPrint(ctx.arena, "{s}\n{s}", .{ body, handle }) catch body;
+    }
     const failed = switch (run.term) {
         .exited => |code| code != 0,
         else => true,
@@ -524,7 +600,7 @@ fn runCaptured(ctx: *ToolContext, argv: []const []const u8, cwd: []const u8) Too
     return .{ .output = body, .status = if (failed) .failed else .ok };
 }
 
-fn toolBash(command: []const u8, ctx: *ToolContext) ToolResult {
+fn toolBash(command: []const u8, background: bool, ctx: *ToolContext) ToolResult {
     // Compound commands go through the user's shell; simple ones run directly
     // (DECISIONS I120). Compound detection is the classifier's job anyway.
     const effect = cmd_class.classify(command);
@@ -537,6 +613,21 @@ fn toolBash(command: []const u8, ctx: *ToolContext) ToolResult {
             if (!ctx.requestApproval("run command", command, .{ .command_prefix = grant_prefix }))
                 return deniedResult(ctx.arena, "command '{s}' (declined)", .{command});
         },
+    }
+
+    if (background) {
+        switch (ctx.engine.decideCommand(command)) {
+            .allow, .ask => {
+                if (ctx.engine.decideCommand(command) == .ask) {
+                    if (!ctx.requestApproval("run command (background)", command, .{ .command_prefix = commandPrefixOf(command) }))
+                        return deniedResult(ctx.arena, "command '{s}' (declined)", .{command});
+                }
+                const start_fn = ctx.exec_start_fn orelse
+                    return errResult(ctx.arena, "bash: background executions not available", .{});
+                return .{ .output = start_fn(ctx.exec_ctx orelse ctx.approval_ctx, ctx.arena, command), .status = .ok };
+            },
+            .deny => return deniedResult(ctx.arena, "command '{s}'", .{command}),
+        }
     }
 
     var argv: std.ArrayListUnmanaged([]const u8) = .empty;
