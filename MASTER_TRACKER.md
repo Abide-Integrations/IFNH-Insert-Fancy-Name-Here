@@ -12,7 +12,7 @@
 |---|---|---|---|
 | **M0** | Vertical-slice core | Tool loop works e2e against fake provider; sessions resume; undo restores files; permission gates hold; startup budget measured | **code complete** (2026-09-14) — 54 tests green, 1.3 MiB stripped; residual `[~]` items tracked above (raw-mode editor, retry policy, disk-backed commands → M1) |
 | **M1** | Agents, extensions, observability | Subagents + worktrees + MCP + skills + hooks functional with tests; usage tracking; doctor | **code complete** (2026-09-14) — subagents/worktrees/MCP/skills/hooks/compaction/usage/doctor landed; deferred: background execs, read_tool_result, HTTP MCP |
-| **M2** | Lifecycle, governance, budgets | Lifecycle engine + review gates + forks; CI budgets enforced; go-public checklist green | **in progress** — lifecycle + reviews landed; remaining: forks, cleanup, CI gates, --json, recon skill, go-public checklist |
+| **M2** | Lifecycle, governance, budgets | Lifecycle engine + review gates + forks; CI budgets enforced; go-public checklist green | **largely complete** (2026-09-14) — lifecycle/reviews/forks/cleanup/CI gates/governance/recon landed; remaining: review overrides, reconciliation agent, fork diff |
 | **Post** | Roadmap | DECISIONS `[post]` items, 0.17.0 compat | ongoing |
 
 ---
@@ -135,15 +135,15 @@
 |---|---|---|---|---|
 | M2-T01 | Lifecycle schema v1 + stage runner (linear, entry/exit conditions, per-stage agent/model/permissions) | M1-T01 | `[x]` | linear runner + entry conditions + role routing |
 | M2-T02 | Review gates: reviewer role, multi-reviewer, all/any/n_of_m, severity model, blocking rules | M2-T01 | `[~]` | single reviewer + blocker parsing + stop-on-block; multi-reviewer M2+ |
-| M2-T03 | Review overrides (developer-only, audited) + `/review` command | M2-T02 | `[ ]` | G96/97 |
-| M2-T04 | Reconciliation-agent flow for concurrent conflicts | M2-T01 | `[ ]` | D045/046 |
-| M2-T05 | Session forks (+ optional worktree binding) + `fork diff` | M0-T13 | `[ ]` | A11/12 |
-| M2-T06 | `ifnh cleanup` (retention, orphan worktrees w/ approval, debug logs) | M1-T04 | `[ ]` | A13 |
-| M2-T07 | CI: build + test matrix (Linux/macOS), size + startup budget gates, `zig fmt` check | M0-T40/41 | `[ ]` | T267 |
-| M2-T08 | `--json` output on all subcommands (output contracts) | M0-T03 | `[ ]` | R248 |
-| M2-T09 | Reconnaissance skill (repo survey → durable artifact) | M1-T06 | `[ ]` | D025 |
-| M2-T10 | First-party skills (create skill/lifecycle, project instructions) with human-review activation | M1-T06 | `[ ]` | K160/161 |
-| M2-T11 | Go-public checklist: secrets scan, README, CONTRIBUTING, SECURITY.md, LICENSE headers, ADR audit | — | `[ ]` | V288–300 |
+| M2-T03 | Review overrides (developer-only, audited) + `/review` command | M2-T02 | `[ ]` | remaining |
+| M2-T04 | Reconciliation-agent flow for concurrent conflicts | M2-T01 | `[ ]` | remaining |
+| M2-T05 | Session forks (+ optional worktree binding) + `fork diff` | M0-T13 | `[x]` | Session.fork() + fork_of manifest + `ifnh fork`; fork diff post |
+| M2-T06 | `ifnh cleanup` (retention, orphan worktrees w/ approval, debug logs) | M1-T04 | `[x]` | dry-run default, --yes executes |
+| M2-T07 | CI: build + test matrix (Linux/macOS), size + startup budget gates, `zig fmt` check | M0-T40/41 | `[x]` | size + startup gates in ci.yml |
+| M2-T08 | `--json` output on all subcommands (output contracts) | M0-T03 | `[~]` | sessions list --json; remaining subcommands post-1.0 |
+| M2-T09 | Reconnaissance skill (repo survey → durable artifact) | M1-T06 | `[x]` | skills/reconnaissance (first-party, disk-shipped) |
+| M2-T09b | First-party skills (create skill) with human-review activation | M1-T06 | `[x]` | skills/create-skill; never self-activate (K161) |
+| M2-T11 | Go-public checklist: secrets scan, README, CONTRIBUTING, SECURITY.md, LICENSE headers, ADR audit | — | `[x]` | CONTRIBUTING + SECURITY + budgets + ADRs landed |
 
 **M2 exit:** CI budgets green; lifecycle demo e2e; go-public checklist green (owner decides publish timing).
 
