@@ -11,6 +11,7 @@ const cli_args = @import("cli/args.zig");
 const fsutil = @import("core/fsutil.zig");
 const repl = @import("cli/repl.zig");
 const session_mod = @import("core/session/store.zig");
+const config_mod = @import("core/config/config.zig");
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -54,6 +55,8 @@ pub fn main(init: std.process.Init) !void {
         .init => try runInit(io, arena, parsed.args),
         .config => try runConfig(io, arena, init.environ_map, parsed.args),
         .sessions => try runSessions(io, arena, parsed.args),
+        .fork => try runFork(io, arena, parsed.args),
+        .cleanup => try runCleanup(io, arena, init.environ_map, parsed.args),
         .@"resume" => blk: {
             if (parsed.args.len == 0) {
                 try printOut(io, arena, "usage: ifnh resume <session-id> (see `ifnh sessions list`)\n", .{});
@@ -72,7 +75,6 @@ pub fn main(init: std.process.Init) !void {
 
 /// `ifnh config [validate|explain <key>|path]`
 fn runConfig(io: std.Io, arena: std.mem.Allocator, environ: *const std.process.Environ.Map, args: []const []const u8) !void {
-    const config_mod = @import("core/config/config.zig");
     var cfg = try config_mod.load(arena, io, environ, std.Io.Dir.cwd());
     defer cfg.deinit();
 
@@ -112,7 +114,27 @@ fn runConfig(io: std.Io, arena: std.mem.Allocator, environ: *const std.process.E
 /// `ifnh sessions list`
 fn runSessions(io: std.Io, arena: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len == 0 or std.mem.eql(u8, args[0], "list")) {
+        const json_mode = args.len > 1 and std.mem.eql(u8, args[1], "--json");
         const summaries = session_mod.list(std.Io.Dir.cwd(), io, arena, ".ifnh/sessions") catch &.{};
+        if (json_mode) {
+            var aw: std.Io.Writer.Allocating = .init(arena);
+            try aw.writer.writeByte('[');
+            for (summaries, 0..) |s, i| {
+                if (i > 0) try aw.writer.writeByte(',');
+                try aw.writer.writeAll("{\"id\":\"");
+                try aw.writer.writeAll(s.id);
+                try aw.writer.print("\",\"created_ms\":{d},\"cwd\":", .{s.created_ms});
+                try std.json.Stringify.value(s.cwd, .{}, &aw.writer);
+                if (s.title) |t| {
+                    try aw.writer.writeAll(",\"title\":");
+                    try std.json.Stringify.value(t, .{}, &aw.writer);
+                }
+                try aw.writer.writeAll("}");
+            }
+            try aw.writer.writeByte(']');
+            try printOut(io, arena, "{s}\n", .{aw.written()});
+            return;
+        }
         if (summaries.len == 0) {
             try printOut(io, arena, "no sessions\n", .{});
             return;
@@ -122,12 +144,88 @@ fn runSessions(io: std.Io, arena: std.mem.Allocator, args: []const []const u8) !
         }
         return;
     }
-    try printOut(io, arena, "usage: ifnh sessions [list]\n", .{});
+    try printOut(io, arena, "usage: ifnh sessions [list] [--json]\n", .{});
+}
+
+/// `ifnh fork <session-id>` — branch a session from its current state (M2-T05, A11).
+fn runFork(io: std.Io, arena: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len == 0) {
+        try printOut(io, arena, "usage: ifnh fork <session-id>\n", .{});
+        std.process.exit(2);
+    }
+    const cwd = std.Io.Dir.cwd();
+    var parent = try session_mod.Session.open(cwd, io, arena, ".ifnh/sessions", args[0]);
+    defer parent.close();
+    var child = try parent.fork();
+    defer child.close();
+    try printOut(io, arena, "forked {s} -> {s} ({d} events inherited)\n", .{ parent.manifest.id, child.manifest.id, child.seq });
+}
+
+/// `ifnh cleanup [--yes]` — retention enforcement (M2-T06, A13).
+/// Removes sessions beyond sessions.keep and orphaned IFNH-created
+/// worktrees (with --yes; otherwise lists what it would do).
+fn runCleanup(io: std.Io, arena: std.mem.Allocator, environ: *const std.process.Environ.Map, args: []const []const u8) !void {
+    var assume_yes = false;
+    for (args) |a| {
+        if (std.mem.eql(u8, a, "--yes")) assume_yes = true;
+    }
+    const cwd = std.Io.Dir.cwd();
+    var cfg = try config_mod.load(arena, io, null, cwd);
+    defer cfg.deinit();
+    const keep: usize = cfg.getU32("sessions.keep", 30);
+
+    // Sessions past retention.
+    const summaries = try session_mod.list(cwd, io, arena, ".ifnh/sessions");
+    if (summaries.len > keep) {
+        try printOut(io, arena, "sessions: {d} exist, retention {d}\n", .{ summaries.len, keep });
+        for (summaries[keep..]) |s| {
+            if (assume_yes) {
+                // s.id is "s_xxx"; deleteTree the session dir.
+                var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+                const rel = std.fmt.bufPrint(&path_buf, ".ifnh/sessions/{s}", .{s.id}) catch continue;
+                cwd.deleteTree(io, rel) catch |err| {
+                    try printOut(io, arena, "  failed to remove {s}: {s}\n", .{ s.id, @errorName(err) });
+                    continue;
+                };
+                try printOut(io, arena, "  removed {s}\n", .{s.id});
+            } else {
+                try printOut(io, arena, "  would remove {s} (run with --yes)\n", .{s.id});
+            }
+        }
+    } else {
+        try printOut(io, arena, "sessions: {d} exist, within retention {d}\n", .{ summaries.len, keep });
+    }
+
+    // Orphaned IFNH worktrees (never auto-removed without --yes; A13).
+    const home = environ.get("HOME") orelse "";
+    if (home.len > 0) {
+        const wt_root = try std.fmt.allocPrint(arena, "{s}/.local/state/ifnh/worktrees", .{home});
+        var wt_dir = cwd.openDir(io, wt_root, .{ .iterate = true }) catch {
+            try printOut(io, arena, "worktrees: none\n", .{});
+            return;
+        };
+        defer wt_dir.close(io);
+        var it = wt_dir.iterate();
+        var found: usize = 0;
+        while (it.next(io) catch null) |entry| {
+            if (entry.kind != .directory) continue;
+            if (!std.mem.startsWith(u8, entry.name, "ifnh-")) continue;
+            found += 1;
+            if (assume_yes) {
+                var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+                const full = std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ wt_root, entry.name }) catch continue;
+                cwd.deleteTree(io, full) catch continue;
+                try printOut(io, arena, "  removed worktree {s}\n", .{entry.name});
+            } else {
+                try printOut(io, arena, "  worktree present: {s} (--yes to remove)\n", .{entry.name});
+            }
+        }
+        if (found == 0) try printOut(io, arena, "worktrees: none\n", .{});
+    }
 }
 
 /// `ifnh doctor` — environment health check (M1-T14, DECISIONS S259).
 fn runDoctor(io: std.Io, arena: std.mem.Allocator, environ: *const std.process.Environ.Map) !void {
-    const config_mod = @import("core/config/config.zig");
     const git_mod = @import("core/git.zig");
     const cwd = std.Io.Dir.cwd();
     var problems: usize = 0;
@@ -250,7 +348,9 @@ const help_text =
     \\  (none)      start an interactive session (M0)
     \\  init        create a .ifnh/ project skeleton
     \\  config      validate/explain configuration (M0)
-    \\  sessions    list recorded sessions (M0)
+    \\  sessions    list recorded sessions (--json supported)
+    \\  fork        branch a session (ifnh fork <id>)
+    \\  cleanup     enforce retention, list/remove worktrees
     \\  resume      resume a previous session (M0)
     \\  doctor      check environment health (M1)
     \\  help        show this text

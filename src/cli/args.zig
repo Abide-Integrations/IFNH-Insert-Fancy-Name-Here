@@ -26,6 +26,8 @@ pub const Subcommand = enum {
     /// `resume` is a Zig keyword; quote the tag.
     @"resume",
     doctor,
+    fork,
+    cleanup,
     unknown,
 };
 
@@ -90,6 +92,10 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
         .@"resume"
     else if (std.mem.eql(u8, cmd_name, "doctor"))
         .doctor
+    else if (std.mem.eql(u8, cmd_name, "fork"))
+        .fork
+    else if (std.mem.eql(u8, cmd_name, "cleanup"))
+        .cleanup
     else
         .unknown;
 

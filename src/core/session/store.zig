@@ -140,6 +140,8 @@ pub const Manifest = struct {
     title: ?[]const u8 = null,
     seq_watermark: u64 = 0,
     byte_watermark: u64 = 0,
+    /// Parent session id when this session is a fork (A11).
+    fork_of: ?[]const u8 = null,
 };
 
 fn manifestToJson(arena: std.mem.Allocator, m: Manifest) ![]u8 {
@@ -152,6 +154,7 @@ fn manifestToJson(arena: std.mem.Allocator, m: Manifest) ![]u8 {
     try obj.put(arena, "title", if (m.title) |t| Value{ .string = t } else .null);
     try obj.put(arena, "seq_watermark", .{ .integer = @intCast(m.seq_watermark) });
     try obj.put(arena, "byte_watermark", .{ .integer = @intCast(m.byte_watermark) });
+    try obj.put(arena, "fork_of", if (m.fork_of) |f| std.json.Value{ .string = f } else .null);
 
     var aw: std.Io.Writer.Allocating = .init(arena);
     try std.json.Stringify.value(Value{ .object = obj }, .{}, &aw.writer);
@@ -181,6 +184,9 @@ fn manifestFromJson(arena: std.mem.Allocator, v: std.json.Value) !Manifest {
     }
     if (o.get("byte_watermark")) |b| {
         if (b == .integer) m.byte_watermark = @intCast(b.integer);
+    }
+    if (o.get("fork_of")) |f| {
+        if (f == .string) m.fork_of = try arena.dupe(u8, f.string);
     }
     return m;
 }
@@ -490,6 +496,28 @@ pub const Session = struct {
         self.dir.close(self.io);
         self.releaseLock();
     }
+
+    /// Fork this session: create a new session dir inheriting the event
+    /// log up to the current watermark (A11). Returns the new Session.
+    pub fn fork(self: *Session) !Session {
+        var fresh = try Session.create(self.parent, self.io, self.alloc, self.sessions_rel_path, self.manifest.cwd);
+        errdefer fresh.close();
+        // Copy committed events.
+        if (self.byte_offset > 0) {
+            const f = try self.dir.openFile(self.io, "events.jsonl", .{});
+            defer f.close(self.io);
+            const buf = try self.alloc.alloc(u8, self.byte_offset);
+            defer self.alloc.free(buf);
+            _ = try f.readPositionalAll(self.io, buf, 0);
+            try fresh.events_file.?.writePositionalAll(self.io, buf, 0);
+            fresh.seq = self.seq;
+            fresh.byte_offset = self.byte_offset;
+            try fresh.writeManifest();
+        }
+        fresh.manifest.fork_of = try self.alloc.dupe(u8, self.manifest.id);
+        try fresh.writeManifest();
+        return fresh;
+    }
 };
 
 // ---------------------------------------------------------------- listing
@@ -635,4 +663,32 @@ test "id validation" {
     try std.testing.expect(SessionId.parse(id.text()) != null);
     try std.testing.expect(SessionId.parse("short") == null);
     try std.testing.expect(SessionId.parse("has space_______") == null);
+}
+
+test "fork inherits events and records parent" {
+    const io = std.testing.io;
+    var ts = try testingSession();
+    defer ts.tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Session.create(ts.parent, io, arena, "sessions", "/tmp/proj");
+    defer s.close();
+    _ = try s.append(.{ .user = .{ .text = "before fork" } });
+
+    var child = try s.fork();
+    defer child.close();
+    try std.testing.expect(child.manifest.fork_of != null);
+    try std.testing.expectEqualStrings(s.manifest.id, child.manifest.fork_of.?);
+    try std.testing.expectEqual(s.seq, child.seq);
+
+    // New events diverge.
+    _ = try child.append(.{ .assistant = .{ .text = "on the fork" } });
+    try std.testing.expectEqual(s.seq + 1, child.seq);
+    try std.testing.expectEqual(@as(u64, 1), s.seq);
+
+    const events = try child.readEvents(arena, 100);
+    try std.testing.expectEqual(@as(usize, 2), events.len);
+    try std.testing.expectEqualStrings("before fork", events[0].event.user.text);
 }
