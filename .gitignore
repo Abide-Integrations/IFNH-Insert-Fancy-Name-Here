@@ -1,0 +1,15 @@
+# Zig
+.zig-cache/
+zig-out/
+*.o
+*.bc
+pgso/
+
+# IFNH runtime state (tracked subset lives in .ifnh/.gitignore)
+.ifnh/sessions/
+.ifnh/cache/
+.ifnh/debug/
+.ifnh/reports/
+
+# OS
+.DS_Store

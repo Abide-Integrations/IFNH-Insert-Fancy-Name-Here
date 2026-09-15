@@ -1,4 +1,3 @@
-```markdown
 # IFNH — Master Design & Architecture Ledger
 
 > **Working Name:** IFNH — "Insert Flashy Name Here"  
@@ -2517,5 +2516,14 @@ Only then should implementation be divided among coding agents.
 
 ---
 
+# 82. Amendments (2026-09-14)
+
+Recorded during the discovery-resolution phase; details and full rationale in `DECISIONS.md` and `docs/adr/`.
+
+- **A1 (amends D035, ADR-0002):** Structured configuration uses **JSON**, not YAML (Zig std has no YAML parser; a dependency would violate the zero-dependency constraint). Markdown remains the format for instructions/skills/commands/reports.
+- **A2 (toolchain, meta-M4):** Implementation targets **Zig 0.16.0 stable** (the current stable generation and fx's exact pin). A requested move to 0.17.0 is tracked for when that release ships (MASTER_TRACKER ST-1).
+- **A3 (fx reuse, meta-M2, ADR-0003):** fx is an **architecture reference only** — clean-room re-implementation, no ported code, pure MIT with empty THIRD_PARTY_NOTICES.
+- **A4 (MVP scope, meta-M3):** The MVP is the **M0 vertical-slice core** (config layering, streaming CLI, generic provider interface, core tool kernel, permissions, JSONL sessions + resume, patch editing, undo journal); subagents/MCP/skills/worktrees/lifecycle follow in M1+.
+- **A5 (discovery closure):** The remaining discovery backlog (310 questions) is resolved in `DECISIONS.md`; discovery status (§81) is thereby complete and implementation is governed by `MASTER_TRACKER.md`.
+
 **END OF CURRENT IFNH MASTER DESIGN & ARCHITECTURE LEDGER**
-```
