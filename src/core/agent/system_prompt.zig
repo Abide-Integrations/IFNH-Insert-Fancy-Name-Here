@@ -26,6 +26,15 @@ pub const system_prompt =
     \\8. If a command is unfamiliar, discover before asking: check for a
     \\   --help flag, man pages, or repository documentation first.
     \\
+    \\Delegation:
+    \\- Use the `agent` tool for self-contained subtasks: research (read-only
+    \\  fact gathering), implement (code changes with tests), or review
+    \\  (structured findings with severities). Give each child a complete,
+    \\  self-contained task description; it cannot ask you questions mid-run.
+    \\- Children return a summary; their full report path is included. Read
+    \\  the report file when you need the details. Delegate only within
+    \\  policy: depth and concurrency are enforced by the harness.
+    \\
     \\Tool usage notes:
     \\- `edit` refuses ambiguous or stale matches; re-read the file and retry
     \\  with a larger unique context.

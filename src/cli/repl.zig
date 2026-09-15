@@ -14,6 +14,7 @@ const engine_mod = @import("../core/permissions/engine.zig");
 const instructions_mod = @import("../core/instructions.zig");
 const system_prompt = @import("../core/agent/system_prompt.zig");
 const agent_engine = @import("../core/agent/engine.zig");
+const subagent_mod = @import("../core/agent/subagent.zig");
 const tool_mod = @import("../tools/tool.zig");
 const core_types = @import("../core/types.zig");
 const openai = @import("../providers/openai.zig");
@@ -162,6 +163,31 @@ fn submitTurn(
 
     var cancel = std.atomic.Value(bool).init(false);
     var approver = Approver{ .io = io, .engine = &sess.engine };
+    var host = subagent_mod.Host{
+        .io = io,
+        .workspace = cwd,
+        .base_system = system,
+        .provider = pcfg.provider,
+        .base_url = pcfg.base_url,
+        .api_key = pcfg.api_key,
+        .default_model = pcfg.model,
+        .mode = sess.engine.mode,
+        .read_globs = sess.engine.read_globs,
+        .write_globs = sess.engine.write_globs,
+        .command_allow = sess.engine.command_allow,
+        .command_deny = sess.engine.command_deny,
+        .env_allow = sess.engine.env_allow,
+        .journal = &sess.journal,
+        .approval_ctx = &approver,
+        .approval_fn = Approver.approve,
+        .max_depth = cfg.getU32("agents.max_depth", 1),
+        .max_concurrent = cfg.getU32("agents.max_concurrent", 4),
+        .max_rounds = 25,
+        .redactions = redactionsFor(arena, pcfg.api_key),
+        .temperature = cfg.getOptionalF64("model.temperature"),
+        .max_output_tokens = cfg.getOptionalU32("model.max_output_tokens"),
+        .cancel = &cancel,
+    };
     var tool_ctx = tool_mod.ToolContext{
         .io = io,
         .arena = arena,
@@ -171,6 +197,10 @@ fn submitTurn(
         .max_file_read_bytes = cfg.getU32("context.max_file_read_bytes", 262144),
         .approval_ctx = &approver,
         .approval_fn = Approver.approve,
+        .agent_spawn_fn = subagent_mod.spawnHookFn,
+        .agent_spawn_ctx = &host,
+        .agent_depth = 0,
+        .agent_label = "parent",
     };
     tool_ctx.approval_ctx = &approver;
     tool_ctx.approval_fn = Approver.approve;
@@ -244,9 +274,12 @@ fn submitTurn(
 const Approver = struct {
     io: std.Io,
     engine: *engine_mod.Engine,
+    mutex: std.Io.Mutex = .init,
 
     fn approve(ctx: *anyopaque, req: tool_mod.ApprovalRequest) tool_mod.ApprovalResponse {
         const self: *Approver = @ptrCast(@alignCast(ctx));
+        self.mutex.lock(self.io) catch return .denied;
+        defer self.mutex.unlock(self.io);
         out(self.io, "\napproval needed: {s}\n  {s}\n[y] once  [s] session  [n] no: ", .{ req.title, req.detail }) catch return .denied;
         var buf: [64]u8 = undefined;
         var stdin_r = std.Io.File.stdin().reader(self.io, &buf);
@@ -390,6 +423,7 @@ fn handleCommand(
             \\  /redo                 redo
             \\  /diff                 show git diff of the working tree
             \\  /plan <title>         create a plan artifact in .ifnh/plans/
+            \\  /agents               list subagent reports
             \\  /sessions             list sessions (use `ifnh resume <id>`)
             \\
         , .{}) catch {};
@@ -434,6 +468,29 @@ fn handleCommand(
         createPlan(io, cwd, arena, rest) catch |err| {
             out(io, "plan creation failed: {s}\n", .{@errorName(err)}) catch {};
         };
+    } else if (std.mem.eql(u8, cmd, "agents")) {
+        _ = &sess;
+        out(io, "subagents run inline during turns; reports:\n", .{}) catch {};
+        var names: std.ArrayListUnmanaged([]const u8) = .empty;
+        if (cwd.openDir(io, ".ifnh/reports", .{ .iterate = true })) |dir| {
+            var d = dir;
+            defer d.close(io);
+            var it = d.iterate();
+            while (it.next(io) catch null) |entry| {
+                if (entry.kind != .file) continue;
+                names.append(arena, arena.dupe(u8, entry.name) catch continue) catch {};
+            }
+        } else |_| {}
+        if (names.items.len == 0) {
+            out(io, "no agent reports\n", .{}) catch {};
+        } else {
+            std.mem.sort([]const u8, names.items, {}, struct {
+                fn lt(_: void, a: []const u8, b: []const u8) bool {
+                    return std.mem.lessThan(u8, a, b);
+                }
+            }.lt);
+            for (names.items) |n| out(io, "  .ifnh/reports/{s}\n", .{n}) catch {};
+        }
     } else if (std.mem.eql(u8, cmd, "sessions")) {
         const summaries = session_mod.list(cwd, io, arena, ".ifnh/sessions") catch &.{};
         if (summaries.len == 0) {

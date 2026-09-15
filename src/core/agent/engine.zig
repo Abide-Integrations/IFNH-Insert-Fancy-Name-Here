@@ -221,28 +221,57 @@ pub fn runTurn(p: RunParams) !Outcome {
             .tool_calls_json = tc_json,
         });
 
-        // Execute each tool call, appending results.
-        for (collector.tool_calls.items) |tc| {
+        // Execute tool calls; consecutive `agent` calls run in parallel
+        // (E58), everything else sequentially, results appended in order.
+        const calls = collector.tool_calls.items;
+        var i: usize = 0;
+        while (i < calls.len) {
             if (p.cancel.load(.acquire)) {
                 return .{ .status = .cancelled, .reply = last_reply, .tool_rounds = rounds, .tool_calls = total_calls, .usage = total_usage };
             }
-            p.callbacks.on_tool_start(p.callbacks.ctx, tc.name, tc.arguments_json);
-            const result_raw = tool_mod.execute(tc.name, tc.arguments_json, p.tool_ctx);
-            const result = tool_mod.ToolResult{
-                .output = redact_mod.redact(p.arena, result_raw.output, p.redactions),
-                .status = result_raw.status,
-            };
-            total_calls += 1;
-            p.callbacks.on_tool_result(p.callbacks.ctx, tc.name, result.status, result.output);
-            if (result.status == .denied) {
-                p.callbacks.on_notice(p.callbacks.ctx, result.output);
+            if (isAgentCall(calls[i])) {
+                var j = i + 1;
+                while (j < calls.len and isAgentCall(calls[j])) j += 1;
+                const batch = calls[i..j];
+                const results = if (batch.len > 1)
+                    try runAgentBatch(p, batch)
+                else blk: {
+                    const one = try p.arena.alloc(tool_mod.ToolResult, 1);
+                    one[0] = executeOne(p, batch[0]);
+                    total_calls += 1;
+                    break :blk one;
+                };
+                for (batch, results) |tc, result| {
+                    p.callbacks.on_tool_start(p.callbacks.ctx, tc.name, tc.arguments_json);
+                    p.callbacks.on_tool_result(p.callbacks.ctx, tc.name, result.status, result.output);
+                    if (result.status == .denied) {
+                        p.callbacks.on_notice(p.callbacks.ctx, result.output);
+                    }
+                    try p.history.append(p.arena, .{
+                        .role = .tool,
+                        .content = result.output,
+                        .tool_call_id = tc.id,
+                        .tool_name = tc.name,
+                    });
+                }
+                total_calls += batch.len;
+                i = j;
+            } else {
+                const result = executeOne(p, calls[i]);
+                total_calls += 1;
+                p.callbacks.on_tool_start(p.callbacks.ctx, calls[i].name, calls[i].arguments_json);
+                p.callbacks.on_tool_result(p.callbacks.ctx, calls[i].name, result.status, result.output);
+                if (result.status == .denied) {
+                    p.callbacks.on_notice(p.callbacks.ctx, result.output);
+                }
+                try p.history.append(p.arena, .{
+                    .role = .tool,
+                    .content = result.output,
+                    .tool_call_id = calls[i].id,
+                    .tool_name = calls[i].name,
+                });
+                i += 1;
             }
-            try p.history.append(p.arena, .{
-                .role = .tool,
-                .content = result.output,
-                .tool_call_id = tc.id,
-                .tool_name = tc.name,
-            });
         }
     }
 
@@ -410,6 +439,71 @@ test "runTurn surfaces provider failure" {
     try std.testing.expectEqualStrings("bad key", outcome.error_message);
 }
 
+fn isAgentCall(tc: core_types.ToolCall) bool {
+    return std.mem.eql(u8, tc.name, "agent");
+}
+
+fn executeOne(p: RunParams, tc: core_types.ToolCall) tool_mod.ToolResult {
+    const raw = tool_mod.execute(tc.name, tc.arguments_json, p.tool_ctx);
+    return .{
+        .output = redact_mod.redact(p.arena, raw.output, p.redactions),
+        .status = raw.status,
+    };
+}
+
+/// Run consecutive agent calls on parallel threads, each with its own
+/// arena and ToolContext copy; results are ordered on return.
+fn runAgentBatch(p: RunParams, calls: []const core_types.ToolCall) ![]tool_mod.ToolResult {
+    const Slot = struct {
+        thread: ?std.Thread = null,
+        arena_state: ?std.heap.ArenaAllocator = null,
+        result: tool_mod.ToolResult = .{ .output = "", .status = .failed },
+        done: std.atomic.Value(bool) = .init(false),
+    };
+    const slots = try p.arena.alloc(Slot, calls.len);
+    for (slots) |*s| s.* = .{};
+
+    const Worker = struct {
+        fn run(params: RunParams, tc: core_types.ToolCall, slot: *Slot) void {
+            var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            var ctx = params.tool_ctx.*;
+            ctx.arena = arena_state.allocator();
+            const raw = tool_mod.execute(tc.name, tc.arguments_json, &ctx);
+            slot.result = raw;
+            slot.arena_state = arena_state; // handed back for ordered copy
+            slot.done.store(true, .release);
+        }
+    };
+
+    var spawned: usize = 0;
+    for (calls, slots) |tc, *slot| {
+        slot.thread = std.Thread.spawn(.{}, Worker.run, .{ p, tc, slot }) catch {
+            slot.done.store(true, .release); // runs inline below
+            continue;
+        };
+        spawned += 1;
+    }
+    // Inline any that failed to spawn.
+    for (calls, slots) |tc, *slot| {
+        if (slot.thread == null and !slot.done.load(.acquire)) {
+            Worker.run(p, tc, slot);
+        }
+    }
+    // Ordered copy-out.
+    for (slots) |*slot| {
+        if (slot.thread) |t| t.join();
+        var arena_state = slot.arena_state orelse continue;
+        const output = arena_state.allocator().dupe(u8, slot.result.output) catch slot.result.output;
+        const out_copy = p.arena.dupe(u8, output) catch output;
+        slot.result.output = out_copy;
+        arena_state.deinit();
+        slot.arena_state = null;
+    }
+    const results = try p.arena.alloc(tool_mod.ToolResult, calls.len);
+    for (slots, 0..) |*slot, idx| results[idx] = slot.result;
+    return results;
+}
+
 fn sleepSeconds(io: std.Io, seconds: u64) !void {
     if (seconds == 0) return;
     try std.Io.sleep(io, .fromSeconds(@intCast(seconds)), .awake);
@@ -419,3 +513,96 @@ fn noopText(_: *anyopaque, _: []const u8) void {}
 fn noopStart(_: *anyopaque, _: []const u8, _: []const u8) void {}
 fn noopResult(_: *anyopaque, _: []const u8, _: tool_mod.Status, _: []const u8) void {}
 fn noopNotice(_: *anyopaque, _: []const u8) void {}
+
+test "consecutive agent calls run in parallel and append in order" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
+    defer tmp.cleanup();
+
+    // Parent makes two agent calls in one round; children are scripted to
+    // succeed immediately.
+    var parent_fake = testing.Fake{ .script = &.{
+        &.{
+            .{ .tool_call = .{ .id = "a1", .name = "agent", .arguments_json = "{\"task\":\"t1\",\"role\":\"research\"}" } },
+            .{ .tool_call = .{ .id = "a2", .name = "agent", .arguments_json = "{\"task\":\"t2\",\"role\":\"research\"}" } },
+        },
+        &.{.{ .text = "both children reported" }},
+    } };
+    var child_fake = testing.Fake{ .script = &.{
+        &.{.{ .text = "child-one" }},
+        &.{.{ .text = "child-two" }},
+    } };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var perm_engine = @import("../permissions/engine.zig").Engine.init(arena, .auto);
+    var cancel = std.atomic.Value(bool).init(false);
+    var host = @import("subagent.zig").Host{
+        .io = io,
+        .workspace = tmp.dir,
+        .base_system = "",
+        .provider = child_fake.provider(),
+        .base_url = "",
+        .api_key = "",
+        .default_model = "fake",
+        .mode = .auto,
+        .read_globs = &.{"**"},
+        .write_globs = &.{},
+        .command_allow = &.{},
+        .command_deny = &.{},
+        .env_allow = &.{},
+        .journal = null,
+        .approval_ctx = undefined,
+        .approval_fn = undefined,
+        .max_depth = 1,
+        .max_concurrent = 4,
+        .max_rounds = 10,
+        .redactions = &.{},
+        .cancel = &cancel,
+    };
+
+    var tool_ctx: tool_mod.ToolContext = .{
+        .io = io,
+        .arena = arena,
+        .workspace = tmp.dir,
+        .engine = &perm_engine,
+        .journal = null,
+        .max_file_read_bytes = 64 * 1024,
+        .approval_ctx = undefined,
+        .approval_fn = undefined,
+        .agent_spawn_fn = @import("subagent.zig").spawnHookFn,
+        .agent_spawn_ctx = &host,
+        .agent_depth = 0,
+        .agent_label = "parent",
+    };
+
+    var history: std.ArrayListUnmanaged(core_types.ChatMessage) = .empty;
+    try history.append(arena, .{ .role = .user, .content = "delegate two tasks" });
+
+    const outcome = try runTurn(.{
+        .io = io,
+        .arena = arena,
+        .pcfg = .{ .provider = parent_fake.provider(), .model = "fake", .base_url = "", .api_key = "" },
+        .system = "",
+        .history = &history,
+        .tool_ctx = &tool_ctx,
+        .callbacks = .{
+            .ctx = undefined,
+            .on_text = noopText,
+            .on_tool_start = noopStart,
+            .on_tool_result = noopResult,
+            .on_notice = noopNotice,
+        },
+        .cancel = &cancel,
+    });
+
+    try std.testing.expectEqual(Status.completed, outcome.status);
+    try std.testing.expectEqual(@as(usize, 2), outcome.tool_calls);
+    // Both child summaries are present in history (order preserved).
+    const r1 = history.items[2].content;
+    const r2 = history.items[3].content;
+    try std.testing.expect(std.mem.indexOf(u8, r1, "child-one") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r2, "child-two") != null);
+}

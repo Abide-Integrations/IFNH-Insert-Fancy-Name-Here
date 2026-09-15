@@ -44,6 +44,13 @@ pub const ToolContext = struct {
     /// Approval callback wired to the UI; used when the engine says `ask`.
     approval_ctx: *anyopaque,
     approval_fn: *const fn (ctx: *anyopaque, req: ApprovalRequest) ApprovalResponse,
+    /// Subagent runtime hook (wired by the host; null disables spawning).
+    agent_spawn_fn: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, parent_depth: usize, arguments_json: []const u8) AgentSpawnResult = null,
+    agent_spawn_ctx: ?*anyopaque = null,
+    /// Delegation depth of the agent owning this context (0 = parent).
+    agent_depth: usize = 0,
+    /// Display label for approval provenance ("parent", "research-1"...).
+    agent_label: []const u8 = "",
 
     pub fn requestApproval(self: *ToolContext, title: []const u8, detail: []const u8, grant: ApprovalRequest.Grant) bool {
         const resp = self.approval_fn(self.approval_ctx, .{ .title = title, .detail = detail, .grant = grant });
@@ -57,6 +64,16 @@ pub const ToolContext = struct {
 pub const ToolResult = struct {
     output: []const u8,
     status: Status = .ok,
+};
+
+/// Result of a subagent run (defined here to avoid an import cycle).
+pub const AgentSpawnResult = struct {
+    pub const SpawnStatus = enum { completed, failed };
+
+    status: SpawnStatus = .completed,
+    summary: []const u8 = "",
+    report_path: []const u8 = "",
+    tool_calls: usize = 0,
 };
 
 pub const Spec = struct {
@@ -84,6 +101,9 @@ pub const specs = [_]Spec{
     },
     .{ .name = "bash", .description = "Run a shell command in the workspace. Read-only commands run freely; anything that changes state requires approval.", .parameters_json =
     \\{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}
+    },
+    .{ .name = "agent", .description = "Delegate a self-contained task to a child agent. Roles: research (read-only), implement (may edit), review (read-only findings). The child works independently and returns a summary; its full report is stored under .ifnh/reports/.", .parameters_json =
+    \\{"type":"object","properties":{"task":{"type":"string"},"role":{"type":"string","enum":["research","implement","review"]},"model":{"type":"string"}},"required":["task","role"]}
     },
     .{ .name = "git", .description = "Run a git subcommand in the workspace (porcelain operations only).", .parameters_json =
     \\{"type":"object","properties":{"args":{"type":"array","items":{"type":"string"}}},"required":["args"]}
@@ -159,6 +179,14 @@ pub fn execute(name: []const u8, args_json: []const u8, ctx: *ToolContext) ToolR
     } else if (std.mem.eql(u8, name, "bash")) {
         const command = a.str("command") orelse return errResult(ctx.arena, "bash: missing command", .{});
         return toolBash(command, ctx);
+    } else if (std.mem.eql(u8, name, "agent")) {
+        const spawn_fn = ctx.agent_spawn_fn orelse
+            return errResult(ctx.arena, "agent: delegation disabled", .{});
+        const res = spawn_fn(ctx.agent_spawn_ctx orelse ctx.approval_ctx, ctx.arena, ctx.agent_depth, args_json);
+        return .{
+            .output = res.summary,
+            .status = if (res.status == .completed) .ok else .failed,
+        };
     } else if (std.mem.eql(u8, name, "git")) {
         const args_v = a.obj.get("args") orelse return errResult(ctx.arena, "git: missing args", .{});
         if (args_v != .array) return errResult(ctx.arena, "git: args must be an array of strings", .{});

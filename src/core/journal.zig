@@ -87,6 +87,8 @@ pub const Journal = struct {
     /// Undo stack (gids in commit order) and redo stack, derived on open.
     undo_stack: std.ArrayListUnmanaged(u64) = .empty,
     redo_stack: std.ArrayListUnmanaged(u64) = .empty,
+    /// Serializes journal mutations; subagent threads share one journal.
+    mutex: std.Io.Mutex = .init,
 
     /// Open (or create) the journal in `dir`. Rebuilds group state and rolls
     /// back any group that has an intent but no commit (crash recovery).
@@ -260,6 +262,8 @@ pub const Journal = struct {
     /// intent record → apply → commit record.
     pub fn apply(self: *Journal, label: []const u8, ops: []const Op) ApplyError!void {
         if (ops.len == 0) return;
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
         var arena_state = std.heap.ArenaAllocator.init(self.alloc);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -384,6 +388,8 @@ pub const Journal = struct {
 
     /// Undo the most recent committed group. Returns its gid.
     pub fn undo(self: *Journal) !?u64 {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
         const gid = self.undo_stack.pop() orelse return null;
         if (self.groups.get(gid).?.state != .committed) return null;
         try self.applyInverseFor(gid);
@@ -395,6 +401,8 @@ pub const Journal = struct {
 
     /// Redo the most recently undone group. Returns its gid.
     pub fn redo(self: *Journal) !?u64 {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
         const gid = self.redo_stack.pop() orelse return null;
         if (self.groups.get(gid).?.state != .undone) return null;
         try self.applyForwardFor(gid);
