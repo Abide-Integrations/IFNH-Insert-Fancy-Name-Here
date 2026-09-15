@@ -47,7 +47,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (parsed.subcommand == .none) {
-        try repl.run(io, arena, init.environ_map, .{});
+        try repl.run(io, arena, init.environ_map, .{ .no_color = parsed.flags.no_color });
         return;
     }
 
@@ -62,7 +62,10 @@ pub fn main(init: std.process.Init) !void {
                 try printOut(io, arena, "usage: ifnh resume <session-id> (see `ifnh sessions list`)\n", .{});
                 std.process.exit(2);
             }
-            break :blk try repl.run(io, arena, init.environ_map, .{ .resume_id = parsed.args[0] });
+            break :blk try repl.run(io, arena, init.environ_map, .{
+                .resume_id = parsed.args[0],
+                .no_color = parsed.flags.no_color,
+            });
         },
         .doctor => try runDoctor(io, arena, init.environ_map),
         .unknown => {
@@ -392,6 +395,7 @@ test {
     _ = @import("core/compaction.zig");
     _ = @import("core/lifecycle.zig");
     _ = @import("core/executions.zig");
+    _ = @import("ui/style.zig");
     _ = @import("core/agent/system_prompt.zig");
     _ = @import("cli/repl.zig");
     _ = @import("core/redact.zig");

@@ -22,6 +22,7 @@ const hooks_mod = @import("../core/hooks.zig");
 const compaction_mod = @import("../core/compaction.zig");
 const lifecycle_mod = @import("../core/lifecycle.zig");
 const executions_mod = @import("../core/executions.zig");
+const style_mod = @import("../ui/style.zig");
 const tool_mod = @import("../tools/tool.zig");
 const core_types = @import("../core/types.zig");
 const openai = @import("../providers/openai.zig");
@@ -32,6 +33,7 @@ const max_output_bytes: usize = 256 * 1024;
 pub const Options = struct {
     resume_id: ?[]const u8 = null,
     json: bool = false,
+    no_color: bool = false,
 };
 
 const Session = struct {
@@ -50,12 +52,23 @@ const Session = struct {
     last_blocked_stage: ?[]const u8 = null,
 };
 
+var palette: style_mod.Palette = .{};
+var g_environ: ?*const std.process.Environ.Map = null;
+var g_no_color: bool = false;
+
+fn envLookup(key: []const u8) ?[]const u8 {
+    const e = g_environ orelse return null;
+    return e.get(key);
+}
+
 pub fn run(
     io: std.Io,
     arena: std.mem.Allocator,
     environ: *const std.process.Environ.Map,
     opts: Options,
 ) !void {
+    g_environ = environ;
+    g_no_color = opts.no_color;
     const cwd = std.Io.Dir.cwd();
 
     // ---- configuration ----
@@ -66,6 +79,8 @@ pub fn run(
     }
     if (cfg.errors.items.len > 0) return error.InvalidConfig;
     for (cfg.warnings.items) |w| try out(io, "config warning: {s}\n", .{w});
+
+    palette = style_mod.Palette.detect(arena, io, envLookup, cfg.getBool("ui.colors", true), g_no_color);
 
     // ---- session state (zero-config: lazily create .ifnh) ----
     ensureIfnh(io, cwd) catch {};
@@ -290,7 +305,15 @@ fn submitTurn(
             _ = name;
             const max_show: usize = 400;
             const shown = if (output.len > max_show) output[0..max_show] else output;
-            out(self.io, "[{s}] {s}{s}\n", .{ @tagName(status), shown, if (output.len > max_show) "..." else "" }) catch {};
+            var scratch: [64]u8 = undefined;
+            const tag = std.fmt.bufPrint(&scratch, "[{s}]", .{@tagName(status)}) catch "[?]";
+            const pa: style_mod.Palette = palette;
+            const colored = switch (status) {
+                .ok => pa.green(tag, std.heap.page_allocator),
+                .denied => pa.yellow(tag, std.heap.page_allocator),
+                else => pa.red(tag, std.heap.page_allocator),
+            };
+            out(self.io, "{s} {s}{s}\n", .{ colored, shown, if (output.len > max_show) "..." else "" }) catch {};
         }
         fn onNotice(ctx: *anyopaque, text: []const u8) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
