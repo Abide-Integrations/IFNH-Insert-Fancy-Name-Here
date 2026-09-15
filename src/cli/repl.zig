@@ -20,6 +20,7 @@ const mcp_mod = @import("../core/mcp.zig");
 const skills_mod = @import("../core/skills.zig");
 const hooks_mod = @import("../core/hooks.zig");
 const compaction_mod = @import("../core/compaction.zig");
+const lifecycle_mod = @import("../core/lifecycle.zig");
 const tool_mod = @import("../tools/tool.zig");
 const core_types = @import("../core/types.zig");
 const openai = @import("../providers/openai.zig");
@@ -605,6 +606,94 @@ fn handleCommand(
         createPlan(io, cwd, arena, rest) catch |err| {
             out(io, "plan creation failed: {s}\n", .{@errorName(err)}) catch {};
         };
+    } else if (std.mem.eql(u8, cmd, "lifecycle")) {
+        if (!std.mem.startsWith(u8, rest, "run ")) {
+            out(io, "usage: /lifecycle run <file.json>\n", .{}) catch {};
+            return .none;
+        }
+        const file_path = std.mem.trim(u8, rest[4..], " \t");
+        const text = fsutil.readSmallFile(cwd, io, arena, file_path, 256 * 1024) catch {
+            out(io, "cannot read {s}\n", .{file_path}) catch {};
+            return .none;
+        };
+        const lc = lifecycle_mod.parse(arena, text) catch {
+            out(io, "invalid lifecycle file {s}\n", .{file_path}) catch {};
+            return .none;
+        };
+        out(io, "running lifecycle '{s}' ({d} stages)\n", .{ lc.name, lc.stages.len }) catch {};
+
+        // Build a host for lifecycle children (reuses the turn host pieces).
+        var cancel2 = std.atomic.Value(bool).init(false);
+        var approver2 = Approver{ .io = io, .engine = &sess.engine };
+        var host2 = subagent_mod.Host{
+            .io = io,
+            .workspace = cwd,
+            .base_system = instr.text,
+            .provider = buildProviderConfig(cfg, environ).provider,
+            .base_url = buildProviderConfig(cfg, environ).base_url,
+            .api_key = buildProviderConfig(cfg, environ).api_key,
+            .default_model = buildProviderConfig(cfg, environ).model,
+            .mode = sess.engine.mode,
+            .read_globs = sess.engine.read_globs,
+            .write_globs = sess.engine.write_globs,
+            .command_allow = sess.engine.command_allow,
+            .command_deny = sess.engine.command_deny,
+            .env_allow = sess.engine.env_allow,
+            .journal = &sess.journal,
+            .approval_ctx = &approver2,
+            .approval_fn = Approver.approve,
+            .max_depth = cfg.getU32("agents.max_depth", 1),
+            .max_concurrent = cfg.getU32("agents.max_concurrent", 4),
+            .max_rounds = 25,
+            .redactions = &.{},
+            .cancel = &cancel2,
+            .git = blk: {
+                var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+                const n = cwd.realPath(io, &path_buf) catch break :blk null;
+                const repo_path = arena.dupe(u8, path_buf[0..n]) catch break :blk null;
+                const g = git_mod.Git.init(io, repo_path);
+                if (!g.isRepo(arena)) break :blk null;
+                break :blk g;
+            },
+            .worktree_root = blk: {
+                const home = environ.get("HOME") orelse break :blk null;
+                const root2 = std.fmt.allocPrint(arena, "{s}/.local/state/ifnh/worktrees", .{home}) catch break :blk null;
+                cwd.createDirPath(io, root2) catch {};
+                break :blk root2;
+            },
+            .session_hint = sess.store.manifest.id,
+        };
+        const outcomes = lifecycle_mod.run(arena, io, &host2, lc, 0, .{
+            .ctx = io.userdata.?,
+            .on_stage_start = struct {
+                fn f(_: *anyopaque, stage: []const u8, role: []const u8) void {
+                    _ = stage;
+                    _ = role;
+                }
+            }.f,
+            .on_stage_done = struct {
+                fn f(_: *anyopaque, o: lifecycle_mod.StageOutcome) void {
+                    _ = o;
+                }
+            }.f,
+            .approve = struct {
+                fn f(_: *anyopaque, stage: []const u8, summary: []const u8) bool {
+                    _ = stage;
+                    _ = summary;
+                    return true; // approval surfaces via child reports in M1
+                }
+            }.f,
+        }) catch |err| {
+            out(io, "lifecycle failed: {s}\n", .{@errorName(err)}) catch {};
+            return .none;
+        };
+        for (outcomes) |o| {
+            out(io, "  [{s}] {s}{s}\n", .{
+                @tagName(o.status),
+                o.stage,
+                if (o.blockers > 0) " (blockers)" else "",
+            }) catch {};
+        }
     } else if (std.mem.eql(u8, cmd, "usage")) {
         var total_in: u64 = 0;
         var total_out: u64 = 0;
