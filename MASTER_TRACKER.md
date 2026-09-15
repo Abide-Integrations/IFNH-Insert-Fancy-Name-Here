@@ -11,8 +11,8 @@
 | Milestone | Theme | Exit condition | Status |
 |---|---|---|---|
 | **M0** | Vertical-slice core | Tool loop works e2e against fake provider; sessions resume; undo restores files; permission gates hold; startup budget measured | **code complete** (2026-09-14) — 54 tests green, 1.3 MiB stripped; residual `[~]` items tracked above (raw-mode editor, retry policy, disk-backed commands → M1) |
-| **M1** | Agents, extensions, observability | Subagents + worktrees + MCP + skills + hooks functional with tests; usage tracking; doctor | not started |
-| **M2** | Lifecycle, governance, budgets | Lifecycle engine + review gates + forks; CI budgets enforced; go-public checklist green | not started |
+| **M1** | Agents, extensions, observability | Subagents + worktrees + MCP + skills + hooks functional with tests; usage tracking; doctor | **code complete** (2026-09-14) — subagents/worktrees/MCP/skills/hooks/compaction/usage/doctor landed; deferred: background execs, read_tool_result, HTTP MCP |
+| **M2** | Lifecycle, governance, budgets | Lifecycle engine + review gates + forks; CI budgets enforced; go-public checklist green | **in progress** — lifecycle + reviews landed; remaining: forks, cleanup, CI gates, --json, recon skill, go-public checklist |
 | **Post** | Roadmap | DECISIONS `[post]` items, 0.17.0 compat | ongoing |
 
 ---
@@ -109,21 +109,21 @@
 
 | ID | Task | Depends | Status | Notes |
 |---|---|---|---|---|
-| M1-T01 | Subagent runtime: spawn request schema, thread-per-child, captured authority snapshot, per-child cancel, structured reports to `reports/` | M0-T32 | `[ ]` | E53–66 |
-| M1-T02 | Parallel subagent groups + auto concurrency (read-only parallel rule) + runaway caps | M1-T01 | `[ ]` | E56–58/70 |
-| M1-T03 | `/agents` status pane + child inspection | M1-T01 | `[ ]` | R240 |
-| M1-T04 | Worktrees: naming, location, branches, merge gate integration, failed-task retention, cleanup-with-approval | M1-T01 | `[ ]` | L164–168 |
-| M1-T05 | MCP client: stdio dispatcher (NDJSON reader thread) + Streamable HTTP, config, admission/trust, permission integration, per-agent allowlists | M0-T28 | `[ ]` | J135–144 |
-| M1-T06 | Skills: SKILL.md catalog (user/project/compat roots), budgeted `<available_skills>` index, `skill` loader tool, `/skills`, `/reload skills` | M0-T37 | `[ ]` | K147–159 |
-| M1-T07 | Hooks: 10 events, sync, block semantics, trust-gated project hooks | M0-T32 | `[ ]` | P212–222 |
-| M1-T08 | Context compaction: trigger thresholds, chunked summary pipeline, structured handoff checkpoint, `/compact` | M0-T12 | `[ ]` | C36–37 |
-| M1-T09 | Usage tracking: per-agent tokens/cost/time/tool-calls (`usage.jsonl`), surfaced in `/agents` | M0-T32 | `[ ]` | S254–258 |
-| M1-T10 | Background/managed executions: execution handles, poll/stop, session-end cleanup | M0-T26 | `[ ]` | I123–125 |
-| M1-T11 | Model catalog probing + aliases/fallbacks + routing table + cost estimation | M0-T19 | `[ ]` | D42–51 |
-| M1-T12 | `read_tool_result` artifact retrieval + output artifact store | M0-T24 | `[ ]` | I127 |
-| M1-T13 | Checkpoints (watermark + handoff + config hash + refs) | M0-T12 | `[ ]` | A7 |
-| M1-T14 | `ifnh doctor`: config, provider reachability, git, MCP health | M1-T05 | `[ ]` | S259 |
-| M1-T15 | Deterministic multi-agent integration tests (fake provider driving children) | M1-T01 | `[ ]` | U287 |
+| M1-T01 | Subagent runtime: spawn request schema, thread-per-child, captured authority snapshot, per-child cancel, structured reports to `reports/` | M0-T32 | `[x]` | role-scoped engines; authority snapshot; durable reports |
+| M1-T02 | Parallel subagent groups + auto concurrency (read-only parallel rule) + runaway caps | M1-T01 | `[x]` | consecutive agent calls run on threads, ordered fan-in; depth/concurrency caps |
+| M1-T03 | `/agents` status pane + child inspection | M1-T01 | `[~]` | /agents lists reports; live pane deferred (children run inline) |
+| M1-T04 | Worktrees: naming, location, branches, merge gate integration, failed-task retention, cleanup-with-approval | M1-T01 | `[x]` | isolation:"worktree"; branch ifnh/<session>/<agent>; diff preview in envelope; cleanup M2 |
+| M1-T05 | MCP client: stdio dispatcher (NDJSON reader thread) + Streamable HTTP, config, admission/trust, permission integration, per-agent allowlists | M0-T28 | `[~]` | stdio done (lazy spawn, tools/call, permission-gated, /mcp); HTTP transport + per-agent allowlists M2 |
+| M1-T06 | Skills: SKILL.md catalog (user/project/compat roots), budgeted `<available_skills>` index, `skill` loader tool, `/skills`, `/reload skills` | M0-T37 | `[x]` | per-turn catalog; /reload M2 |
+| M1-T07 | Hooks: 10 events, sync, block semantics, trust-gated project hooks | M0-T32 | `[~]` | 8 events wired (before/after agent); tool/merge-level dispatch M2 |
+| M1-T08 | Context compaction: trigger thresholds, chunked summary pipeline, structured handoff checkpoint, `/compact` | M0-T12 | `[x]` | auto at turn boundaries + manual; chunked pipeline C36 note |
+| M1-T09 | Usage tracking: per-agent tokens/cost/time/tool-calls (`usage.jsonl`), surfaced in `/agents` | M0-T32 | `[x]` | session usage.jsonl + /usage totals |
+| M1-T10 | Background/managed executions: execution handles, poll/stop, session-end cleanup | M0-T26 | `[ ]` | deferred |
+| M1-T11 | Model catalog probing + aliases/fallbacks + routing table + cost estimation | M0-T19 | `[~]` | /model session override + role routing (lifecycle); aliases/fallbacks/cost M2 |
+| M1-T12 | `read_tool_result` artifact retrieval + output artifact store | M0-T24 | `[ ]` | deferred |
+| M1-T13 | Checkpoints (watermark + handoff + config hash + refs) | M0-T12 | `[~]` | watermark + manifest + compaction notes; full checkpoint.json M2 |
+| M1-T14 | `ifnh doctor`: config, provider reachability, git, MCP health | M1-T05 | `[x]` | config/provider-key/git/MCP/state checks |
+| M1-T15 | Deterministic multi-agent integration tests (fake provider driving children) | M1-T01 | `[x]` | subagent + lifecycle e2e on scripted providers |
 
 **M1 exit:** W302 feature set works with tests; per-child overhead measured (T265).
 
@@ -133,8 +133,8 @@
 
 | ID | Task | Depends | Status | Notes |
 |---|---|---|---|---|
-| M2-T01 | Lifecycle schema v1 + stage runner (linear, entry/exit conditions, per-stage agent/model/permissions) | M1-T01 | `[ ]` | F76–86 |
-| M2-T02 | Review gates: reviewer role, multi-reviewer, all/any/n_of_m, severity model, blocking rules | M2-T01 | `[ ]` | G88–95 |
+| M2-T01 | Lifecycle schema v1 + stage runner (linear, entry/exit conditions, per-stage agent/model/permissions) | M1-T01 | `[x]` | linear runner + entry conditions + role routing |
+| M2-T02 | Review gates: reviewer role, multi-reviewer, all/any/n_of_m, severity model, blocking rules | M2-T01 | `[~]` | single reviewer + blocker parsing + stop-on-block; multi-reviewer M2+ |
 | M2-T03 | Review overrides (developer-only, audited) + `/review` command | M2-T02 | `[ ]` | G96/97 |
 | M2-T04 | Reconciliation-agent flow for concurrent conflicts | M2-T01 | `[ ]` | D045/046 |
 | M2-T05 | Session forks (+ optional worktree binding) + `fork diff` | M0-T13 | `[ ]` | A11/12 |
