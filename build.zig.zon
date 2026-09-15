@@ -1,0 +1,16 @@
+.{
+    .name = .ifnh,
+    .version = "0.0.1",
+    .fingerprint = 0x93277f440563ae3d, // Compiler-assigned for this new package; regenerate if forking another package.
+    .minimum_zig_version = "0.16.0",
+    // Zero third-party dependencies (ADR-0001). Any addition requires an ADR
+    // and a "why does this belong in core" review.
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "LICENSE",
+        "src",
+        "tests",
+    },
+}
