@@ -626,7 +626,7 @@ fn handleCommand(
         out(io, "session usage: {d} turns, {d} tokens in, {d} tokens out\n", .{ turns, total_in, total_out }) catch {};
     } else if (std.mem.eql(u8, cmd, "compact")) {
         const pcfg2 = buildProviderConfig(cfg, environ);
-        try out(io, "[compacting context...]\n", .{});
+        out(io, "[compacting context...]\n", .{}) catch {};
         const res_opt: ?compaction_mod.Result = blk: {
             break :blk compaction_mod.compact(arena, io, pcfg2, &sess.history, &.{}) catch |err| {
                 out(io, "compaction failed: {s}\n", .{@errorName(err)}) catch {};
@@ -635,8 +635,8 @@ fn handleCommand(
         };
         if (res_opt) |res| {
             sess.history.clearRetainingCapacity();
-            try sess.history.appendSlice(arena, res.history);
-            _ = try sess.store.append(.{ .note = .{ .text = "manual compaction" } });
+            sess.history.appendSlice(arena, res.history) catch {};
+            _ = sess.store.append(.{ .note = .{ .text = "manual compaction" } }) catch {};
             out(io, "[compacted: {d} -> {d} tokens]\n", .{ res.tokens_before, res.tokens_after }) catch {};
         }
     } else if (std.mem.eql(u8, cmd, "skills")) {
