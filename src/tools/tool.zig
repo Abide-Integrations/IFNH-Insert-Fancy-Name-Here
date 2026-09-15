@@ -47,6 +47,9 @@ pub const ToolContext = struct {
     /// Subagent runtime hook (wired by the host; null disables spawning).
     agent_spawn_fn: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, parent_depth: usize, arguments_json: []const u8) AgentSpawnResult = null,
     agent_spawn_ctx: ?*anyopaque = null,
+    /// Skill loader hook (wired by the host; null disables the tool).
+    skill_load_fn: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, name: []const u8) ?[]const u8 = null,
+    skill_ctx: ?*anyopaque = null,
     /// MCP registry hooks (wired by the host; null disables MCP).
     mcp_list_fn: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator) []const u8 = null,
     mcp_call_fn: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, server: []const u8, tool: []const u8, arguments_json: []const u8) []const u8 = null,
@@ -105,6 +108,9 @@ pub const specs = [_]Spec{
     },
     .{ .name = "bash", .description = "Run a shell command in the workspace. Read-only commands run freely; anything that changes state requires approval.", .parameters_json =
     \\{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}
+    },
+    .{ .name = "skill", .description = "Load a named skill's full instructions from the installed skills catalog.", .parameters_json =
+    \\{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}
     },
     .{ .name = "mcp_list", .description = "List configured MCP servers and their tools.", .parameters_json =
     \\{"type":"object","properties":{}}
@@ -189,6 +195,13 @@ pub fn execute(name: []const u8, args_json: []const u8, ctx: *ToolContext) ToolR
     } else if (std.mem.eql(u8, name, "bash")) {
         const command = a.str("command") orelse return errResult(ctx.arena, "bash: missing command", .{});
         return toolBash(command, ctx);
+    } else if (std.mem.eql(u8, name, "skill")) {
+        const load_fn = ctx.skill_load_fn orelse
+            return errResult(ctx.arena, "skill: skills not available", .{});
+        const skill_name = a.str("name") orelse return errResult(ctx.arena, "skill: missing name", .{});
+        const body = load_fn(ctx.skill_ctx orelse ctx.approval_ctx, ctx.arena, skill_name) orelse
+            return errResult(ctx.arena, "skill: '{s}' not found in catalog", .{skill_name});
+        return .{ .output = body, .status = .ok };
     } else if (std.mem.eql(u8, name, "mcp_list")) {
         const list_fn = ctx.mcp_list_fn orelse
             return errResult(ctx.arena, "mcp_list: MCP not configured", .{});

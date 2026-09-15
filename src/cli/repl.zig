@@ -17,6 +17,7 @@ const agent_engine = @import("../core/agent/engine.zig");
 const subagent_mod = @import("../core/agent/subagent.zig");
 const git_mod = @import("../core/git.zig");
 const mcp_mod = @import("../core/mcp.zig");
+const skills_mod = @import("../core/skills.zig");
 const tool_mod = @import("../tools/tool.zig");
 const core_types = @import("../core/types.zig");
 const openai = @import("../providers/openai.zig");
@@ -30,6 +31,7 @@ pub const Options = struct {
 };
 
 const Session = struct {
+    io: std.Io,
     store: session_mod.Session,
     journal: journal_mod.Journal,
     engine: engine_mod.Engine,
@@ -38,6 +40,7 @@ const Session = struct {
     /// config re-reads at turn boundaries (DECISIONS B24).
     overrides: std.ArrayListUnmanaged(struct { path: []const u8, json: []const u8 }) = .empty,
     mcp_registry: ?*mcp_mod.Registry = null,
+    skills: ?skills_mod.Catalog = null,
 };
 
 pub fn run(
@@ -65,14 +68,14 @@ pub fn run(
         if (opts.resume_id) |id| {
             const store = try session_mod.Session.open(cwd, io, arena, sessions_dir_name, id);
             const j = try journal_mod.Journal.open(io, arena, store.dir);
-            var s = Session{ .store = store, .journal = j, .engine = engineFromConfig(arena, &cfg) };
+            var s = Session{ .io = io, .store = store, .journal = j, .engine = engineFromConfig(arena, &cfg) };
             try rebuildHistory(arena, &s);
             break :blk s;
         } else {
             const cwd_copy: []const u8 = if (environ.get("PWD")) |pwd| pwd else ".";
             const store = try session_mod.Session.create(cwd, io, arena, sessions_dir_name, cwd_copy);
             const j = try journal_mod.Journal.open(io, arena, store.dir);
-            break :blk Session{ .store = store, .journal = j, .engine = engineFromConfig(arena, &cfg) };
+            break :blk Session{ .io = io, .store = store, .journal = j, .engine = engineFromConfig(arena, &cfg) };
         }
     };
     defer {
@@ -80,6 +83,13 @@ pub fn run(
         sess.store.close();
         sess.journal.close();
     }
+
+    // ---- skills catalog (K148/149) ----
+    sess.skills = blk: {
+        const user_dir = std.fmt.allocPrint(arena, "{s}/.config/ifnh/skills", .{environ.get("HOME") orelse ""}) catch break :blk null;
+        const catalog = skills_mod.discover(cwd, io, arena, user_dir) catch break :blk null;
+        break :blk catalog;
+    };
 
     // ---- MCP registry (lazy servers, J137/138) ----
     sess.mcp_registry = blk: {
@@ -144,8 +154,18 @@ pub fn run(
         }
         const focus = instructions_mod.focusDirsFromHistory(arena, sess.history.items, 8);
         const turn_instr = instructions_mod.assemble(cwd, io, arena, system_prompt.system_prompt, focus) catch instr;
+        // Skills catalog appendix (budgeted, K148).
+        const skill_prompt = blk: {
+            if (sess.skills) |catalog| {
+                const rendered = skills_mod.renderCatalog(arena, catalog) catch "";
+                if (rendered.len > 0) {
+                    break :blk std.fmt.allocPrint(arena, "{s}\n\nAvailable skills (load with the skill tool):\n{s}", .{ turn_instr.text, rendered }) catch turn_instr.text;
+                }
+            }
+            break :blk turn_instr.text;
+        };
 
-        try submitTurn(io, arena, environ, &sess, &cfg, buildProviderConfig(&cfg, environ), turn_instr.text, line, cwd);
+        try submitTurn(io, arena, environ, &sess, &cfg, buildProviderConfig(&cfg, environ), skill_prompt, line, cwd);
     }
 }
 
@@ -231,6 +251,8 @@ fn submitTurn(
         .mcp_list_fn = mcpListHook,
         .mcp_call_fn = mcpCallHook,
         .mcp_ctx = sess.mcp_registry orelse mcp_registry_sentinel,
+        .skill_load_fn = skillLoadHook,
+        .skill_ctx = sess,
     };
     tool_ctx.approval_ctx = &approver;
     tool_ctx.approval_fn = Approver.approve;
@@ -391,6 +413,13 @@ fn mcpListHook(ctx: *anyopaque, arena: std.mem.Allocator) []const u8 {
     return buf.items;
 }
 
+fn skillLoadHook(ctx: *anyopaque, arena: std.mem.Allocator, name: []const u8) ?[]const u8 {
+    const sess: *Session = @ptrCast(@alignCast(ctx));
+    const catalog = sess.skills orelse return null;
+    const cwd = std.Io.Dir.cwd();
+    return skills_mod.loadSkill(cwd, sess.io, arena, catalog, name) catch null;
+}
+
 fn mcpCallHook(ctx: *anyopaque, arena: std.mem.Allocator, server: []const u8, tool: []const u8, arguments_json: []const u8) []const u8 {
     const reg: *mcp_mod.Registry = @ptrCast(@alignCast(ctx));
     if (reg == mcp_registry_sentinel) return "error: MCP not configured";
@@ -524,6 +553,15 @@ fn handleCommand(
         createPlan(io, cwd, arena, rest) catch |err| {
             out(io, "plan creation failed: {s}\n", .{@errorName(err)}) catch {};
         };
+    } else if (std.mem.eql(u8, cmd, "skills")) {
+        if (sess.skills) |catalog| {
+            if (catalog.skills.len == 0) {
+                out(io, "no skills installed (.ifnh/skills/, ~/.config/ifnh/skills/)\n", .{}) catch {};
+            }
+            for (catalog.skills) |s| {
+                out(io, "  [{s}] {s}: {s}\n", .{ s.scope, s.name, s.description }) catch {};
+            }
+        } else out(io, "skills unavailable\n", .{}) catch {};
     } else if (std.mem.eql(u8, cmd, "mcp")) {
         if (sess.mcp_registry) |reg| {
             if (reg.configs.len == 0) {
