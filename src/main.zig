@@ -219,6 +219,7 @@ test {
     _ = @import("core/git.zig");
     _ = @import("core/mcp.zig");
     _ = @import("core/skills.zig");
+    _ = @import("core/hooks.zig");
     _ = @import("core/agent/system_prompt.zig");
     _ = @import("cli/repl.zig");
     _ = @import("core/redact.zig");

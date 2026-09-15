@@ -18,6 +18,7 @@ const subagent_mod = @import("../core/agent/subagent.zig");
 const git_mod = @import("../core/git.zig");
 const mcp_mod = @import("../core/mcp.zig");
 const skills_mod = @import("../core/skills.zig");
+const hooks_mod = @import("../core/hooks.zig");
 const tool_mod = @import("../tools/tool.zig");
 const core_types = @import("../core/types.zig");
 const openai = @import("../providers/openai.zig");
@@ -281,6 +282,13 @@ fn submitTurn(
     };
     var ui = TurnUi{ .io = io };
 
+    var hook_engine = hooks_mod.Engine.init(io, cwd, try hooks_mod.Engine.fromConfig(arena, cfg.get("hooks")), arena);
+    const pre = hook_engine.dispatch(.before_agent, "{}");
+    if (pre.blocked) {
+        try out(io, "before_agent hook blocked the turn: {s}\n", .{pre.output});
+        return;
+    }
+
     const outcome = agent_engine.runTurn(.{
         .io = io,
         .arena = arena,
@@ -303,6 +311,7 @@ fn submitTurn(
         return;
     };
 
+    _ = hook_engine.dispatch(.after_agent, "{}");
     try out(io, "\n", .{});
     switch (outcome.status) {
         .completed => {
