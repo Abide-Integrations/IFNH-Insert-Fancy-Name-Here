@@ -402,3 +402,4 @@ Answers above marked `[cfg]` are shipped defaults, not laws: every one is meant 
 | Date | Change |
 |---|---|
 | 2026-09-14 | Initial resolution of the full discovery backlog (Q1–Q310) + meta-decisions M1–M4. |
+| 2026-09-14 | Implementation notes: MCP tools surface via explicit `mcp_list`/`mcp_call` tools (J135 simplification, fx-style lazy schema advertisement deferred); slash-command dispatch and hooks confirmed as designed; lifecycle reviews implemented as single reviewer with BLOCKERS severity parsing (G92 n_of_m deferred). |

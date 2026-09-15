@@ -12,7 +12,7 @@
 |---|---|---|---|
 | **M0** | Vertical-slice core | Tool loop works e2e against fake provider; sessions resume; undo restores files; permission gates hold; startup budget measured | **code complete** (2026-09-14) — 54 tests green, 1.3 MiB stripped; residual `[~]` items tracked above (raw-mode editor, retry policy, disk-backed commands → M1) |
 | **M1** | Agents, extensions, observability | Subagents + worktrees + MCP + skills + hooks functional with tests; usage tracking; doctor | **code complete** (2026-09-14) — subagents/worktrees/MCP/skills/hooks/compaction/usage/doctor landed; deferred: background execs, read_tool_result, HTTP MCP |
-| **M2** | Lifecycle, governance, budgets | Lifecycle engine + review gates + forks; CI budgets enforced; go-public checklist green | **largely complete** (2026-09-14) — lifecycle/reviews/forks/cleanup/CI gates/governance/recon landed; remaining: review overrides, reconciliation agent, fork diff |
+| **M2** | Lifecycle, governance, budgets | Lifecycle engine + review gates + forks; CI budgets enforced; go-public checklist green | **code complete** (2026-09-14) — all M2 tasks landed except `fork diff` (post). Remaining open items are polish (`[~]`) and post-1.0 features |
 | **Post** | Roadmap | DECISIONS `[post]` items, 0.17.0 compat | ongoing |
 
 ---
@@ -46,7 +46,7 @@
 | M0-T11 | `core/session/`: dir layout, manifest, id generation (`s_` + 12-char), flock/SessionBusy | M0-T02 | `[x]` | tryLock non-blocking; SessionBusy tested |
 | M0-T12 | JSONL event writer with watermark + bounded replay reader + torn-tail handling | M0-T11 | `[x]` | torn tail ignored; assistant tool_calls embedded |
 | M0-T13 | `ifnh sessions list` / `ifnh resume` (picker + last) with UI replay projection | M0-T12 | `[x]` | list + resume by id; interactive picker M1 |
-| M0-T14 | `core/journal.zig`: intent/commit groups, inverse patches, undo/redo walker | M0-T02 | `[ ]` | DESIGN §3.6 |
+| M0-T14 | `core/journal.zig`: intent/commit groups, inverse patches, undo/redo walker | M0-T02 | `[x]` | DESIGN §3.6 |
 | M0-T15 | Crash-recovery pass: replay/rollback incomplete journal groups at startup | M0-T14 | `[x]` | rollback-on-open tested |
 
 ### M0.4 Providers (prototype-first per W309)
@@ -118,9 +118,9 @@
 | M1-T07 | Hooks: 10 events, sync, block semantics, trust-gated project hooks | M0-T32 | `[~]` | 8 events wired (before/after agent); tool/merge-level dispatch M2 |
 | M1-T08 | Context compaction: trigger thresholds, chunked summary pipeline, structured handoff checkpoint, `/compact` | M0-T12 | `[x]` | auto at turn boundaries + manual; chunked pipeline C36 note |
 | M1-T09 | Usage tracking: per-agent tokens/cost/time/tool-calls (`usage.jsonl`), surfaced in `/agents` | M0-T32 | `[x]` | session usage.jsonl + /usage totals |
-| M1-T10 | Background/managed executions: execution handles, poll/stop, session-end cleanup | M0-T26 | `[ ]` | deferred |
+| M1-T10 | Background/managed executions: execution handles, poll/stop, session-end cleanup | M0-T26 | `[x]` | registry + bash background:true + exec tool + /exec |
 | M1-T11 | Model catalog probing + aliases/fallbacks + routing table + cost estimation | M0-T19 | `[~]` | /model session override + role routing (lifecycle); aliases/fallbacks/cost M2 |
-| M1-T12 | `read_tool_result` artifact retrieval + output artifact store | M0-T24 | `[ ]` | deferred |
+| M1-T12 | `read_tool_result` artifact retrieval + output artifact store | M0-T24 | `[x]` | oversized outputs to .ifnh/cache/artifacts with paging |
 | M1-T13 | Checkpoints (watermark + handoff + config hash + refs) | M0-T12 | `[~]` | watermark + manifest + compaction notes; full checkpoint.json M2 |
 | M1-T14 | `ifnh doctor`: config, provider reachability, git, MCP health | M1-T05 | `[x]` | config/provider-key/git/MCP/state checks |
 | M1-T15 | Deterministic multi-agent integration tests (fake provider driving children) | M1-T01 | `[x]` | subagent + lifecycle e2e on scripted providers |
@@ -135,8 +135,8 @@
 |---|---|---|---|---|
 | M2-T01 | Lifecycle schema v1 + stage runner (linear, entry/exit conditions, per-stage agent/model/permissions) | M1-T01 | `[x]` | linear runner + entry conditions + role routing |
 | M2-T02 | Review gates: reviewer role, multi-reviewer, all/any/n_of_m, severity model, blocking rules | M2-T01 | `[~]` | single reviewer + blocker parsing + stop-on-block; multi-reviewer M2+ |
-| M2-T03 | Review overrides (developer-only, audited) + `/review` command | M2-T02 | `[ ]` | remaining |
-| M2-T04 | Reconciliation-agent flow for concurrent conflicts | M2-T01 | `[ ]` | remaining |
+| M2-T03 | Review overrides (developer-only, audited) + `/review` command | M2-T02 | `[x]` | audit artifacts + --from resume |
+| M2-T04 | Reconciliation-agent flow for concurrent conflicts | M2-T01 | `[x]` | /reconcile via journal version history (D045/046) |
 | M2-T05 | Session forks (+ optional worktree binding) + `fork diff` | M0-T13 | `[x]` | Session.fork() + fork_of manifest + `ifnh fork`; fork diff post |
 | M2-T06 | `ifnh cleanup` (retention, orphan worktrees w/ approval, debug logs) | M1-T04 | `[x]` | dry-run default, --yes executes |
 | M2-T07 | CI: build + test matrix (Linux/macOS), size + startup budget gates, `zig fmt` check | M0-T40/41 | `[x]` | size + startup gates in ci.yml |
