@@ -19,6 +19,7 @@ const tool_mod = @import("../../tools/tool.zig");
 const engine_mod = @import("../permissions/engine.zig");
 const journal_mod = @import("../journal.zig");
 const fsutil = @import("../fsutil.zig");
+const git_mod = @import("../git.zig");
 
 pub const max_summary_bytes: usize = 4 * 1024;
 
@@ -60,6 +61,12 @@ pub const Host = struct {
     cancel: *std.atomic.Value(bool),
     active: std.atomic.Value(u32) = .init(0),
     report_seq: std.atomic.Value(u32) = .init(0),
+    /// Git access for worktree isolation (null = worktrees unavailable).
+    git: ?git_mod.Git = null,
+    /// Where agent worktrees are created (absolute, outside the repo).
+    worktree_root: ?[]const u8 = null,
+    /// Session hint used in worktree/branch names.
+    session_hint: []const u8 = "s",
 };
 
 fn rolePreamble(arena: std.mem.Allocator, role: Role, label: []const u8) ![]const u8 {
@@ -107,6 +114,7 @@ pub fn spawnHook(
     var task: []const u8 = "";
     var role: Role = .implement;
     var model: ?[]const u8 = null;
+    var isolation_worktree = false;
     {
         const v = std.json.parseFromSliceLeaky(std.json.Value, arena, arguments_json, .{}) catch
             return fail(arena, "agent: invalid arguments", .{});
@@ -123,6 +131,9 @@ pub fn spawnHook(
         if (o.get("model")) |m| {
             if (m == .string and m.string.len > 0) model = m.string;
         }
+        if (o.get("isolation")) |iso| {
+            if (iso == .string and std.mem.eql(u8, iso.string, "worktree")) isolation_worktree = true;
+        }
     }
 
     if (host.cancel.load(.acquire)) return fail(arena, "agent: cancelled", .{});
@@ -133,8 +144,27 @@ pub fn spawnHook(
     defer _ = host.active.fetchSub(1, .acq_rel);
 
     const label = std.fmt.allocPrint(arena, "{s}-{d}", .{ @tagName(role), host.report_seq.load(.monotonic) + 1 }) catch "child";
-    const result = runChild(host, arena, task, role, model, parent_depth, label);
+    const result = runChild(host, arena, task, role, model, parent_depth, label, isolation_worktree);
     return result;
+}
+
+const WorktreeInfo = struct {
+    path: ?[]const u8 = null,
+    branch: ?[]const u8 = null,
+    note: []const u8 = "",
+};
+
+/// Create an isolated git worktree for the child (D009, L164-166).
+fn prepareWorktree(host: *Host, arena: std.mem.Allocator, label: []const u8) WorktreeInfo {
+    const git = host.git orelse return .{ .note = "worktree isolation unavailable (not a git repository); child runs in the main workspace" };
+    const root = host.worktree_root orelse return .{ .note = "worktree root not configured; child runs in the main workspace" };
+    const name = std.fmt.allocPrint(arena, "ifnh-{s}-{s}", .{ host.session_hint, label }) catch return .{};
+    const path = std.fmt.allocPrint(arena, "{s}/{s}", .{ root, name }) catch return .{};
+    const branch = std.fmt.allocPrint(arena, "ifnh/{s}/{s}", .{ host.session_hint, label }) catch return .{};
+    git.addWorktree(arena, path, branch) catch |err| {
+        return .{ .note = std.fmt.allocPrint(arena, "worktree creation failed ({s}); child runs in the main workspace", .{@errorName(err)}) catch "" };
+    };
+    return .{ .path = path, .branch = branch };
 }
 
 fn fail(arena: std.mem.Allocator, comptime fmt: []const u8, args: anytype) tool_mod.AgentSpawnResult {
@@ -150,11 +180,22 @@ fn runChild(
     model: ?[]const u8,
     parent_depth: usize,
     label: []const u8,
+    isolation_worktree: bool,
 ) tool_mod.AgentSpawnResult {
     // Child gets its own arena (thread isolation; freed before return).
     var child_arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer child_arena_state.deinit();
     const child_arena = child_arena_state.allocator();
+
+    // Worktree isolation (D009): the child operates inside its own tree.
+    var child_workspace = host.workspace;
+    var wt = WorktreeInfo{};
+    if (isolation_worktree) {
+        wt = prepareWorktree(host, parent_arena, label);
+        if (wt.path) |p| {
+            child_workspace = std.Io.Dir.openDirAbsolute(host.io, p, .{ .access_sub_paths = true }) catch host.workspace;
+        }
+    }
 
     // Role-scoped engine: research/review are read-only (D015).
     var child_engine = engine_mod.Engine.init(child_arena, host.mode);
@@ -170,7 +211,7 @@ fn runChild(
     var child_tool_ctx = tool_mod.ToolContext{
         .io = host.io,
         .arena = child_arena,
-        .workspace = host.workspace,
+        .workspace = child_workspace,
         .engine = &child_engine,
         .journal = host.journal,
         .max_file_read_bytes = 256 * 1024,
@@ -221,21 +262,38 @@ fn runChild(
         return fail(parent_arena, "agent: child turn failed: {s}", .{@errorName(err)});
     };
 
+    // Diff summary for worktree-isolated children (L172 preview).
+    var diff_note: []const u8 = "";
+    if (wt.path) |wp| {
+        if (host.git) |g| {
+            const diff = g.diffWorktree(parent_arena, wp);
+            if (diff.len > 0) {
+                const max_diff: usize = 2 * 1024;
+                diff_note = std.fmt.allocPrint(parent_arena, "\nworktree diff ({s}):\n{s}", .{
+                    wt.branch orelse "?",
+                    if (diff.len > max_diff) diff[0..max_diff] else diff,
+                }) catch "";
+            }
+        }
+    }
+
     // Durable report (PLAN §19). Path is copied to the parent arena — the
     // child arena dies on return.
-    const report_path_child = writeReport(host, child_arena, task, role, label, outcome) catch "";
+    const report_path_child = writeReport(host, child_arena, task, role, label, outcome, wt) catch "";
     const report_path = parent_arena.dupe(u8, report_path_child) catch "";
 
     // Structured result for the parent's model context (bounded).
     const summary = if (outcome.reply.len > max_summary_bytes) outcome.reply[0..max_summary_bytes] else outcome.reply;
     const envelope = std.fmt.allocPrint(
         parent_arena,
-        "subagent {s} {s}\nreport: {s}\ntool_calls: {d}\n\n{s}",
+        "subagent {s} {s}\nreport: {s}\ntool_calls: {d}{s}{s}\n\n{s}",
         .{
             label,
             @tagName(outcome.status),
             report_path,
             outcome.tool_calls,
+            if (wt.branch) |b| std.fmt.allocPrint(parent_arena, "\nbranch: {s}\nworktree: {s}", .{ b, wt.path.? }) catch "" else "",
+            diff_note,
             summary,
         },
     ) catch return fail(parent_arena, "agent: out of memory", .{});
@@ -258,6 +316,7 @@ fn writeReport(
     role: Role,
     label: []const u8,
     outcome: agent_engine.Outcome,
+    wt: WorktreeInfo,
 ) ![]const u8 {
     host.workspace.createDirPath(host.io, ".ifnh/reports") catch {};
     const seq = host.report_seq.fetchAdd(1, .monotonic);
@@ -269,6 +328,7 @@ fn writeReport(
         \\# Agent Report ({s})
         \\
         \\- role: {s}
+        \\- worktree: {s}
         \\- status: {s}
         \\- ts_ms: {d}
         \\- tool_calls: {d}
@@ -285,6 +345,7 @@ fn writeReport(
     , .{
         label,
         @tagName(role),
+        if (wt.path) |p| p else "none",
         @tagName(outcome.status),
         ts_ms,
         outcome.tool_calls,
@@ -461,4 +522,75 @@ test "research role has no write access" {
     try std.testing.expectEqual(tool_mod.AgentSpawnResult.SpawnStatus.completed, result.status);
     const data = try tmp.dir.readFileAlloc(io, "code.txt", arena, .limited(1024));
     try std.testing.expectEqualStrings("hello\n", data);
+}
+
+test "worktree isolation: child edits land in its own tree" {
+    const io = std.testing.io;
+    const git_avail = blk: {
+        const r = std.process.run(std.testing.allocator, io, .{ .argv = &.{ "git", "--version" } }) catch break :blk false;
+        const ok = r.term == .exited and r.term.exited == 0;
+        std.testing.allocator.free(r.stdout);
+        std.testing.allocator.free(r.stderr);
+        break :blk ok;
+    };
+    if (!git_avail) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path_buf);
+    const repo_path = try arena.dupe(u8, path_buf[0..n]);
+
+    // Real repo with a committed seed file.
+    _ = std.process.run(arena, io, .{ .argv = &.{ "git", "init", "-q", "-b", "main" }, .cwd = .{ .path = repo_path } }) catch return error.SkipZigTest;
+    try tmp.dir.writeFile(io, .{ .sub_path = "code.txt", .data = "original\n" });
+    _ = std.process.run(arena, io, .{ .argv = &.{ "git", "add", "." }, .cwd = .{ .path = repo_path } }) catch {};
+    _ = std.process.run(arena, io, .{ .argv = &.{ "git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "seed" }, .cwd = .{ .path = repo_path } }) catch {};
+
+    // Child is an implement role that overwrites code.txt in its worktree.
+    var child_fake = testing.Fake{ .script = &.{
+        &.{.{ .tool_call = .{ .id = "w1", .name = "write", .arguments_json = "{\"path\":\"code.txt\",\"content\":\"edited by child\"}" } }},
+        &.{.{ .text = "Changes Made: overwrote code.txt." }},
+    } };
+
+    const wt_root = try std.fmt.allocPrint(arena, "{s}/agent-worktrees", .{repo_path});
+    var cancel = std.atomic.Value(bool).init(false);
+    var host = Host{
+        .io = io,
+        .workspace = tmp.dir,
+        .base_system = "",
+        .provider = child_fake.provider(),
+        .base_url = "",
+        .api_key = "",
+        .default_model = "fake",
+        .mode = .auto,
+        .read_globs = &.{"**"},
+        .write_globs = &.{"**"},
+        .command_allow = &.{},
+        .command_deny = &.{},
+        .env_allow = &.{},
+        .journal = null,
+        .approval_ctx = undefined,
+        .approval_fn = undefined,
+        .max_depth = 1,
+        .max_concurrent = 1,
+        .max_rounds = 10,
+        .redactions = &.{},
+        .cancel = &cancel,
+        .git = git_mod.Git.init(io, repo_path),
+        .worktree_root = wt_root,
+        .session_hint = "stest",
+    };
+
+    const result = spawnHook(&host, arena, 0, "{\"task\":\"edit code\",\"role\":\"implement\",\"isolation\":\"worktree\"}");
+    try std.testing.expectEqual(tool_mod.AgentSpawnResult.SpawnStatus.completed, result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.summary, "branch: ifnh/") != null);
+
+    // Main tree untouched; worktree has the edit.
+    const main_data = try tmp.dir.readFileAlloc(io, "code.txt", arena, .limited(1024));
+    try std.testing.expectEqualStrings("original\n", main_data);
 }

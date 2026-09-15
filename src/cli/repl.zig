@@ -15,6 +15,7 @@ const instructions_mod = @import("../core/instructions.zig");
 const system_prompt = @import("../core/agent/system_prompt.zig");
 const agent_engine = @import("../core/agent/engine.zig");
 const subagent_mod = @import("../core/agent/subagent.zig");
+const git_mod = @import("../core/git.zig");
 const tool_mod = @import("../tools/tool.zig");
 const core_types = @import("../core/types.zig");
 const openai = @import("../providers/openai.zig");
@@ -118,7 +119,7 @@ pub fn run(
             switch (action) {
                 .quit => break,
                 .submit => |prompt| {
-                    try submitTurn(io, arena, &sess, &cfg, buildProviderConfig(&cfg, environ), instr.text, prompt, cwd);
+                    try submitTurn(io, arena, environ, &sess, &cfg, buildProviderConfig(&cfg, environ), instr.text, prompt, cwd);
                 },
                 .none => {},
             }
@@ -134,7 +135,7 @@ pub fn run(
         const focus = instructions_mod.focusDirsFromHistory(arena, sess.history.items, 8);
         const turn_instr = instructions_mod.assemble(cwd, io, arena, system_prompt.system_prompt, focus) catch instr;
 
-        try submitTurn(io, arena, &sess, &cfg, buildProviderConfig(&cfg, environ), turn_instr.text, line, cwd);
+        try submitTurn(io, arena, environ, &sess, &cfg, buildProviderConfig(&cfg, environ), turn_instr.text, line, cwd);
     }
 }
 
@@ -143,6 +144,7 @@ pub fn run(
 fn submitTurn(
     io: std.Io,
     arena: std.mem.Allocator,
+    environ: *const std.process.Environ.Map,
     sess: *Session,
     cfg: *config_mod.Store,
     pcfg: agent_engine.ProviderConfig,
@@ -187,6 +189,21 @@ fn submitTurn(
         .temperature = cfg.getOptionalF64("model.temperature"),
         .max_output_tokens = cfg.getOptionalU32("model.max_output_tokens"),
         .cancel = &cancel,
+        .git = blk: {
+            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const n = cwd.realPath(io, &path_buf) catch break :blk null;
+            const repo_path = arena.dupe(u8, path_buf[0..n]) catch break :blk null;
+            const g = git_mod.Git.init(io, repo_path);
+            if (!g.isRepo(arena)) break :blk null;
+            break :blk g;
+        },
+        .worktree_root = blk: {
+            const home = environ.get("HOME") orelse break :blk null;
+            const root = std.fmt.allocPrint(arena, "{s}/.local/state/ifnh/worktrees", .{home}) catch break :blk null;
+            std.Io.Dir.cwd().createDirPath(io, root) catch {};
+            break :blk root;
+        },
+        .session_hint = sess.store.manifest.id,
     };
     var tool_ctx = tool_mod.ToolContext{
         .io = io,
