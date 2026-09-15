@@ -61,7 +61,7 @@ pub fn main(init: std.process.Init) !void {
             }
             break :blk try repl.run(io, arena, init.environ_map, .{ .resume_id = parsed.args[0] });
         },
-        .doctor => try printOut(io, arena, "doctor: not yet implemented (tracker M1-T14)\n", .{}),
+        .doctor => try runDoctor(io, arena, init.environ_map),
         .unknown => {
             try printOut(io, arena, "error: unknown subcommand '{s}'\n(run `ifnh help` for usage)\n", .{parsed.args[0]});
             std.process.exit(2);
@@ -123,6 +123,75 @@ fn runSessions(io: std.Io, arena: std.mem.Allocator, args: []const []const u8) !
         return;
     }
     try printOut(io, arena, "usage: ifnh sessions [list]\n", .{});
+}
+
+/// `ifnh doctor` — environment health check (M1-T14, DECISIONS S259).
+fn runDoctor(io: std.Io, arena: std.mem.Allocator, environ: *const std.process.Environ.Map) !void {
+    const config_mod = @import("core/config/config.zig");
+    const git_mod = @import("core/git.zig");
+    const cwd = std.Io.Dir.cwd();
+    var problems: usize = 0;
+
+    try printOut(io, arena, "ifnh doctor\n", .{});
+
+    // Config.
+    var cfg = try config_mod.load(arena, io, environ, cwd);
+    defer cfg.deinit();
+    if (cfg.errors.items.len == 0) {
+        try printOut(io, arena, "  config: ok\n", .{});
+    } else {
+        problems += cfg.errors.items.len;
+        for (cfg.errors.items) |e| try printOut(io, arena, "  config: ERROR [{s}] {s}\n", .{ e.path, e.message });
+    }
+    for (cfg.warnings.items) |w| try printOut(io, arena, "  config: warning {s}\n", .{w});
+
+    // Model/provider.
+    const provider_name = cfg.getString("model.provider", "openai");
+    const is_anthropic = std.mem.eql(u8, provider_name, "anthropic");
+    const key_env = cfg.getOptionalString("model.api_key_env") orelse
+        (if (is_anthropic) "ANTHROPIC_API_KEY" else "OPENAI_API_KEY");
+    const has_key = environ.get(key_env) != null;
+    const has_model = cfg.getString("model.model", "").len > 0;
+    if (has_key and has_model) {
+        try printOut(io, arena, "  provider: ok ({s}/{s}, key from {s})\n", .{ provider_name, cfg.getString("model.model", ""), key_env });
+    } else {
+        problems += 1;
+        if (!has_model) try printOut(io, arena, "  provider: model.model not set (IFNH_MODEL__MODEL or .ifnh/config.json)\n", .{});
+        if (!has_key) try printOut(io, arena, "  provider: {s} not set in environment\n", .{key_env});
+    }
+
+    // Git.
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = cwd.realPath(io, &path_buf) catch 0;
+    if (n > 0) {
+        const g = git_mod.Git.init(io, arena.dupe(u8, path_buf[0..n]) catch "");
+        if (g.isRepo(arena)) {
+            const dirty = g.dirtyCount(arena);
+            try printOut(io, arena, "  git: repository, branch {s}, {d} uncommitted changes\n", .{ g.currentBranch(arena), dirty });
+        } else {
+            try printOut(io, arena, "  git: not a repository (worktree isolation unavailable)\n", .{});
+        }
+    }
+
+    // MCP.
+    const mcp_mod = @import("core/mcp.zig");
+    var reg = try mcp_mod.Registry.init(io, arena, cfg.get("mcp_servers"));
+    defer reg.deinit();
+    try printOut(io, arena, "  mcp: {d} servers configured\n", .{reg.configs.len});
+
+    // Session dir writability.
+    cwd.createDirPath(io, ".ifnh/sessions") catch {
+        problems += 1;
+        try printOut(io, arena, "  state: cannot create .ifnh/sessions (read-only checkout?)\n", .{});
+        return;
+    };
+    try printOut(io, arena, "  state: .ifnh/sessions writable\n", .{});
+
+    if (problems > 0) {
+        try printOut(io, arena, "{d} problem(s) found\n", .{problems});
+        std.process.exit(1);
+    }
+    try printOut(io, arena, "all checks passed\n", .{});
 }
 
 /// `ifnh init` — create the .ifnh/ skeleton (tracker M0-T38; minimal now).

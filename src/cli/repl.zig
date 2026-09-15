@@ -19,6 +19,7 @@ const git_mod = @import("../core/git.zig");
 const mcp_mod = @import("../core/mcp.zig");
 const skills_mod = @import("../core/skills.zig");
 const hooks_mod = @import("../core/hooks.zig");
+const compaction_mod = @import("../core/compaction.zig");
 const tool_mod = @import("../tools/tool.zig");
 const core_types = @import("../core/types.zig");
 const openai = @import("../providers/openai.zig");
@@ -136,7 +137,7 @@ pub fn run(
             const cmd_end = std.mem.indexOfScalar(u8, line, ' ') orelse line.len;
             const cmd = line[1..cmd_end];
             const rest = if (cmd_end < line.len) std.mem.trim(u8, line[cmd_end + 1 ..], " \t") else "";
-            const action = handleCommand(io, arena, cwd, &sess, &cfg, cmd, rest, instr);
+            const action = handleCommand(io, arena, cwd, environ, &sess, &cfg, cmd, rest, instr);
             switch (action) {
                 .quit => break,
                 .submit => |prompt| {
@@ -289,6 +290,29 @@ fn submitTurn(
         return;
     }
 
+    // ---- automatic context compaction (C36, PLAN §24) ----
+    if (cfg.getBool("context.auto_compact", true)) {
+        const threshold: usize = cfg.getU32("context.max_context_tokens", 96_000);
+        const plan = compaction_mod.planCompaction(sess.history.items, threshold, cfg.getF64("context.compact_at_fraction", 0.8));
+        if (plan.should_compact) {
+            try out(io, "[compacting context... {d} tokens]\n", .{plan.estimated_tokens});
+            const res_opt: ?compaction_mod.Result = blk: {
+                break :blk compaction_mod.compact(arena, io, pcfg, &sess.history, redactionsFor(arena, pcfg.api_key)) catch |err| {
+                    try out(io, "[compaction failed: {s}; continuing with full context]\n", .{@errorName(err)});
+                    break :blk null;
+                };
+            };
+            if (res_opt) |res| {
+                sess.history.clearRetainingCapacity();
+                try sess.history.appendSlice(arena, res.history);
+                _ = try sess.store.append(.{ .note = .{
+                    .text = try std.fmt.allocPrint(arena, "context compacted: {d} -> {d} tokens", .{ res.tokens_before, res.tokens_after }),
+                } });
+                try out(io, "[context compacted: {d} -> {d} tokens]\n", .{ res.tokens_before, res.tokens_after });
+            }
+        }
+    }
+
     const outcome = agent_engine.runTurn(.{
         .io = io,
         .arena = arena,
@@ -328,6 +352,22 @@ fn submitTurn(
     }
     if (outcome.usage.input_tokens > 0 or outcome.usage.output_tokens > 0) {
         try out(io, "[tokens: {d} in / {d} out, {d} tool calls]\n", .{ outcome.usage.input_tokens, outcome.usage.output_tokens, outcome.tool_calls });
+        // Session usage log (S254-258).
+        const usage_line = try std.fmt.allocPrint(arena, "{{\"ts_ms\":{d},\"input_tokens\":{d},\"output_tokens\":{d},\"tool_calls\":{d}}}\n", .{
+            @as(i64, @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms))),
+            outcome.usage.input_tokens,
+            outcome.usage.output_tokens,
+            outcome.tool_calls,
+        });
+        var usage_buf: [256]u8 = undefined;
+        @memcpy(usage_buf[0..usage_line.len], usage_line);
+        const f = sess.store.dir.createFile(io, "usage.jsonl", .{ .truncate = false }) catch null;
+        if (f) |file| {
+            defer file.close(io);
+            const st = file.stat(io) catch null;
+            const off: u64 = if (st) |s| s.size else 0;
+            file.writePositionalAll(io, usage_line, off) catch {};
+        }
     }
     try sess.store.syncWatermark();
 }
@@ -496,6 +536,7 @@ fn handleCommand(
     io: std.Io,
     arena: std.mem.Allocator,
     cwd: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
     sess: *Session,
     cfg: *config_mod.Store,
     cmd: []const u8,
@@ -518,6 +559,8 @@ fn handleCommand(
             \\  /plan <title>         create a plan artifact in .ifnh/plans/
             \\  /agents               list subagent reports
             \\  /mcp                  list MCP servers/tools
+            \\  /usage                session token usage
+            \\  /compact              compact the conversation context
             \\  /sessions             list sessions (use `ifnh resume <id>`)
             \\
         , .{}) catch {};
@@ -562,6 +605,40 @@ fn handleCommand(
         createPlan(io, cwd, arena, rest) catch |err| {
             out(io, "plan creation failed: {s}\n", .{@errorName(err)}) catch {};
         };
+    } else if (std.mem.eql(u8, cmd, "usage")) {
+        var total_in: u64 = 0;
+        var total_out: u64 = 0;
+        var turns: usize = 0;
+        const raw = fsutil.readSmallFile(sess.store.dir, io, arena, "usage.jsonl", 1024 * 1024) catch "";
+        var it = std.mem.splitScalar(u8, raw, '\n');
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            const v = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch continue;
+            if (v != .object) continue;
+            if (v.object.get("input_tokens")) |ti| {
+                if (ti == .integer) total_in += @intCast(ti.integer);
+            }
+            if (v.object.get("output_tokens")) |to| {
+                if (to == .integer) total_out += @intCast(to.integer);
+            }
+            turns += 1;
+        }
+        out(io, "session usage: {d} turns, {d} tokens in, {d} tokens out\n", .{ turns, total_in, total_out }) catch {};
+    } else if (std.mem.eql(u8, cmd, "compact")) {
+        const pcfg2 = buildProviderConfig(cfg, environ);
+        try out(io, "[compacting context...]\n", .{});
+        const res_opt: ?compaction_mod.Result = blk: {
+            break :blk compaction_mod.compact(arena, io, pcfg2, &sess.history, &.{}) catch |err| {
+                out(io, "compaction failed: {s}\n", .{@errorName(err)}) catch {};
+                break :blk null;
+            };
+        };
+        if (res_opt) |res| {
+            sess.history.clearRetainingCapacity();
+            try sess.history.appendSlice(arena, res.history);
+            _ = try sess.store.append(.{ .note = .{ .text = "manual compaction" } });
+            out(io, "[compacted: {d} -> {d} tokens]\n", .{ res.tokens_before, res.tokens_after }) catch {};
+        }
     } else if (std.mem.eql(u8, cmd, "skills")) {
         if (sess.skills) |catalog| {
             if (catalog.skills.len == 0) {

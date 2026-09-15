@@ -181,6 +181,9 @@ test "compaction fails cleanly when provider fails" {
         try history.append(arena, .{ .role = .user, .content = "z" ** 3000 });
     }
     try std.testing.expectError(error.CompactionFailed, compact(arena, io, .{
-        .provider = fake.provider(), .model = "fake", .base_url = "", .api_key = "",
+        .provider = fake.provider(),
+        .model = "fake",
+        .base_url = "",
+        .api_key = "",
     }, &history, &.{}));
 }
