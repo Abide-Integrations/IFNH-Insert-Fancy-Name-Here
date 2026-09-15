@@ -77,7 +77,7 @@
 |---|---|---|---|---|
 | M0-T28 | `core/permissions/engine.zig`: rules (tool/path/command), deny>ask>allow, realpath glob matching, fail-closed parse | M0-T06 | `[x]` | glob + command classifier + engine, 9 tests |
 | M0-T29 | Session grants: once/session/pattern scopes; grant feedback into context | M0-T28, M0-T11 | `[x]` | once-grants consumed; approval prompt grants prefixes |
-| M0-T30 | `.ifnh/` agent-write-deny + policy snapshot hash at approval boundaries | M0-T28 | `[~]` | protected-path write-deny shipped; policy hash snapshots M1 |
+| M0-T30 | `.ifnh/` agent-write-deny + policy snapshot hash at approval boundaries | M0-T28 | `[x]` | fail-closed tamper detection at every approval |
 | M0-T31 | Approval UI (inline diff/command preview, grant options) + dirty-tree detection banner | M0-T29 | `[x]` | [y]once/[s]session/[n]o prompt; dirty-tree banner M1 |
 
 ### M0.7 Agent loop & UI
@@ -96,8 +96,8 @@
 
 | ID | Task | Depends | Status | Notes |
 |---|---|---|---|---|
-| M0-T39 | Integration tests: e2e tool loop (fake provider), kill -9 resume, undo-after-crash, permission denials | M0-T32 | `[~]` | 54 tests incl. e2e loop + crash recovery; kill-9 REPL harness test M1 |
-| M0-T40 | Benchmark script: startup + subcommand timing vs budget (50ms/5ms), record baseline | M0-T34 | `[~]` | startup <10ms measured for `config validate`; formal hyperfine script M2 (CI budget gate) |
+| M0-T39 | Integration tests: e2e tool loop (fake provider), kill -9 resume, undo-after-crash, permission denials | M0-T32 | `[x]` | 85 tests + tests/integration-kill9.sh harness |
+| M0-T40 | Benchmark script: startup + subcommand timing vs budget (50ms/5ms), record baseline | M0-T34 | `[x]` | scripts/bench.sh (size + startup gates); 5ms measured |
 | M0-T41 | Binary size check vs 5 MiB budget; strip verification | M0-T01 | `[x]` | 1.3 MiB stripped ReleaseSafe (was 9.3 MiB unstripped) |
 | M0-T42 | AGENTS.md conventions finalized; `zig fmt` clean; error-path audit (no panics on bad input) | all | `[~]` | fmt clean, all paths error-return; audit continues |
 
@@ -134,10 +134,10 @@
 | ID | Task | Depends | Status | Notes |
 |---|---|---|---|---|
 | M2-T01 | Lifecycle schema v1 + stage runner (linear, entry/exit conditions, per-stage agent/model/permissions) | M1-T01 | `[x]` | linear runner + entry conditions + role routing |
-| M2-T02 | Review gates: reviewer role, multi-reviewer, all/any/n_of_m, severity model, blocking rules | M2-T01 | `[~]` | single reviewer + blocker parsing + stop-on-block; multi-reviewer M2+ |
+| M2-T02 | Review gates: reviewer role, multi-reviewer, all/any/n_of_m, severity model, blocking rules | M2-T01 | `[x]` | N reviewers + all/any/n_of_m + threshold; failed reviewers fail closed |
 | M2-T03 | Review overrides (developer-only, audited) + `/review` command | M2-T02 | `[x]` | audit artifacts + --from resume |
 | M2-T04 | Reconciliation-agent flow for concurrent conflicts | M2-T01 | `[x]` | /reconcile via journal version history (D045/046) |
-| M2-T05 | Session forks (+ optional worktree binding) + `fork diff` | M0-T13 | `[x]` | Session.fork() + fork_of manifest + `ifnh fork`; fork diff post |
+| M2-T05 | Session forks (+ optional worktree binding) + `fork diff` | M0-T13 | `[x]` | fork + `ifnh fork diff` with divergence point |
 | M2-T06 | `ifnh cleanup` (retention, orphan worktrees w/ approval, debug logs) | M1-T04 | `[x]` | dry-run default, --yes executes |
 | M2-T07 | CI: build + test matrix (Linux/macOS), size + startup budget gates, `zig fmt` check | M0-T40/41 | `[x]` | size + startup gates in ci.yml |
 | M2-T08 | `--json` output on all subcommands (output contracts) | M0-T03 | `[~]` | sessions list --json; remaining subcommands post-1.0 |
