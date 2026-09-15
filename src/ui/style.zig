@@ -13,12 +13,11 @@ pub const Palette = struct {
 
     pub fn detect(allocator: std.mem.Allocator, io: std.Io, environ_get: *const fn ([]const u8) ?[]const u8, config_colors: bool, cli_no_color: bool) Palette {
         _ = allocator;
-        _ = io;
         if (cli_no_color) return .{ .enabled = false };
         if (environ_get("NO_COLOR") != null) return .{ .enabled = false };
         if (!config_colors) return .{ .enabled = false };
-        // Color only when stdout is a TTY (best-effort POSIX check).
-        const is_tty = std.posix.isatty(std.posix.STDOUT_FILENO);
+        // Color only when stdout is a TTY (best-effort).
+        const is_tty = std.Io.File.stdout().isTty(io) catch false;
         return .{ .enabled = is_tty };
     }
 

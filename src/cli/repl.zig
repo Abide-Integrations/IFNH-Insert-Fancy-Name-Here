@@ -415,11 +415,72 @@ const Approver = struct {
     io: std.Io,
     engine: *engine_mod.Engine,
     mutex: std.Io.Mutex = .init,
+    /// SHA-256 of policy-relevant files at session start (G99/M0-T30).
+    policy_hash: [32]u8 = [_]u8{0} ** 32,
+    policy_hashed: bool = false,
+
+    fn policyFingerprint(self: *Approver, arena: std.mem.Allocator) ?[32]u8 {
+        const cwd = std.Io.Dir.cwd();
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        const files = [_][]const u8{
+            ".ifnh/config.json",
+            ".ifnh/config.d",
+            ".ifnh/lifecycle",
+            ".ifnh/instructions",
+            ".ifnh/commands",
+            ".ifnh/skills",
+            "AGENTS.md",
+            "CLAUDE.md",
+        };
+        var any = false;
+        for (files) |f| {
+            const stat = cwd.statFile(self.io, f, .{}) catch continue;
+            any = true;
+            hasher.update(f);
+            if (stat.kind == .directory) {
+                // Hash directory entries (names only; content via children below).
+                var d = cwd.openDir(self.io, f, .{ .iterate = true }) catch continue;
+                defer d.close(self.io);
+                var it = d.iterate();
+                while (it.next(self.io) catch null) |entry| {
+                    hasher.update(entry.name);
+                    const child = std.fmt.allocPrint(arena, "{s}/{s}", .{ f, entry.name }) catch continue;
+                    if (fsutil.readSmallFile(cwd, self.io, arena, child, 1024 * 1024)) |content| {
+                        hasher.update(content);
+                    } else |_| {}
+                }
+            } else if (fsutil.readSmallFile(cwd, self.io, arena, f, 1024 * 1024)) |content| {
+                hasher.update(content);
+            } else |_| {}
+        }
+        if (!any) return null;
+        var digest: [32]u8 = undefined;
+        hasher.final(&digest);
+        return digest;
+    }
+
+    /// Fail-closed on policy tampering between session start and now (G99).
+    fn verifyPolicy(self: *Approver, arena: std.mem.Allocator) bool {
+        if (!self.policy_hashed) {
+            self.policy_hash = self.policyFingerprint(arena) orelse [_]u8{0} ** 32;
+            self.policy_hashed = true;
+            return true;
+        }
+        const current = self.policyFingerprint(arena) orelse [_]u8{0} ** 32;
+        if (!std.mem.eql(u8, &current, &self.policy_hash)) {
+            out(self.io, "\nPOLICY CHANGE DETECTED: .ifnh policy files changed since session start.\nApproval denied (fail-closed). Restart the session to adopt the new policy.\n", .{}) catch {};
+            return false;
+        }
+        return true;
+    }
 
     fn approve(ctx: *anyopaque, req: tool_mod.ApprovalRequest) tool_mod.ApprovalResponse {
         const self: *Approver = @ptrCast(@alignCast(ctx));
         self.mutex.lock(self.io) catch return .denied;
         defer self.mutex.unlock(self.io);
+        var fba: [4096]u8 = undefined;
+        var fba_state = std.heap.FixedBufferAllocator.init(&fba);
+        if (!self.verifyPolicy(fba_state.allocator())) return .denied;
         out(self.io, "\napproval needed: {s}\n  {s}\n[y] once  [s] session  [n] no: ", .{ req.title, req.detail }) catch return .denied;
         var buf: [64]u8 = undefined;
         var stdin_r = std.Io.File.stdin().reader(self.io, &buf);
