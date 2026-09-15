@@ -1,0 +1,430 @@
+//! Interactive streaming REPL (DESIGN §6, DECISIONS section R).
+//!
+//! Line-oriented inline streaming UI: works on a TTY, over SSH, and with
+//! piped stdin/stdout. Slash commands are built-in; disk-backed commands
+//! load from `.ifnh/commands/*.md`. Approvals are interactive prompts that
+//! can grant session-scoped permission patterns.
+
+const std = @import("std");
+const config_mod = @import("../core/config/config.zig");
+const session_mod = @import("../core/session/store.zig");
+const journal_mod = @import("../core/journal.zig");
+const engine_mod = @import("../core/permissions/engine.zig");
+const instructions_mod = @import("../core/instructions.zig");
+const system_prompt = @import("../core/agent/system_prompt.zig");
+const agent_engine = @import("../core/agent/engine.zig");
+const tool_mod = @import("../tools/tool.zig");
+const core_types = @import("../core/types.zig");
+const openai = @import("../providers/openai.zig");
+const anthropic = @import("../providers/anthropic.zig");
+
+const max_output_bytes: usize = 256 * 1024;
+
+pub const Options = struct {
+    resume_id: ?[]const u8 = null,
+    json: bool = false,
+};
+
+const Session = struct {
+    store: session_mod.Session,
+    journal: journal_mod.Journal,
+    engine: engine_mod.Engine,
+    history: std.ArrayListUnmanaged(core_types.ChatMessage) = .empty,
+};
+
+pub fn run(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    environ: *const std.process.Environ.Map,
+    opts: Options,
+) !void {
+    const cwd = std.Io.Dir.cwd();
+
+    // ---- configuration ----
+    var cfg = try config_mod.load(arena, io, environ, cwd);
+    defer cfg.deinit();
+    for (cfg.errors.items) |err| {
+        try out(io, "config error [{s}]: {s}\n", .{ err.path, err.message });
+    }
+    if (cfg.errors.items.len > 0) return error.InvalidConfig;
+    for (cfg.warnings.items) |w| try out(io, "config warning: {s}\n", .{w});
+
+    // ---- session state (zero-config: lazily create .ifnh) ----
+    ensureIfnh(io, cwd) catch {};
+    const sessions_dir_name = ".ifnh/sessions";
+
+    var sess: Session = blk: {
+        if (opts.resume_id) |id| {
+            const store = try session_mod.Session.open(cwd, io, arena, sessions_dir_name, id);
+            const j = try journal_mod.Journal.open(io, arena, store.dir);
+            var s = Session{ .store = store, .journal = j, .engine = engineFromConfig(arena, &cfg) };
+            try rebuildHistory(arena, &s);
+            break :blk s;
+        } else {
+            const cwd_copy: []const u8 = if (environ.get("PWD")) |pwd| pwd else ".";
+            const store = try session_mod.Session.create(cwd, io, arena, sessions_dir_name, cwd_copy);
+            const j = try journal_mod.Journal.open(io, arena, store.dir);
+            break :blk Session{ .store = store, .journal = j, .engine = engineFromConfig(arena, &cfg) };
+        }
+    };
+    defer {
+        sess.store.close();
+        sess.journal.close();
+    }
+
+    // ---- provider ----
+    const pcfg = buildProviderConfig(&cfg, environ);
+    const provider_name = cfg.getString("model.provider", "openai");
+
+    // ---- instructions ----
+    const builtin_prompt = system_prompt.system_prompt;
+    const instr = try instructions_mod.assemble(cwd, io, arena, builtin_prompt);
+
+    // ---- welcome ----
+    try out(io, "ifnh session {s} (model: {s}/{s}{s})\n", .{
+        sess.store.manifest.id,
+        provider_name,
+        if (pcfg.model.len > 0) pcfg.model else "<unset>",
+        if (pcfg.api_key.len == 0) ", no api key" else "",
+    });
+    try out(io, "type a message, or /help for commands\n", .{});
+
+    // ---- input loop ----
+    var stdin_buf: [4096]u8 = undefined;
+    var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buf);
+
+    while (true) {
+        try out(io, "> ", .{});
+        const line_raw = stdin_reader.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
+            error.EndOfStream => {
+                try out(io, "\n", .{});
+                break;
+            },
+            else => break,
+        };
+        var line = std.mem.trim(u8, line_raw, " \t\r\n");
+        if (line.len == 0) continue;
+
+        if (line[0] == '/') {
+            const cmd_end = std.mem.indexOfScalar(u8, line, ' ') orelse line.len;
+            const cmd = line[1..cmd_end];
+            const rest = if (cmd_end < line.len) std.mem.trim(u8, line[cmd_end + 1 ..], " \t") else "";
+            const action = handleCommand(io, arena, cwd, &sess, &cfg, cmd, rest, instr);
+            if (action == .quit) break;
+            continue;
+        }
+
+        try submitTurn(io, arena, &sess, &cfg, buildProviderConfig(&cfg, environ), instr.text, line, cwd);
+    }
+}
+
+// ---------------------------------------------------------------- turn flow
+
+fn submitTurn(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    sess: *Session,
+    cfg: *config_mod.Store,
+    pcfg: agent_engine.ProviderConfig,
+    system: []const u8,
+    user_text: []const u8,
+    cwd: std.Io.Dir,
+) !void {
+    if (pcfg.model.len == 0) {
+        try out(io, "no model configured: set model.model in .ifnh/config.json or IFNH_MODEL__MODEL\n", .{});
+        return;
+    }
+    if (pcfg.api_key.len == 0) {
+        try out(io, "note: no api key found in environment; the provider will likely reject the request\n", .{});
+    }
+
+    _ = try sess.store.append(.{ .user = .{ .text = user_text } });
+    try sess.history.append(arena, .{ .role = .user, .content = user_text });
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var approver = Approver{ .io = io, .engine = &sess.engine };
+    var tool_ctx = tool_mod.ToolContext{
+        .io = io,
+        .arena = arena,
+        .workspace = cwd,
+        .engine = &sess.engine,
+        .journal = &sess.journal,
+        .max_file_read_bytes = cfg.getU32("context.max_file_read_bytes", 262144),
+        .approval_ctx = &approver,
+        .approval_fn = Approver.approve,
+    };
+    tool_ctx.approval_ctx = &approver;
+    tool_ctx.approval_fn = Approver.approve;
+
+    const TurnUi = struct {
+        io: std.Io,
+        fn onText(ctx: *anyopaque, text: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            std.Io.File.stdout().writeStreamingAll(self.io, text) catch {};
+        }
+        fn onToolStart(ctx: *anyopaque, name: []const u8, arguments_json: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            out(self.io, "\n[tool] {s} {s}\n", .{ name, arguments_json }) catch {};
+        }
+        fn onToolResult(ctx: *anyopaque, name: []const u8, status: tool_mod.Status, output: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = name;
+            const max_show: usize = 400;
+            const shown = if (output.len > max_show) output[0..max_show] else output;
+            out(self.io, "[{s}] {s}{s}\n", .{ @tagName(status), shown, if (output.len > max_show) "..." else "" }) catch {};
+        }
+        fn onNotice(ctx: *anyopaque, text: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            out(self.io, "! {s}\n", .{text}) catch {};
+        }
+    };
+    var ui = TurnUi{ .io = io };
+
+    const outcome = agent_engine.runTurn(.{
+        .io = io,
+        .arena = arena,
+        .pcfg = pcfg,
+        .system = system,
+        .history = &sess.history,
+        .tool_ctx = &tool_ctx,
+        .callbacks = .{
+            .ctx = &ui,
+            .on_text = TurnUi.onText,
+            .on_tool_start = TurnUi.onToolStart,
+            .on_tool_result = TurnUi.onToolResult,
+            .on_notice = TurnUi.onNotice,
+        },
+        .cancel = &cancel,
+    }) catch |err| {
+        try out(io, "\nturn failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+
+    try out(io, "\n", .{});
+    switch (outcome.status) {
+        .completed => {
+            _ = try sess.store.append(.{ .assistant = .{ .text = outcome.reply } });
+        },
+        .failed => {
+            try out(io, "provider error: {s}\n", .{outcome.error_message});
+            _ = try sess.store.append(.{ .note = .{ .text = outcome.error_message } });
+        },
+        .cancelled => {
+            try out(io, "(interrupted)\n", .{});
+            _ = try sess.store.append(.interrupted);
+        },
+    }
+    if (outcome.usage.input_tokens > 0 or outcome.usage.output_tokens > 0) {
+        try out(io, "[tokens: {d} in / {d} out, {d} tool calls]\n", .{ outcome.usage.input_tokens, outcome.usage.output_tokens, outcome.tool_calls });
+    }
+    try sess.store.syncWatermark();
+}
+
+const Approver = struct {
+    io: std.Io,
+    engine: *engine_mod.Engine,
+
+    fn approve(ctx: *anyopaque, req: tool_mod.ApprovalRequest) tool_mod.ApprovalResponse {
+        const self: *Approver = @ptrCast(@alignCast(ctx));
+        out(self.io, "\napproval needed: {s}\n  {s}\n[y] once  [s] session  [n] no: ", .{ req.title, req.detail }) catch return .denied;
+        var buf: [64]u8 = undefined;
+        var stdin_r = std.Io.File.stdin().reader(self.io, &buf);
+        const line = stdin_r.interface.takeDelimiterInclusive('\n') catch return .denied;
+        const answer = std.mem.trim(u8, line, " \t\r\n");
+        if (std.ascii.eqlIgnoreCase(answer, "y")) {
+            return .approved_once;
+        } else if (std.ascii.eqlIgnoreCase(answer, "s")) {
+            switch (req.grant) {
+                .command_prefix => |prefix| self.engine.commandPrefixGrant(prefix, .session) catch {},
+                .path_write => |path| self.engine.pathWriteGrant(path, .session) catch {},
+                .none => {},
+            }
+            return .approved_session;
+        }
+        return .denied;
+    }
+};
+
+// ---------------------------------------------------------------- history rebuild
+
+fn rebuildHistory(arena: std.mem.Allocator, sess: *Session) !void {
+    const events = try sess.store.readEvents(arena, 10_000);
+    for (events) |ev| {
+        switch (ev.event) {
+            .user => |v| try sess.history.append(arena, .{ .role = .user, .content = v.text }),
+            .assistant => |v| try sess.history.append(arena, .{
+                .role = .assistant,
+                .content = v.text,
+                .tool_calls_json = v.tool_calls_json,
+            }),
+            .tool_call => {},
+            .tool_result => |v| try sess.history.append(arena, .{
+                .role = .tool,
+                .content = v.output,
+                .tool_call_id = v.call_id,
+            }),
+            .note, .interrupted => {},
+        }
+    }
+}
+
+fn buildProviderConfig(cfg: *config_mod.Store, environ: *const std.process.Environ.Map) agent_engine.ProviderConfig {
+    const provider_name = cfg.getString("model.provider", "openai");
+    const is_anthropic = std.mem.eql(u8, provider_name, "anthropic");
+    const base_url = cfg.getOptionalString("model.base_url") orelse
+        (if (is_anthropic) "https://api.anthropic.com" else "https://api.openai.com/v1");
+    const model = cfg.getString("model.model", "");
+    const api_key_env = cfg.getOptionalString("model.api_key_env") orelse
+        (if (is_anthropic) "ANTHROPIC_API_KEY" else "OPENAI_API_KEY");
+    const api_key = environ.get(api_key_env) orelse "";
+    return .{
+        .provider = if (is_anthropic) anthropic.instance else openai.instance,
+        .model = model,
+        .base_url = base_url,
+        .api_key = api_key,
+    };
+}
+
+fn engineFromConfig(arena: std.mem.Allocator, cfg: *config_mod.Store) engine_mod.Engine {
+    var e = engine_mod.Engine.init(arena, if (std.mem.eql(u8, cfg.getString("permissions.default_mode", "ask"), "auto")) .auto else .ask);
+    e.read_globs = cfg.getStringList("permissions.read");
+    e.write_globs = cfg.getStringList("permissions.write");
+    e.command_allow = cfg.getStringList("permissions.command_allow");
+    e.command_deny = cfg.getStringList("permissions.command_deny");
+    e.env_allow = cfg.getStringList("permissions.env_allow");
+    return e;
+}
+
+fn ensureIfnh(io: std.Io, cwd: std.Io.Dir) !void {
+    const dirs = [_][]const u8{ ".ifnh", ".ifnh/sessions", ".ifnh/plans" };
+    for (dirs) |d| try cwd.createDirPath(io, d);
+    if (!isFile(cwd, io, ".ifnh/.gitignore")) {
+        try cwd.writeFile(io, .{ .sub_path = ".ifnh/.gitignore", .data = "sessions/\ncache/\ndebug/\nreports/\n" });
+    }
+}
+
+fn isFile(cwd: std.Io.Dir, io: std.Io, path: []const u8) bool {
+    const st = cwd.statFile(io, path, .{}) catch return false;
+    return st.kind == .file;
+}
+
+// ---------------------------------------------------------------- slash commands
+
+const CommandAction = enum { none, quit };
+
+fn handleCommand(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    cwd: std.Io.Dir,
+    sess: *Session,
+    cfg: *config_mod.Store,
+    cmd: []const u8,
+    rest: []const u8,
+    instr: instructions_mod.Assembled,
+) CommandAction {
+    if (std.mem.eql(u8, cmd, "quit") or std.mem.eql(u8, cmd, "q")) {
+        return .quit;
+    } else if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "h")) {
+        out(io,
+            \\commands:
+            \\  /help                 this text
+            \\  /quit                 exit ifnh
+            \\  /model <name>         switch model for this session
+            \\  /config               show resolved configuration
+            \\  /context              show assembled system prompt sources
+            \\  /undo                 undo last file-mutation group
+            \\  /redo                 redo
+            \\  /diff                 show git diff of the working tree
+            \\  /plan <title>         create a plan artifact in .ifnh/plans/
+            \\  /sessions             list sessions (use `ifnh resume <id>`)
+            \\
+        , .{}) catch {};
+    } else if (std.mem.eql(u8, cmd, "model")) {
+        if (rest.len > 0) {
+            cfg.applyOverride("model.model", std.fmt.allocPrint(arena, "\"{s}\"", .{rest}) catch return .none, .{ .layer = .session, .origin = "session" }) catch {
+                out(io, "invalid model value\n", .{}) catch {};
+                return .none;
+            };
+            out(io, "model set to {s} for this session\n", .{rest}) catch {};
+        } else {
+            out(io, "usage: /model <name>\n", .{}) catch {};
+        }
+    } else if (std.mem.eql(u8, cmd, "config")) {
+        out(io, "model: {s} / {s}\n", .{ cfg.getString("model.provider", ""), cfg.getString("model.model", "") }) catch {};
+        out(io, "permissions.default_mode: {s}\n", .{cfg.getString("permissions.default_mode", "")}) catch {};
+        out(io, "agents.max_depth: {d}\n", .{cfg.getU32("agents.max_depth", 1)}) catch {};
+    } else if (std.mem.eql(u8, cmd, "context")) {
+        out(io, "assembled context ({d} sources):\n", .{instr.sources.len}) catch {};
+        for (instr.sources) |s| out(io, "  [{s}] {s}\n", .{ s.layer, s.path }) catch {};
+    } else if (std.mem.eql(u8, cmd, "undo")) {
+        if (sess.journal.undo() catch null) |gid| {
+            out(io, "undone group {d}\n", .{gid}) catch {};
+        } else out(io, "nothing to undo\n", .{}) catch {};
+    } else if (std.mem.eql(u8, cmd, "redo")) {
+        if (sess.journal.redo() catch null) |gid| {
+            out(io, "redone group {d}\n", .{gid}) catch {};
+        } else out(io, "nothing to redo\n", .{}) catch {};
+    } else if (std.mem.eql(u8, cmd, "diff")) {
+        const diff_result = std.process.run(arena, io, .{
+            .argv = &.{ "git", "diff" },
+            .stdout_limit = .limited(max_output_bytes),
+        }) catch {
+            out(io, "git diff failed (is this a git repository?)\n", .{}) catch {};
+            return .none;
+        };
+        if (diff_result.stdout.len == 0) out(io, "(no unstaged changes)\n", .{}) catch {};
+        out(io, "{s}", .{diff_result.stdout}) catch {};
+    } else if (std.mem.eql(u8, cmd, "plan")) {
+        createPlan(io, cwd, arena, rest) catch |err| {
+            out(io, "plan creation failed: {s}\n", .{@errorName(err)}) catch {};
+        };
+    } else if (std.mem.eql(u8, cmd, "sessions")) {
+        const summaries = session_mod.list(cwd, io, arena, ".ifnh/sessions") catch &.{};
+        if (summaries.len == 0) {
+            out(io, "no sessions\n", .{}) catch {};
+        }
+        for (summaries) |s| {
+            out(io, "  {s}  {d}  {s}\n", .{ s.id, s.created_ms, s.cwd }) catch {};
+        }
+    } else {
+        out(io, "unknown command /{s} (try /help)\n", .{cmd}) catch {};
+    }
+    return .none;
+}
+
+fn createPlan(io: std.Io, cwd: std.Io.Dir, arena: std.mem.Allocator, title: []const u8) !void {
+    try cwd.createDirPath(io, ".ifnh/plans");
+    const ts_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
+    const id = std.fmt.allocPrint(arena, "plan-{d}", .{ts_ms}) catch return error.OutOfMemory;
+    const path = std.fmt.allocPrint(arena, ".ifnh/plans/{s}.md", .{id}) catch return error.OutOfMemory;
+    const content = std.fmt.allocPrint(arena,
+        \\---
+        \\id: {s}
+        \\title: {s}
+        \\status: draft
+        \\created_ms: {d}
+        \\---
+        \\
+        \\# Plan: {s}
+        \\
+        \\## Goal
+        \\
+        \\## Approach
+        \\
+        \\## Steps
+        \\
+        \\1.
+        \\
+        \\## Verification
+        \\
+        \\
+    , .{ id, if (title.len > 0) title else "untitled", ts_ms, if (title.len > 0) title else "untitled" }) catch return error.OutOfMemory;
+    try cwd.writeFile(io, .{ .sub_path = path, .data = content });
+    out(io, "created {s}\n", .{path}) catch {};
+}
+
+fn out(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
+    var buf: [4096]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, fmt, args) catch return error.MessageTooLong;
+    try std.Io.File.stdout().writeStreamingAll(io, text);
+}
