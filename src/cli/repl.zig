@@ -780,6 +780,66 @@ fn handleCommand(
             }
             if (buf.items.len == 0) out(io, "no background executions\n", .{}) catch {} else out(io, "{s}", .{buf.items}) catch {};
         } else out(io, "background executions unavailable\n", .{}) catch {};
+    } else if (std.mem.eql(u8, cmd, "review")) {
+        // M2-T03 (G96/97): developer-only override of the last blocked review.
+        if (!std.mem.startsWith(u8, rest, "override ")) {
+            out(io, "usage: /review override <reason>\n", .{}) catch {};
+            return .none;
+        }
+        const reason = std.mem.trim(u8, rest[9..], " \t");
+        if (reason.len == 0) {
+            out(io, "a reason is required for audit purposes\n", .{}) catch {};
+            return .none;
+        }
+        const stage = sess.last_blocked_stage orelse {
+            out(io, "no blocked review in this session to override\n", .{}) catch {};
+            return .none;
+        };
+        cwd.createDirPath(io, ".ifnh/reports") catch {};
+        const ts_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
+        const audit_path = std.fmt.allocPrint(arena, ".ifnh/reports/override-{d}.md", .{ts_ms}) catch return .none;
+        const audit = std.fmt.allocPrint(arena,
+            \\# Review Override
+            \\
+            \\- stage: {s}
+            \\- ts_ms: {d}
+            \\- decided_by: developer (only a human may override a review)
+            \\- reason: {s}
+            \\
+            \\The blocked review for this stage was explicitly overridden by the
+            \\developer. This record is the durable audit trail (G97).
+            \\
+        , .{ stage, ts_ms, reason }) catch return .none;
+        fsutil.atomicWriteFile(cwd, io, arena, audit_path, audit) catch {};
+        sess.last_blocked_stage = null;
+        out(io, "review for '{s}' overridden; audit: {s}\n", .{ stage, audit_path }) catch {};
+        out(io, "resume with /lifecycle run <file> --from <n>\n", .{}) catch {};
+    } else if (std.mem.eql(u8, cmd, "reconcile")) {
+        // M2-T04 (D045/046): reconciliation agent for conflicting edits.
+        const rpath = std.mem.trim(u8, rest, " \t");
+        if (rpath.len == 0) {
+            out(io, "usage: /reconcile <path>\n", .{}) catch {};
+            return .none;
+        }
+        const versions = sess.journal.versionsForPath(arena, rpath) catch &.{};
+        if (versions.len < 2) {
+            out(io, "no conflicting versions of '{s}' in the journal\n", .{rpath}) catch {};
+            return .none;
+        }
+        out(io, "reconciling '{s}': {d} competing versions found\n", .{ rpath, versions.len }) catch {};
+        var payload: std.ArrayListUnmanaged(u8) = .empty;
+        payload.print(arena,
+            \\Reconcile conflicting implementations of '{s}'. Below are the
+            \\competing versions recorded in the undo journal. Produce a combined
+            \\solution that preserves the intent of both, then verify it compiles
+            \\and tests pass. The result goes through normal review and approval.
+            \\
+            \\
+        , .{rpath}) catch return .none;
+        for (versions, 0..) |v, i| {
+            payload.print(arena, "\n## Version {d}\n```\n{s}\n```\n", .{ i + 1, v }) catch {};
+        }
+        return .{ .submit = payload.items };
     } else if (std.mem.eql(u8, cmd, "usage")) {
         var total_in: u64 = 0;
         var total_out: u64 = 0;
