@@ -23,11 +23,14 @@ pub const Assembled = struct {
 
 /// Load and assemble project instructions from `workspace`.
 /// Missing files are skipped silently; over-long files are truncated.
+/// `focus_dirs` (C30/C31): for each directory the agent is working in,
+/// a nested AGENTS.md applies when present.
 pub fn assemble(
     workspace: std.Io.Dir,
     io: std.Io,
     arena: std.mem.Allocator,
     builtin: []const u8,
+    focus_dirs: []const []const u8,
 ) !Assembled {
     var parts: std.ArrayListUnmanaged(u8) = .empty;
     var sources: std.ArrayListUnmanaged(Source) = .empty;
@@ -74,7 +77,65 @@ pub fn assemble(
         } else |_| {}
     }
 
+    // Nested AGENTS.md for focus directories (deepest path wins duplicates).
+    var seen_dirs: std.ArrayListUnmanaged([]const u8) = .empty;
+    for (focus_dirs) |dir| {
+        if (dir.len == 0 or std.mem.eql(u8, dir, ".")) continue;
+        var dup = false;
+        for (seen_dirs.items) |sd| {
+            if (std.mem.eql(u8, sd, dir)) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
+        seen_dirs.append(arena, dir) catch continue;
+        const agents_path = std.fmt.allocPrint(arena, "{s}/AGENTS.md", .{dir}) catch continue;
+        if (loadBounded(workspace, io, arena, agents_path)) |content| {
+            try parts.appendSlice(arena, "\n\n# Instructions from ");
+            try parts.appendSlice(arena, agents_path);
+            try parts.appendSlice(arena, "\n\n");
+            try parts.appendSlice(arena, content);
+            try sources.append(arena, .{ .path = agents_path, .layer = "nested" });
+        } else |_| {}
+    }
+
     return .{ .text = parts.items, .sources = sources.items };
+}
+
+/// Extract the directories referenced by tool calls in the history
+/// (read/edit/write/grep targets), used to focus nested instructions.
+pub fn focusDirsFromHistory(arena: std.mem.Allocator, history: []const @import("types.zig").ChatMessage, max: usize) []const []const u8 {
+    var dirs: std.ArrayListUnmanaged([]const u8) = .empty;
+    var i: usize = history.len;
+    while (i > 0 and dirs.items.len < max) {
+        i -= 1;
+        const msg = history[i];
+        const tcj = msg.tool_calls_json orelse continue;
+        const v = std.json.parseFromSliceLeaky(std.json.Value, arena, tcj, .{}) catch continue;
+        if (v != .array) continue;
+        for (v.array.items) |item| {
+            if (dirs.items.len >= max) break;
+            if (item != .object) continue;
+            const args_s = item.object.get("arguments_json") orelse continue;
+            if (args_s != .string) continue;
+            const args = std.json.parseFromSliceLeaky(std.json.Value, arena, args_s.string, .{}) catch continue;
+            if (args != .object) continue;
+            const path_v = args.object.get("path") orelse continue;
+            if (path_v != .string) continue;
+            const dir = std.fs.path.dirname(path_v.string) orelse continue;
+            if (dir.len == 0) continue;
+            var dup = false;
+            for (dirs.items) |d| {
+                if (std.mem.eql(u8, d, dir)) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) dirs.append(arena, arena.dupe(u8, dir) catch continue) catch {};
+        }
+    }
+    return dirs.items;
 }
 
 fn loadBounded(workspace: std.Io.Dir, io: std.Io, arena: std.mem.Allocator, path: []const u8) ![]const u8 {
@@ -97,7 +158,7 @@ test "assemble picks up repo and project instructions in order" {
     defer arena_state.deinit();
     const a = arena_state.allocator();
 
-    const assembled = try assemble(tmp.dir, io, a, "builtin prompt");
+    const assembled = try assemble(tmp.dir, io, a, "builtin prompt", &.{});
     try std.testing.expect(std.mem.indexOf(u8, assembled.text, "builtin prompt") != null);
     const repo_pos = std.mem.indexOf(u8, assembled.text, "repo rules").?;
     const proj_a = std.mem.indexOf(u8, assembled.text, "proj a").?;
@@ -113,6 +174,20 @@ test "assemble tolerates missing files" {
     defer tmp.cleanup();
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const assembled = try assemble(tmp.dir, io, arena_state.allocator(), "only builtin");
+    const assembled = try assemble(tmp.dir, io, arena_state.allocator(), "only builtin", &.{});
     try std.testing.expectEqual(@as(usize, 1), assembled.sources.len);
+}
+
+test "focus dirs pull in nested AGENTS.md" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "src/core");
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/core/AGENTS.md", .data = "core rules" });
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const asm2 = try assemble(tmp.dir, io, arena_state.allocator(), "builtin", &.{"src/core"});
+    try std.testing.expect(std.mem.indexOf(u8, asm2.text, "core rules") != null);
+    try std.testing.expectEqual(@as(usize, 2), asm2.sources.len);
 }

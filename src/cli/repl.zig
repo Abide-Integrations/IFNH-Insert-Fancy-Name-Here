@@ -6,6 +6,7 @@
 //! can grant session-scoped permission patterns.
 
 const std = @import("std");
+const fsutil = @import("../core/fsutil.zig");
 const config_mod = @import("../core/config/config.zig");
 const session_mod = @import("../core/session/store.zig");
 const journal_mod = @import("../core/journal.zig");
@@ -30,6 +31,9 @@ const Session = struct {
     journal: journal_mod.Journal,
     engine: engine_mod.Engine,
     history: std.ArrayListUnmanaged(core_types.ChatMessage) = .empty,
+    /// Session-layer overrides (path, JSON value text) re-applied after
+    /// config re-reads at turn boundaries (DECISIONS B24).
+    overrides: std.ArrayListUnmanaged(struct { path: []const u8, json: []const u8 }) = .empty,
 };
 
 pub fn run(
@@ -78,7 +82,7 @@ pub fn run(
 
     // ---- instructions ----
     const builtin_prompt = system_prompt.system_prompt;
-    const instr = try instructions_mod.assemble(cwd, io, arena, builtin_prompt);
+    const instr = try instructions_mod.assemble(cwd, io, arena, builtin_prompt, &.{});
 
     // ---- welcome ----
     try out(io, "ifnh session {s} (model: {s}/{s}{s})\n", .{
@@ -110,11 +114,26 @@ pub fn run(
             const cmd = line[1..cmd_end];
             const rest = if (cmd_end < line.len) std.mem.trim(u8, line[cmd_end + 1 ..], " \t") else "";
             const action = handleCommand(io, arena, cwd, &sess, &cfg, cmd, rest, instr);
-            if (action == .quit) break;
+            switch (action) {
+                .quit => break,
+                .submit => |prompt| {
+                    try submitTurn(io, arena, &sess, &cfg, buildProviderConfig(&cfg, environ), instr.text, prompt, cwd);
+                },
+                .none => {},
+            }
             continue;
         }
 
-        try submitTurn(io, arena, &sess, &cfg, buildProviderConfig(&cfg, environ), instr.text, line, cwd);
+        // ---- policy boundary (D029): re-read disk config, re-assemble
+        // instructions with focus dirs from recent tool activity ----
+        if (reloadConfig(io, arena, cwd, environ, &sess)) |fresh| {
+            cfg.deinit();
+            cfg = fresh;
+        }
+        const focus = instructions_mod.focusDirsFromHistory(arena, sess.history.items, 8);
+        const turn_instr = instructions_mod.assemble(cwd, io, arena, system_prompt.system_prompt, focus) catch instr;
+
+        try submitTurn(io, arena, &sess, &cfg, buildProviderConfig(&cfg, environ), turn_instr.text, line, cwd);
     }
 }
 
@@ -270,6 +289,32 @@ fn rebuildHistory(arena: std.mem.Allocator, sess: *Session) !void {
     }
 }
 
+/// Re-read disk config at a turn boundary, re-applying session overrides
+/// and preserving permission grants (T10/D029). Returns the replacement
+/// store, or null when the reload failed (caller keeps the last-good one).
+fn reloadConfig(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    cwd: std.Io.Dir,
+    environ: *const std.process.Environ.Map,
+    sess: *Session,
+) ?config_mod.Store {
+    var fresh = config_mod.load(arena, io, environ, cwd) catch return null;
+    for (sess.overrides.items) |ov| {
+        fresh.applyOverride(ov.path, ov.json, .{ .layer = .session, .origin = "session" }) catch {};
+    }
+    if (fresh.errors.items.len > 0) {
+        fresh.deinit();
+        return null; // keep the last-good config on invalid reload
+    }
+    // Rebuild the engine against the fresh store's slices, carrying grants
+    // (grant patterns were duped into the long-lived REPL arena).
+    var new_engine = engineFromConfig(arena, &fresh);
+    new_engine.grants = sess.engine.grants;
+    sess.engine = new_engine;
+    return fresh;
+}
+
 fn redactionsFor(arena: std.mem.Allocator, api_key: []const u8) []const []const u8 {
     if (api_key.len < 8) return &.{};
     var list: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -319,7 +364,7 @@ fn isFile(cwd: std.Io.Dir, io: std.Io, path: []const u8) bool {
 
 // ---------------------------------------------------------------- slash commands
 
-const CommandAction = enum { none, quit };
+const CommandAction = union(enum) { none, quit, submit: []const u8 };
 
 fn handleCommand(
     io: std.Io,
@@ -350,10 +395,12 @@ fn handleCommand(
         , .{}) catch {};
     } else if (std.mem.eql(u8, cmd, "model")) {
         if (rest.len > 0) {
-            cfg.applyOverride("model.model", std.fmt.allocPrint(arena, "\"{s}\"", .{rest}) catch return .none, .{ .layer = .session, .origin = "session" }) catch {
+            const json = std.fmt.allocPrint(arena, "\"{s}\"", .{rest}) catch return .none;
+            cfg.applyOverride("model.model", json, .{ .layer = .session, .origin = "session" }) catch {
                 out(io, "invalid model value\n", .{}) catch {};
                 return .none;
             };
+            sess.overrides.append(arena, .{ .path = "model.model", .json = json }) catch {};
             out(io, "model set to {s} for this session\n", .{rest}) catch {};
         } else {
             out(io, "usage: /model <name>\n", .{}) catch {};
@@ -395,10 +442,41 @@ fn handleCommand(
         for (summaries) |s| {
             out(io, "  {s}  {d}  {s}\n", .{ s.id, s.created_ms, s.cwd }) catch {};
         }
+    } else if (loadDiskCommand(io, arena, cwd, cmd, rest)) |prompt| {
+        return .{ .submit = prompt };
     } else {
         out(io, "unknown command /{s} (try /help)\n", .{cmd}) catch {};
     }
     return .none;
+}
+
+/// Disk-backed slash command (D030, M0-T37): `.ifnh/commands/<name>.md`
+/// with optional frontmatter; `$ARGS` in the body is replaced by the
+/// command arguments. The body is submitted as the user's prompt.
+fn loadDiskCommand(io: std.Io, arena: std.mem.Allocator, cwd: std.Io.Dir, cmd: []const u8, args: []const u8) ?[]const u8 {
+    var name_buf: [128]u8 = undefined;
+    if (cmd.len == 0 or cmd.len > 64) return null;
+    for (cmd) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_') return null;
+    }
+    const rel = std.fmt.bufPrint(&name_buf, ".ifnh/commands/{s}.md", .{cmd}) catch return null;
+    const raw = fsutil.readSmallFile(cwd, io, arena, rel, 64 * 1024) catch return null;
+
+    // Strip YAML-ish frontmatter (--- ... ---) if present.
+    var body = raw;
+    if (std.mem.startsWith(u8, body, "---")) {
+        if (std.mem.indexOfPos(u8, body, 3, "\n---")) |end| {
+            const after = body[end + 4 ..];
+            body = if (after.len > 0 and after[0] == '\n') after[1..] else after;
+        }
+    }
+    if (std.mem.indexOf(u8, body, "$ARGS")) |pos| {
+        return std.fmt.allocPrint(arena, "{s}{s}{s}", .{ body[0..pos], args, body[pos + "$ARGS".len ..] }) catch null;
+    }
+    if (args.len > 0) {
+        return std.fmt.allocPrint(arena, "{s}\n\nArguments: {s}", .{ body, args }) catch null;
+    }
+    return body;
 }
 
 fn createPlan(io: std.Io, cwd: std.Io.Dir, arena: std.mem.Allocator, title: []const u8) !void {
