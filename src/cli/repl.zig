@@ -195,6 +195,8 @@ fn submitTurn(
             .on_notice = TurnUi.onNotice,
         },
         .cancel = &cancel,
+        .max_retries = cfg.getU32("agents.max_retries", 3),
+        .redactions = redactionsFor(arena, pcfg.api_key),
     }) catch |err| {
         try out(io, "\nturn failed: {s}\n", .{@errorName(err)});
         return;
@@ -266,6 +268,13 @@ fn rebuildHistory(arena: std.mem.Allocator, sess: *Session) !void {
             .note, .interrupted => {},
         }
     }
+}
+
+fn redactionsFor(arena: std.mem.Allocator, api_key: []const u8) []const []const u8 {
+    if (api_key.len < 8) return &.{};
+    var list: std.ArrayListUnmanaged([]const u8) = .empty;
+    list.append(arena, api_key) catch return &.{};
+    return list.items;
 }
 
 fn buildProviderConfig(cfg: *config_mod.Store, environ: *const std.process.Environ.Map) agent_engine.ProviderConfig {

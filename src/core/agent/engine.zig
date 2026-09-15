@@ -10,6 +10,7 @@ const std = @import("std");
 const core_types = @import("../types.zig");
 const provider_mod = @import("../../providers/provider.zig");
 const tool_mod = @import("../../tools/tool.zig");
+const redact_mod = @import("../redact.zig");
 
 pub const max_tool_rounds_default: usize = 25;
 
@@ -129,6 +130,9 @@ pub const RunParams = struct {
     callbacks: Callbacks,
     cancel: *std.atomic.Value(bool),
     max_tool_rounds: usize = max_tool_rounds_default,
+    max_retries: usize = 3,
+    /// Secret strings redacted from tool output before it enters history.
+    redactions: []const []const u8 = &.{},
     temperature: ?f64 = null,
     max_output_tokens: ?u32 = null,
 };
@@ -147,17 +151,30 @@ pub fn runTurn(p: RunParams) !Outcome {
 
         var collector = Collector{ .arena = p.arena };
         const tools_json = try renderToolsJson(p.arena, null);
-        try p.pcfg.provider.stream(p.arena, p.io, .{
-            .model = p.pcfg.model,
-            .base_url = p.pcfg.base_url,
-            .api_key = p.pcfg.api_key,
-            .system = p.system,
-            .messages = p.history.items,
-            .tools_json = tools_json,
-            .temperature = p.temperature,
-            .max_output_tokens = p.max_output_tokens,
-            .cancel = p.cancel,
-        }, .{ .ctx = &collector, .emit_fn = sinkEmit });
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            collector = Collector{ .arena = p.arena };
+            try p.pcfg.provider.stream(p.arena, p.io, .{
+                .model = p.pcfg.model,
+                .base_url = p.pcfg.base_url,
+                .api_key = p.pcfg.api_key,
+                .system = p.system,
+                .messages = p.history.items,
+                .tools_json = tools_json,
+                .temperature = p.temperature,
+                .max_output_tokens = p.max_output_tokens,
+                .cancel = p.cancel,
+            }, .{ .ctx = &collector, .emit_fn = sinkEmit });
+            if (collector.failure) |f| {
+                if (core_types.isRetryable(f.kind) and attempt < p.max_retries and !p.cancel.load(.acquire)) {
+                    const shift: u6 = @intCast(@min(attempt, 4));
+                    const delay_s: u64 = @min(@as(u64, 1) << shift, 16);
+                    sleepSeconds(p.io, delay_s) catch break;
+                    continue;
+                }
+            }
+            break;
+        }
 
         total_usage.input_tokens += collector.usage.input_tokens;
         total_usage.output_tokens += collector.usage.output_tokens;
@@ -210,7 +227,11 @@ pub fn runTurn(p: RunParams) !Outcome {
                 return .{ .status = .cancelled, .reply = last_reply, .tool_rounds = rounds, .tool_calls = total_calls, .usage = total_usage };
             }
             p.callbacks.on_tool_start(p.callbacks.ctx, tc.name, tc.arguments_json);
-            const result = tool_mod.execute(tc.name, tc.arguments_json, p.tool_ctx);
+            const result_raw = tool_mod.execute(tc.name, tc.arguments_json, p.tool_ctx);
+            const result = tool_mod.ToolResult{
+                .output = redact_mod.redact(p.arena, result_raw.output, p.redactions),
+                .status = result_raw.status,
+            };
             total_calls += 1;
             p.callbacks.on_tool_result(p.callbacks.ctx, tc.name, result.status, result.output);
             if (result.status == .denied) {
@@ -387,6 +408,11 @@ test "runTurn surfaces provider failure" {
     });
     try std.testing.expectEqual(Status.failed, outcome.status);
     try std.testing.expectEqualStrings("bad key", outcome.error_message);
+}
+
+fn sleepSeconds(io: std.Io, seconds: u64) !void {
+    if (seconds == 0) return;
+    try std.Io.sleep(io, .fromSeconds(@intCast(seconds)), .awake);
 }
 
 fn noopText(_: *anyopaque, _: []const u8) void {}

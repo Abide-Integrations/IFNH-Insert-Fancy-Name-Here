@@ -217,4 +217,5 @@ test {
     _ = @import("core/agent/testing.zig");
     _ = @import("core/agent/system_prompt.zig");
     _ = @import("cli/repl.zig");
+    _ = @import("core/redact.zig");
 }
