@@ -55,7 +55,12 @@ pub fn main(init: std.process.Init) !void {
         .init => try runInit(io, arena, parsed.args),
         .config => try runConfig(io, arena, init.environ_map, parsed.args),
         .sessions => try runSessions(io, arena, parsed.args),
-        .fork => try runFork(io, arena, parsed.args),
+        .fork => blk: {
+            if (parsed.args.len >= 3 and std.mem.eql(u8, parsed.args[0], "diff")) {
+                break :blk try runForkDiff(io, arena, parsed.args[1..]);
+            }
+            break :blk try runFork(io, arena, parsed.args);
+        },
         .cleanup => try runCleanup(io, arena, init.environ_map, parsed.args),
         .@"resume" => blk: {
             if (parsed.args.len == 0) {
@@ -162,6 +167,54 @@ fn runFork(io: std.Io, arena: std.mem.Allocator, args: []const []const u8) !void
     var child = try parent.fork();
     defer child.close();
     try printOut(io, arena, "forked {s} -> {s} ({d} events inherited)\n", .{ parent.manifest.id, child.manifest.id, child.seq });
+}
+
+/// `ifnh fork diff <a> <b>` — side-by-side comparison (M2-T05, A12).
+fn runForkDiff(io: std.Io, arena: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len < 2) {
+        try printOut(io, arena, "usage: ifnh fork diff <session-a> <session-b>\n", .{});
+        std.process.exit(2);
+    }
+    const cwd = std.Io.Dir.cwd();
+    var a = try session_mod.Session.openReadOnly(cwd, io, arena, ".ifnh/sessions", args[0]);
+    defer a.close();
+    var b = try session_mod.Session.openReadOnly(cwd, io, arena, ".ifnh/sessions", args[1]);
+    defer b.close();
+
+    const events_a = try a.readEvents(arena, 10_000);
+    const events_b = try b.readEvents(arena, 10_000);
+
+    try printOut(io, arena, "session A: {s} ({d} events, fork_of {s})\n", .{ a.manifest.id, events_a.len, a.manifest.fork_of orelse "-" });
+    try printOut(io, arena, "session B: {s} ({d} events, fork_of {s})\n", .{ b.manifest.id, events_b.len, b.manifest.fork_of orelse "-" });
+
+    // Common prefix length.
+    var common: usize = 0;
+    while (common < events_a.len and common < events_b.len) {
+        if (events_a[common].seq != events_b[common].seq) break;
+        common += 1;
+    }
+    try printOut(io, arena, "common history: {d} events (diverge after seq {d})\n", .{ common, common });
+
+    // Last assistant text per side.
+    for ([_]struct { label: []const u8, evs: []session_mod.Record }{ .{ .label = "A", .evs = events_a }, .{ .label = "B", .evs = events_b } }) |side| {
+        var i = side.evs.len;
+        while (i > 0) {
+            i -= 1;
+            switch (side.evs[i].event) {
+                .assistant => |v| {
+                    const max: usize = 200;
+                    try printOut(io, arena, "last assistant ({s}): {s}{s}\n", .{
+                        side.label,
+                        v.text[0..@min(v.text.len, max)],
+                        if (v.text.len > max) "..." else "",
+                    });
+                    break;
+                },
+                else => {},
+            }
+        }
+    }
+    _ = args.len;
 }
 
 /// `ifnh cleanup [--yes]` — retention enforcement (M2-T06, A13).
@@ -352,7 +405,7 @@ const help_text =
     \\  init        create a .ifnh/ project skeleton
     \\  config      validate/explain configuration (M0)
     \\  sessions    list recorded sessions (--json supported)
-    \\  fork        branch a session (ifnh fork <id>)
+    \\  fork        branch a session (ifnh fork <id>); 'ifnh fork diff <a> <b>' compares
     \\  cleanup     enforce retention, list/remove worktrees
     \\  resume      resume a previous session (M0)
     \\  doctor      check environment health (M1)

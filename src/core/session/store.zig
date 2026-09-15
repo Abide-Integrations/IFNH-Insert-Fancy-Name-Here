@@ -304,6 +304,44 @@ pub const Session = struct {
         return self;
     }
 
+    /// Open without taking the advisory lock — for inspection commands
+    /// (fork diff, listing) that must not disturb a live session.
+    pub fn openReadOnly(
+        parent: std.Io.Dir,
+        io: std.Io,
+        alloc: std.mem.Allocator,
+        sessions_rel_path: []const u8,
+        full_id: []const u8,
+    ) OpenError!Session {
+        const bare = SessionId.parse(sessionIdPrefix(full_id)) orelse return error.InvalidSessionId;
+        var name_buf: [2 + id_len]u8 = undefined;
+        name_buf[0] = 's';
+        name_buf[1] = '_';
+        @memcpy(name_buf[2..], bare.text());
+        const rel = std.fmt.allocPrint(alloc, "{s}/{s}", .{ sessions_rel_path, name_buf[0..] }) catch
+            return error.OutOfMemory;
+        var dir = parent.openDir(io, rel, .{ .access_sub_paths = true }) catch |err| switch (err) {
+            error.FileNotFound => return error.SessionNotFound,
+            else => return err,
+        };
+        errdefer dir.close(io);
+        var self = Session{
+            .io = io,
+            .alloc = alloc,
+            .dir = dir,
+            .parent = parent,
+            .sessions_rel_path = try alloc.dupe(u8, sessions_rel_path),
+            .id = bare,
+            .manifest = undefined,
+        };
+        const manifest_text = fsutil.readSmallFile(self.dir, io, alloc, "manifest.json", 64 * 1024) catch
+            return error.CorruptManifest;
+        const mv = std.json.parseFromSliceLeaky(std.json.Value, alloc, manifest_text, .{}) catch
+            return error.CorruptManifest;
+        self.manifest = manifestFromJson(alloc, mv) catch return error.CorruptManifest;
+        return self;
+    }
+
     fn acquireLock(self: *Session) !void {
         const f = try self.dir.createFile(self.io, "session.lock", .{ .truncate = false });
         self.lock_file = f;
