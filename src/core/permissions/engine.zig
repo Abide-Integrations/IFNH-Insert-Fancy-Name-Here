@@ -17,6 +17,7 @@ pub const Request = union(enum) {
     path: struct { access: Access, path: []const u8 },
     command: struct { command: []const u8 },
     env: struct { name: []const u8 },
+    mcp: struct { server: []const u8, tool: []const u8 },
 };
 
 pub const GrantScope = enum { once, session, pattern };
@@ -49,6 +50,8 @@ pub const Engine = struct {
     command_allow: []const []const u8 = &.{},
     command_deny: []const []const u8 = &.{},
     env_allow: []const []const u8 = &.{},
+    mcp_allow: []const []const u8 = &.{},
+    mcp_deny: []const []const u8 = &.{},
     /// Session grants accumulated from approvals. `alloc` is the engine's
     /// arena (Grant patterns are duped into it).
     grants: std.ArrayListUnmanaged(Grant) = .empty,
@@ -69,7 +72,22 @@ pub const Engine = struct {
             .path => |p| self.decidePath(p.access, p.path),
             .command => |c| self.decideCommand(c.command),
             .env => |e| self.decideEnv(e.name),
+            .mcp => |m| self.decideMcp(m.server, m.tool),
         };
+    }
+
+    /// MCP tool permissions (J141): deny > allow > ask. Patterns are
+    /// "server.tool" or "server.*".
+    pub fn decideMcp(self: *Engine, server: []const u8, tool: []const u8) Decision {
+        var buf: [256]u8 = undefined;
+        const key = std.fmt.bufPrint(&buf, "{s}.{s}", .{ server, tool }) catch return .ask;
+        for (self.mcp_deny) |d| {
+            if (mcpMatch(d, key)) return .deny;
+        }
+        for (self.mcp_allow) |a| {
+            if (mcpMatch(a, key)) return .allow;
+        }
+        return .ask;
     }
 
     pub fn decidePath(self: *Engine, access: Access, path: []const u8) Decision {
@@ -172,6 +190,14 @@ fn prefixMatch(prefix: []const u8, target: []const u8) bool {
     if (p.len == 0) return false;
     return std.mem.startsWith(u8, target, p) and
         (target.len == p.len or target[p.len] == ' ' or target[p.len] == '\t');
+}
+
+fn mcpMatch(pattern: []const u8, key: []const u8) bool {
+    if (std.mem.eql(u8, pattern, key)) return true;
+    if (std.mem.endsWith(u8, pattern, ".*")) {
+        return std.mem.startsWith(u8, key, pattern[0 .. pattern.len - 1]);
+    }
+    return false;
 }
 
 fn isProtectedPath(path: []const u8) bool {

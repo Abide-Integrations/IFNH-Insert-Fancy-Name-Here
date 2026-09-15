@@ -47,6 +47,10 @@ pub const ToolContext = struct {
     /// Subagent runtime hook (wired by the host; null disables spawning).
     agent_spawn_fn: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, parent_depth: usize, arguments_json: []const u8) AgentSpawnResult = null,
     agent_spawn_ctx: ?*anyopaque = null,
+    /// MCP registry hooks (wired by the host; null disables MCP).
+    mcp_list_fn: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator) []const u8 = null,
+    mcp_call_fn: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, server: []const u8, tool: []const u8, arguments_json: []const u8) []const u8 = null,
+    mcp_ctx: ?*anyopaque = null,
     /// Delegation depth of the agent owning this context (0 = parent).
     agent_depth: usize = 0,
     /// Display label for approval provenance ("parent", "research-1"...).
@@ -101,6 +105,12 @@ pub const specs = [_]Spec{
     },
     .{ .name = "bash", .description = "Run a shell command in the workspace. Read-only commands run freely; anything that changes state requires approval.", .parameters_json =
     \\{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}
+    },
+    .{ .name = "mcp_list", .description = "List configured MCP servers and their tools.", .parameters_json =
+    \\{"type":"object","properties":{}}
+    },
+    .{ .name = "mcp_call", .description = "Call an MCP server tool. Server/tool must be permitted; calls require approval unless allowlisted.", .parameters_json =
+    \\{"type":"object","properties":{"server":{"type":"string"},"tool":{"type":"string"},"arguments":{"type":"object"}},"required":["server","tool"]}
     },
     .{ .name = "agent", .description = "Delegate a self-contained task to a child agent. Roles: research (read-only), implement (may edit), review (read-only findings). The child works independently and returns a summary; its full report is stored under .ifnh/reports/.", .parameters_json =
     \\{"type":"object","properties":{"task":{"type":"string"},"role":{"type":"string","enum":["research","implement","review"]},"model":{"type":"string"}},"required":["task","role"]}
@@ -179,6 +189,32 @@ pub fn execute(name: []const u8, args_json: []const u8, ctx: *ToolContext) ToolR
     } else if (std.mem.eql(u8, name, "bash")) {
         const command = a.str("command") orelse return errResult(ctx.arena, "bash: missing command", .{});
         return toolBash(command, ctx);
+    } else if (std.mem.eql(u8, name, "mcp_list")) {
+        const list_fn = ctx.mcp_list_fn orelse
+            return errResult(ctx.arena, "mcp_list: MCP not configured", .{});
+        return .{ .output = list_fn(ctx.mcp_ctx orelse ctx.approval_ctx, ctx.arena), .status = .ok };
+    } else if (std.mem.eql(u8, name, "mcp_call")) {
+        const call_fn = ctx.mcp_call_fn orelse
+            return errResult(ctx.arena, "mcp_call: MCP not configured", .{});
+        const server = a.str("server") orelse return errResult(ctx.arena, "mcp_call: missing server", .{});
+        const mcp_tool = a.str("tool") orelse return errResult(ctx.arena, "mcp_call: missing tool", .{});
+        var arguments_json: []const u8 = "{}";
+        if (a.obj.get("arguments")) |av| {
+            var aw: std.Io.Writer.Allocating = .init(ctx.arena);
+            std.json.Stringify.value(av, .{}, &aw.writer) catch {};
+            arguments_json = aw.written();
+        }
+        switch (ctx.engine.decide(.{ .mcp = .{ .server = server, .tool = mcp_tool } })) {
+            .allow => {},
+            .deny => return deniedResult(ctx.arena, "mcp {s}.{s}", .{ server, mcp_tool }),
+            .ask => {
+                const label = std.fmt.allocPrint(ctx.arena, "{s}.{s}", .{ server, mcp_tool }) catch "?";
+                if (!ctx.requestApproval("call MCP tool", label, .none))
+                    return deniedResult(ctx.arena, "mcp {s}.{s} (declined)", .{ server, mcp_tool });
+            },
+        }
+        const out = call_fn(ctx.mcp_ctx orelse ctx.approval_ctx, ctx.arena, server, mcp_tool, arguments_json);
+        return .{ .output = out, .status = .ok };
     } else if (std.mem.eql(u8, name, "agent")) {
         const spawn_fn = ctx.agent_spawn_fn orelse
             return errResult(ctx.arena, "agent: delegation disabled", .{});

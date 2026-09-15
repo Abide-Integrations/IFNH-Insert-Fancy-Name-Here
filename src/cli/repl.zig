@@ -16,6 +16,7 @@ const system_prompt = @import("../core/agent/system_prompt.zig");
 const agent_engine = @import("../core/agent/engine.zig");
 const subagent_mod = @import("../core/agent/subagent.zig");
 const git_mod = @import("../core/git.zig");
+const mcp_mod = @import("../core/mcp.zig");
 const tool_mod = @import("../tools/tool.zig");
 const core_types = @import("../core/types.zig");
 const openai = @import("../providers/openai.zig");
@@ -36,6 +37,7 @@ const Session = struct {
     /// Session-layer overrides (path, JSON value text) re-applied after
     /// config re-reads at turn boundaries (DECISIONS B24).
     overrides: std.ArrayListUnmanaged(struct { path: []const u8, json: []const u8 }) = .empty,
+    mcp_registry: ?*mcp_mod.Registry = null,
 };
 
 pub fn run(
@@ -74,9 +76,17 @@ pub fn run(
         }
     };
     defer {
+        if (sess.mcp_registry) |reg| reg.deinit();
         sess.store.close();
         sess.journal.close();
     }
+
+    // ---- MCP registry (lazy servers, J137/138) ----
+    sess.mcp_registry = blk: {
+        const reg = arena.create(mcp_mod.Registry) catch break :blk null;
+        reg.* = mcp_mod.Registry.init(io, arena, cfg.get("mcp_servers")) catch break :blk null;
+        break :blk reg;
+    };
 
     // ---- provider ----
     const pcfg = buildProviderConfig(&cfg, environ);
@@ -218,6 +228,9 @@ fn submitTurn(
         .agent_spawn_ctx = &host,
         .agent_depth = 0,
         .agent_label = "parent",
+        .mcp_list_fn = mcpListHook,
+        .mcp_call_fn = mcpCallHook,
+        .mcp_ctx = sess.mcp_registry orelse mcp_registry_sentinel,
     };
     tool_ctx.approval_ctx = &approver;
     tool_ctx.approval_fn = Approver.approve;
@@ -365,6 +378,31 @@ fn reloadConfig(
     return fresh;
 }
 
+const mcp_registry_sentinel: *mcp_mod.Registry = @ptrFromInt(@alignOf(usize)); // never dereferenced
+
+fn mcpListHook(ctx: *anyopaque, arena: std.mem.Allocator) []const u8 {
+    const reg: *mcp_mod.Registry = @ptrCast(@alignCast(ctx));
+    if (reg == mcp_registry_sentinel or reg.configs.len == 0) return "no MCP servers configured";
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    for (reg.allTools(arena)) |st| {
+        buf.print(arena, "{s}.{s}: {s}\n", .{ st.server, st.tool.name, st.tool.description }) catch {};
+    }
+    if (buf.items.len == 0) return "no MCP tools available";
+    return buf.items;
+}
+
+fn mcpCallHook(ctx: *anyopaque, arena: std.mem.Allocator, server: []const u8, tool: []const u8, arguments_json: []const u8) []const u8 {
+    const reg: *mcp_mod.Registry = @ptrCast(@alignCast(ctx));
+    if (reg == mcp_registry_sentinel) return "error: MCP not configured";
+    const res = reg.call(arena, server, tool, arguments_json) catch |err| {
+        return std.fmt.allocPrint(arena, "error: mcp call failed: {s}", .{@errorName(err)}) catch "error: mcp call failed";
+    };
+    if (res.is_error) {
+        return std.fmt.allocPrint(arena, "mcp error: {s}", .{res.text}) catch res.text;
+    }
+    return res.text;
+}
+
 fn redactionsFor(arena: std.mem.Allocator, api_key: []const u8) []const []const u8 {
     if (api_key.len < 8) return &.{};
     var list: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -441,6 +479,7 @@ fn handleCommand(
             \\  /diff                 show git diff of the working tree
             \\  /plan <title>         create a plan artifact in .ifnh/plans/
             \\  /agents               list subagent reports
+            \\  /mcp                  list MCP servers/tools
             \\  /sessions             list sessions (use `ifnh resume <id>`)
             \\
         , .{}) catch {};
@@ -485,6 +524,16 @@ fn handleCommand(
         createPlan(io, cwd, arena, rest) catch |err| {
             out(io, "plan creation failed: {s}\n", .{@errorName(err)}) catch {};
         };
+    } else if (std.mem.eql(u8, cmd, "mcp")) {
+        if (sess.mcp_registry) |reg| {
+            if (reg.configs.len == 0) {
+                out(io, "no MCP servers configured (mcp_servers in config)\n", .{}) catch {};
+            }
+            for (reg.configs) |c| {
+                out(io, "  {s}: {s}\n", .{ c.name, c.command }) catch {};
+            }
+            out(io, "{s}", .{mcpListHook(@ptrCast(reg), arena)}) catch {};
+        } else out(io, "MCP not available\n", .{}) catch {};
     } else if (std.mem.eql(u8, cmd, "agents")) {
         _ = &sess;
         out(io, "subagents run inline during turns; reports:\n", .{}) catch {};
