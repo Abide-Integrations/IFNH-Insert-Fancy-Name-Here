@@ -11,10 +11,13 @@ const std = @import("std");
 const core_types = @import("types.zig");
 const subagent_mod = @import("agent/subagent.zig");
 const tool_mod = @import("../tools/tool.zig");
+const testing = @import("agent/testing.zig");
 
 pub const max_stages: usize = 32;
 
 pub const Approval = enum { none, human };
+
+pub const ReviewPolicy = enum { all, any, n_of_m };
 
 pub const Stage = struct {
     name: []const u8,
@@ -22,8 +25,14 @@ pub const Stage = struct {
     instructions: []const u8,
     /// Paths that must exist for the stage to start (F81).
     requires: []const []const u8 = &.{},
-    /// Stage output is reviewed by a review-role child (G88-92).
+    /// Stage output is reviewed by review-role children (G88-92).
     review: bool = false,
+    /// Number of independent reviewers (G90/91). >1 runs N children.
+    reviewers: usize = 1,
+    /// Approval combination policy (G92): all = unanimity, any = one
+    /// clean review suffices, n_of_m = at least `review_threshold`.
+    review_policy: ReviewPolicy = .all,
+    review_threshold: usize = 2,
     /// Human approval gate after the stage (G98, D027).
     approval: Approval = .none,
 };
@@ -73,12 +82,29 @@ pub fn parse(arena: std.mem.Allocator, json_text: []const u8) ParseError!Lifecyc
                 try requires.append(arena, p.string);
             }
         }
+        var reviewers: usize = 1;
+        if (so.get("reviewers")) |rv| {
+            if (rv == .integer and rv.integer > 0) reviewers = @intCast(rv.integer);
+        }
+        var policy: ReviewPolicy = .all;
+        if (so.get("review_policy")) |pv| {
+            if (pv == .string) {
+                policy = std.meta.stringToEnum(ReviewPolicy, pv.string) orelse return error.InvalidLifecycle;
+            }
+        }
+        var threshold: usize = 2;
+        if (so.get("review_threshold")) |tv| {
+            if (tv == .integer and tv.integer > 0) threshold = @intCast(tv.integer);
+        }
         try stages.append(arena, .{
             .name = name_v.string,
             .role = role,
             .instructions = instr_v.string,
             .requires = requires.items,
             .review = if (so.get("review")) |rv| (rv == .bool and rv.bool) else false,
+            .reviewers = reviewers,
+            .review_policy = policy,
+            .review_threshold = threshold,
             .approval = if (so.get("approval")) |av|
                 (if (av == .string and std.mem.eql(u8, av.string, "human")) Approval.human else Approval.none)
             else
@@ -150,7 +176,7 @@ pub fn run(
 
         // Stage task = instructions (+ role framing handled by the child).
         const task = try std.fmt.allocPrint(arena, "Lifecycle stage '{s}': {s}", .{ stage.name, stage.instructions });
-        var spawn_result = spawnChild(host, arena, task, stage.role);
+        const spawn_result = spawnChild(host, arena, task, stage.role);
 
         const out = StageOutcome{
             .stage = stage.name,
@@ -162,26 +188,46 @@ pub fn run(
         try outcomes.append(arena, out);
         if (out.status != .completed) return outcomes.items;
 
-        // Review pass (D026, G88): a review-role child inspects the stage.
+        // Review pass (D026, G88-92): N independent review-role children;
+        // the policy decides whether their approvals suffice.
         if (stage.review) {
-            const review_task = try std.fmt.allocPrint(arena, "Review the work completed for lifecycle stage '{s}'. Its report: {s}. " ++
-                "Inspect the changed files in the repository and report findings with severities; " ++
-                "state clearly on the first line either 'BLOCKERS: 0' or 'BLOCKERS: <n>'.", .{ stage.name, spawn_result.report_path });
-            const review_result = spawnChild(host, arena, review_task, .review);
-            const blockers = parseBlockers(review_result.summary);
+            const reviewer_count = @max(stage.reviewers, 1);
+            var clean: usize = 0;
+            var total_blockers: usize = 0;
+            var last_summary: []const u8 = "";
+            var last_report: []const u8 = "";
+            var r: usize = 0;
+            while (r < reviewer_count) : (r += 1) {
+                const review_task = try std.fmt.allocPrint(arena, "Review the work completed for lifecycle stage '{s}' (reviewer {d} of {d}). Its report: {s}. " ++
+                    "Inspect the changed files in the repository and report findings with severities; " ++
+                    "state clearly on the first line either 'BLOCKERS: 0' or 'BLOCKERS: <n>'.", .{ stage.name, r + 1, reviewer_count, spawn_result.report_path });
+                const review_result = spawnChild(host, arena, review_task, .review);
+                var blockers = parseBlockers(review_result.summary);
+                // A reviewer that failed to run is NOT a clean pass
+                // (fail-closed review, D008).
+                if (review_result.status != .completed and blockers == 0) blockers = 1;
+                last_summary = review_result.summary;
+                last_report = review_result.report_path;
+                if (blockers == 0) clean += 1 else total_blockers += blockers;
+            }
+            const passed = switch (stage.review_policy) {
+                .all => clean == reviewer_count,
+                .any => clean >= 1,
+                .n_of_m => clean >= stage.review_threshold,
+            };
             const reviewed = StageOutcome{
                 .stage = stage.name,
-                .status = if (blockers > 0) .blocked else .completed,
-                .summary = review_result.summary,
-                .report_path = review_result.report_path,
-                .review_summary = review_result.summary,
-                .blockers = blockers,
+                .status = if (passed) .completed else .blocked,
+                .summary = last_summary,
+                .report_path = last_report,
+                .review_summary = last_summary,
+                .blockers = if (passed) 0 else total_blockers,
             };
             try outcomes.append(arena, reviewed);
             callbacks.on_stage_done(callbacks.ctx, reviewed);
-            if (blockers > 0) return outcomes.items; // failed review stops (D008)
-            spawn_result = review_result;
+            if (!passed) return outcomes.items; // failed review stops (D008)
         }
+        // (review summaries stand in for the gate display)
 
         // Human approval gate (D027).
         if (stage.approval == .human) {
@@ -387,4 +433,125 @@ test "lifecycle stops at blocked review" {
     try std.testing.expectEqual(StageOutcome.Status.completed, outcomes[0].status);
     try std.testing.expectEqual(StageOutcome.Status.blocked, outcomes[1].status);
     try std.testing.expectEqual(@as(usize, 1), outcomes[1].blockers);
+}
+
+const ReviewTracker = struct {
+    started: usize = 0,
+    fn onStart(_: *anyopaque, _: []const u8, _: []const u8) void {
+        // can't mutate through the ctx; counters live in the test
+    }
+    fn onDone(_: *anyopaque, _: StageOutcome) void {}
+    fn approveFn(_: *anyopaque, _: []const u8, _: []const u8) bool {
+        return true;
+    }
+};
+
+pub fn runReviewScenarioForDebug(policy_json: []const u8, review_actions: []const testing.Action, out_arena: std.mem.Allocator) ![]StageOutcome {
+    return runReviewScenarioImpl(policy_json, review_actions, out_arena);
+}
+
+/// Runs one stage+review scenario against scripted providers. Returned
+/// outcomes (and their strings) are copied into `out_arena` — the internal
+/// arena dies on return.
+fn runReviewScenarioImpl(policy_json: []const u8, review_actions: []const testing.Action, out_arena: std.mem.Allocator) ![]StageOutcome {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Script layout: entry 0 = the stage turn; entries 1..N = one per
+    // reviewer turn (the fake provider advances one entry per stream call).
+    var script: std.ArrayListUnmanaged([]const testing.Action) = .empty;
+    const stage_turn = try arena.alloc(testing.Action, 1);
+    stage_turn[0] = .{ .text = "stage work done." };
+    try script.append(arena, stage_turn);
+    for (review_actions) |action| {
+        const one = try arena.alloc(testing.Action, 1);
+        one[0] = action;
+        try script.append(arena, one);
+    }
+    var child_fake = testing.Fake{ .script = script.items };
+    var cancel = std.atomic.Value(bool).init(false);
+    var host = subagent_mod.Host{
+        .io = io,
+        .workspace = tmp.dir,
+        .base_system = "",
+        .provider = child_fake.provider(),
+        .base_url = "",
+        .api_key = "",
+        .default_model = "fake",
+        .mode = .auto,
+        .read_globs = &.{"**"},
+        .write_globs = &.{},
+        .command_allow = &.{},
+        .command_deny = &.{},
+        .env_allow = &.{},
+        .journal = null,
+        .approval_ctx = undefined,
+        .approval_fn = undefined,
+        .max_depth = 1,
+        .max_concurrent = 1,
+        .max_rounds = 10,
+        .redactions = &.{},
+        .cancel = &cancel,
+    };
+    const lc = try parse(arena, policy_json);
+    const raw = try run(arena, io, &host, lc, 0, .{
+        .ctx = undefined,
+        .on_stage_start = ReviewTracker.onStart,
+        .on_stage_done = ReviewTracker.onDone,
+        .approve = ReviewTracker.approveFn,
+    });
+    // Copy out of the internal arena.
+    const owned = try out_arena.alloc(StageOutcome, raw.len);
+    for (raw, 0..) |o, i| {
+        owned[i] = .{
+            .stage = try out_arena.dupe(u8, o.stage),
+            .status = o.status,
+            .summary = try out_arena.dupe(u8, o.summary),
+            .report_path = try out_arena.dupe(u8, o.report_path),
+            .review_summary = try out_arena.dupe(u8, o.review_summary),
+            .blockers = o.blockers,
+        };
+    }
+    return owned;
+}
+
+test "multi-reviewer: all/any/n_of_m policies" {
+    // One clean review, one blocking review, one clean (3 reviewers).
+    // Stage turn + 3 reviewer turns.
+    const script: []const testing.Action = &[_]testing.Action{
+        .{ .text = "stage work done." },
+        .{ .text = "BLOCKERS: 0\nlooks good." },
+        .{ .text = "BLOCKERS: 1\nproblem here." },
+        .{ .text = "BLOCKERS: 0\nlooks good." },
+    };
+
+    // all: one blocker -> blocked.
+    var test_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer test_arena.deinit();
+    var outcomes = try runReviewScenarioImpl(
+        \\{"stages":[{"name":"impl","role":"implement","instructions":"do","review":true,"reviewers":3,"review_policy":"all"}]}
+    , script, test_arena.allocator());
+    try std.testing.expectEqual(StageOutcome.Status.blocked, outcomes[1].status);
+
+    // any: one clean suffices -> pass.
+    outcomes = try runReviewScenarioImpl(
+        \\{"stages":[{"name":"impl","role":"implement","instructions":"do","review":true,"reviewers":3,"review_policy":"any"}]}
+    , script, test_arena.allocator());
+    try std.testing.expectEqual(StageOutcome.Status.completed, outcomes[1].status);
+
+    // n_of_m threshold 2: two clean -> pass.
+    outcomes = try runReviewScenarioImpl(
+        \\{"stages":[{"name":"impl","role":"implement","instructions":"do","review":true,"reviewers":3,"review_policy":"n_of_m","review_threshold":2}]}
+    , script, test_arena.allocator());
+    try std.testing.expectEqual(StageOutcome.Status.completed, outcomes[1].status);
+
+    // n_of_m threshold 3: only two clean -> blocked.
+    outcomes = try runReviewScenarioImpl(
+        \\{"stages":[{"name":"impl","role":"implement","instructions":"do","review":true,"reviewers":3,"review_policy":"n_of_m","review_threshold":3}]}
+    , script, test_arena.allocator());
+    try std.testing.expectEqual(StageOutcome.Status.blocked, outcomes[1].status);
 }
