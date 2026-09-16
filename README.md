@@ -18,17 +18,36 @@ Status: pre-alpha, active architecture/scaffolding phase.
 | [AGENTS.md](AGENTS.md) | Conventions for humans and coding agents working here |
 | [docs/adr/](docs/adr/) | Architecture decision records |
 
+## Quickstart
+
+```bash
+zig build -Doptimize=ReleaseSafe
+scripts/install.sh                 # -> ~/.local/bin/ifnh
+cd your/project
+export ANTHROPIC_API_KEY=sk-ant-...
+ifnh init                          # optional .ifnh/ skeleton
+ifnh doctor                        # verify environment
+ifnh                               # start an agentic session
+```
+
+Works with any OpenAI-compatible endpoint (Ollama, llama.cpp, vLLM,
+OpenRouter) via `model.base_url`. See the [usage guide](docs/USAGE.md)
+for configuration, permissions, subagents, MCP, skills, hooks, and
+lifecycles.
+
 ## Build
 
 Requires [Zig 0.16.0](https://ziglang.org/download/):
 
 ```bash
-zig build
+zig build -Doptimize=ReleaseSafe
 ./zig-out/bin/ifnh --help
 zig build test
 ```
 
-Zero third-party dependencies. Linux and macOS.
+Zero third-party dependencies. Linux and macOS. Cross-compiles to any
+target (`-Dtarget=aarch64-linux-gnu` etc.); tagging a release builds all
+four platform artifacts in CI.
 
 ## License
 

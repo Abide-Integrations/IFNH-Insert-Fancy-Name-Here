@@ -1,0 +1,28 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        target: [x86_64-linux-gnu, aarch64-linux-gnu, x86_64-linux-musl, aarch64-linux-musl]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
+      - name: Package
+        run: |
+          tar -czf "ifnh-${{ matrix.target }}.tar.gz" -C zig-out/bin ifnh
+          sha256sum "ifnh-${{ matrix.target }}.tar.gz" > "ifnh-${{ matrix.target }}.tar.gz.sha256"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ifnh-*.tar.gz
+            ifnh-*.tar.gz.sha256
