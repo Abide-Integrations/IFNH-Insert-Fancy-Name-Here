@@ -62,9 +62,36 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    dispatch(io, arena, init.environ_map, parsed) catch |err| {
+        if (err == error.AccessDenied) {
+            try printOut(io, arena, "error: permission denied\n" ++
+                "ifnh writes its state (.ifnh/) in the current directory.\n" ++
+                "'{s}' is not writable by you — run ifnh from a directory\n" ++
+                "you own, or fix ownership:\n" ++
+                "  sudo chown -R $(whoami) <directory>\n" ++
+                "(note: do not run ifnh itself under sudo)\n", .{cwdPath(arena, init.environ_map)});
+        } else {
+            try printOut(io, arena, "error: {s}\n(run 'ifnh doctor' for diagnostics)\n", .{@errorName(err)});
+        }
+        std.process.exit(1);
+    };
+}
+
+fn dispatch(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    environ: *const std.process.Environ.Map,
+    parsed: cli_args.Parsed,
+) !void {
+    const io_arg = io;
+    _ = io_arg;
     switch (parsed.subcommand) {
+        .none => {
+            try repl.run(io, arena, environ, .{ .no_color = parsed.flags.no_color });
+            return;
+        },
         .init => try runInit(io, arena, parsed.args),
-        .config => try runConfig(io, arena, init.environ_map, parsed.args),
+        .config => try runConfig(io, arena, environ, parsed.args),
         .sessions => try runSessions(io, arena, parsed.args),
         .fork => blk: {
             if (parsed.args.len >= 3 and std.mem.eql(u8, parsed.args[0], "diff")) {
@@ -72,18 +99,18 @@ pub fn main(init: std.process.Init) !void {
             }
             break :blk try runFork(io, arena, parsed.args);
         },
-        .cleanup => try runCleanup(io, arena, init.environ_map, parsed.args),
+        .cleanup => try runCleanup(io, arena, environ, parsed.args),
         .@"resume" => blk: {
             if (parsed.args.len == 0) {
                 try printOut(io, arena, "usage: ifnh resume <session-id> (see `ifnh sessions list`)\n", .{});
                 std.process.exit(2);
             }
-            break :blk try repl.run(io, arena, init.environ_map, .{
+            break :blk try repl.run(io, arena, environ, .{
                 .resume_id = parsed.args[0],
                 .no_color = parsed.flags.no_color,
             });
         },
-        .doctor => try runDoctor(io, arena, init.environ_map),
+        .doctor => try runDoctor(io, arena, environ),
         .unknown => {
             try printOut(io, arena, "error: unknown subcommand '{s}'\n(run `ifnh help` for usage)\n", .{parsed.args[0]});
             std.process.exit(2);
