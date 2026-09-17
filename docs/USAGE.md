@@ -239,19 +239,25 @@ Run with `/lifecycle run .ifnh/lifecycle/ship.json` (resume with
 
 ## 12. Distribution
 
+One-liner (after the repo is on GitHub and a tag is released):
+
 ```bash
-# Release binaries for four targets (see .github/workflows/release.yml):
-zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-gnu
-zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-gnu
-zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl
-zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl
+curl -fsSL https://raw.githubusercontent.com/<org>/ifnh/main/install.sh | sh
 ```
 
-Tag a release (`git tag v0.1.0 && git push --tags`) and CI builds and
-attaches all four. For a single machine:
+The root `install.sh` detects platform, prefers static musl builds on
+Linux, verifies sha256 when available, installs to `~/.local/bin`, and
+warns if that directory is not on your PATH. Set `IFNH_PREFIX` to install
+elsewhere, `IFNH_VERSION=v0.1.0` to pin a version.
+
+CI is deliberately lean: `ci.yml` runs on ubuntu only (auto-cancel,
+docs-only changes skipped) — fmt, tests, ReleaseSafe build, size +
+startup budgets, integration harnesses. `release.yml` builds all five
+release targets cross-compiled on one ubuntu runner and attaches them to
+the GitHub release with sha256sums. For a single machine:
 
 ```bash
-scripts/install.sh              # copies the local build to ~/.local/bin
+zig build -Doptimize=ReleaseSafe && scripts/install.sh
 ```
 
 ## 13. Project layout inside `.ifnh/`

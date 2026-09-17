@@ -18,11 +18,24 @@ Status: pre-alpha, active architecture/scaffolding phase.
 | [AGENTS.md](AGENTS.md) | Conventions for humans and coding agents working here |
 | [docs/adr/](docs/adr/) | Architecture decision records |
 
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/<org>/ifnh/main/install.sh | sh
+```
+
+(One-time setup: replace `ifnh/ifnh` at the top of `install.sh` with your
+`<org>/<repo>` after pushing, or `export IFNH_REPO=<org>/<repo>`.)
+
+Or from source:
+
+```bash
+zig build -Doptimize=ReleaseSafe && scripts/install.sh
+```
+
 ## Quickstart
 
 ```bash
-zig build -Doptimize=ReleaseSafe
-scripts/install.sh                 # -> ~/.local/bin/ifnh
 cd your/project
 export ANTHROPIC_API_KEY=sk-ant-...
 ifnh init                          # optional .ifnh/ skeleton
