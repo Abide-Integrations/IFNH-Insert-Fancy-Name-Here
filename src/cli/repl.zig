@@ -8,6 +8,7 @@
 const std = @import("std");
 const fsutil = @import("../core/fsutil.zig");
 const config_mod = @import("../core/config/config.zig");
+const keys_mod = @import("../core/config/keys.zig");
 const session_mod = @import("../core/session/store.zig");
 const journal_mod = @import("../core/journal.zig");
 const engine_mod = @import("../core/permissions/engine.zig");
@@ -50,11 +51,16 @@ const Session = struct {
     executions: ?*executions_mod.Registry = null,
     /// Stage of the most recent blocked lifecycle review (M2-T03 override target).
     last_blocked_stage: ?[]const u8 = null,
+    /// Persistent key store (user env file) for /provider key.
+    user_keys: ?*keys_mod.Keys = null,
 };
+
+var global_user_keys: keys_mod.Keys = undefined;
 
 var palette: style_mod.Palette = .{};
 var g_environ: ?*const std.process.Environ.Map = null;
 var g_no_color: bool = false;
+var g_merged_env: ?*std.process.Environ.Map = null; // mutable overlay (provider keys)
 
 fn envLookup(key: []const u8) ?[]const u8 {
     const e = g_environ orelse return null;
@@ -69,6 +75,27 @@ pub fn run(
 ) !void {
     g_environ = environ;
     g_no_color = opts.no_color;
+
+    // Persistent provider keys (~/.config/ifnh/env) overlay the process
+    // environment for lookups (D022; real env wins).
+    var user_keys = keys_mod.Keys.init(arena);
+    user_keys.load(io, arena, environ);
+    var merged = std.process.Environ.Map.init(arena);
+    var keit = environ.iterator();
+    while (keit.next()) |entry| {
+        try merged.put(entry.key_ptr.*, entry.value_ptr.*);
+    }
+    var uk = user_keys.map.iterator();
+    while (uk.next()) |entry| {
+        if (merged.get(entry.key_ptr.*) == null) {
+            try merged.put(entry.key_ptr.*, entry.value_ptr.*);
+        }
+    }
+    const merged_env = try arena.create(std.process.Environ.Map);
+    merged_env.* = merged;
+    g_environ = merged_env;
+    g_merged_env = merged_env;
+    global_user_keys = user_keys;
     const cwd = std.Io.Dir.cwd();
 
     // ---- configuration ----
@@ -100,6 +127,7 @@ pub fn run(
             break :blk Session{ .io = io, .store = store, .journal = j, .engine = engineFromConfig(arena, &cfg) };
         }
     };
+    sess.user_keys = &global_user_keys;
     defer {
         if (sess.executions) |reg| reg.deinit(); // kill background children (I125)
         if (sess.mcp_registry) |reg| reg.deinit();
@@ -640,6 +668,50 @@ fn redactionsFor(arena: std.mem.Allocator, api_key: []const u8) []const []const 
     return list.items;
 }
 
+/// Persist provider settings into .ifnh/config.json (developer action,
+/// not an agent write): read -> set paths -> atomic write.
+fn persistProjectConfig(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    cfg: *config_mod.Store,
+    prov: []const u8,
+    model_name: []const u8,
+    base_url: ?[]const u8,
+    key_env: ?[]const u8,
+) ![]const u8 {
+    const cwd = std.Io.Dir.cwd();
+    var root: std.json.Value = blk: {
+        const text = fsutil.readSmallFile(cwd, io, arena, ".ifnh/config.json", config_mod.max_config_bytes) catch
+            break :blk .{ .object = try std.json.ObjectMap.init(arena, &.{}, &.{}) };
+        break :blk std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch
+            .{ .object = try std.json.ObjectMap.init(arena, &.{}, &.{}) };
+    };
+    var tmp_store = try config_mod.Store.init(arena);
+    defer tmp_store.deinit();
+    tmp_store.value = root;
+    try tmp_store.setPath("model.provider", .{ .string = prov });
+    try tmp_store.setPath("model.model", .{ .string = model_name });
+    if (base_url) |b| try tmp_store.setPath("model.base_url", .{ .string = b });
+    if (key_env) |k| try tmp_store.setPath("model.api_key_env", .{ .string = k });
+    root = tmp_store.value;
+
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    try std.json.Stringify.value(root, .{ .whitespace = .indent_2 }, &aw.writer);
+    try aw.writer.writeByte('\n');
+    try cwd.writeFile(io, .{ .sub_path = ".ifnh/config.json", .data = aw.written() });
+
+    // Live-apply to this session too.
+    try cfg.applyOverride("model.provider", try std.fmt.allocPrint(arena, "\"{s}\"", .{prov}), .{ .layer = .project, .origin = ".ifnh/config.json" });
+    try cfg.applyOverride("model.model", try std.fmt.allocPrint(arena, "\"{s}\"", .{model_name}), .{ .layer = .project, .origin = ".ifnh/config.json" });
+    if (base_url) |b| {
+        try cfg.applyOverride("model.base_url", try std.fmt.allocPrint(arena, "\"{s}\"", .{b}), .{ .layer = .project, .origin = ".ifnh/config.json" });
+    }
+    if (key_env) |k| {
+        try cfg.applyOverride("model.api_key_env", try std.fmt.allocPrint(arena, "\"{s}\"", .{k}), .{ .layer = .project, .origin = ".ifnh/config.json" });
+    }
+    return "saved .ifnh/config.json — applied to this session";
+}
+
 fn buildProviderConfig(cfg: *config_mod.Store, environ: *const std.process.Environ.Map) agent_engine.ProviderConfig {
     const provider_name = cfg.getString("model.provider", "openai");
     const is_anthropic = std.mem.eql(u8, provider_name, "anthropic");
@@ -864,6 +936,58 @@ fn handleCommand(
             }
             if (buf.items.len == 0) out(io, "no background executions\n", .{}) catch {} else out(io, "{s}", .{buf.items}) catch {};
         } else out(io, "background executions unavailable\n", .{}) catch {};
+    } else if (std.mem.eql(u8, cmd, "provider")) {
+        const pcfg_now = buildProviderConfig(cfg, g_environ.?);
+        if (rest.len == 0 or std.mem.eql(u8, rest, "show")) {
+            out(io, "provider: {s}\nmodel: {s}\nbase_url: {s}\nkey env: {s} ({s})\n", .{
+                cfg.getString("model.provider", "openai"),
+                pcfg_now.model,
+                pcfg_now.base_url,
+                cfg.getOptionalString("model.api_key_env") orelse "(default)",
+                if (pcfg_now.api_key.len > 0) "found" else "MISSING",
+            }) catch {};
+            if (rest.len == 0) out(io, "usage: /provider set <provider> <model> [base_url] [key_env]\n       /provider key <ENV_NAME> <value>\n", .{}) catch {};
+        } else if (std.mem.startsWith(u8, rest, "set ")) {
+            var toks = std.mem.tokenizeAny(u8, rest[4..], " ");
+            const prov = toks.next() orelse {
+                out(io, "usage: /provider set <provider> <model> [base_url] [key_env]\n", .{}) catch {};
+                return .none;
+            };
+            const model_name = toks.next() orelse {
+                out(io, "usage: /provider set <provider> <model> [base_url] [key_env]\n", .{}) catch {};
+                return .none;
+            };
+            const base = toks.next();
+            const key_env = toks.next();
+            if (persistProjectConfig(io, arena, cfg, prov, model_name, base, key_env)) |msg| {
+                out(io, "{s}\n", .{msg}) catch {};
+            } else |err| {
+                out(io, "failed to write .ifnh/config.json: {s}\n", .{@errorName(err)}) catch {};
+            }
+        } else if (std.mem.startsWith(u8, rest, "key ")) {
+            var toks = std.mem.tokenizeAny(u8, rest[4..], " ");
+            const name = toks.next() orelse {
+                out(io, "usage: /provider key <ENV_NAME> <value>\n", .{}) catch {};
+                return .none;
+            };
+            const value = toks.next() orelse {
+                out(io, "usage: /provider key <ENV_NAME> <value>\n", .{}) catch {};
+                return .none;
+            };
+            if (std.mem.indexOfScalar(u8, value, ' ') != null) {
+                out(io, "key values must not contain spaces\n", .{}) catch {};
+                return .none;
+            }
+            global_user_keys.store(io, arena, environ, name, value) catch |err| {
+                out(io, "failed to store key: {s}\n", .{@errorName(err)}) catch {};
+                return .none;
+            };
+            // Visible for the rest of this session immediately.
+            g_merged_env.?.put(name, value) catch {};
+            out(io, "stored {s} in ~/.config/ifnh/env (0600); takes effect immediately\n", .{name}) catch {};
+        } else {
+            out(io, "usage: /provider [show|set <provider> <model> [base_url] [key_env]|key <ENV_NAME> <value>]\n", .{}) catch {};
+        }
     } else if (std.mem.eql(u8, cmd, "review")) {
         // M2-T03 (G96/97): developer-only override of the last blocked review.
         if (!std.mem.startsWith(u8, rest, "override ")) {
