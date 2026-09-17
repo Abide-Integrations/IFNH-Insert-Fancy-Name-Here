@@ -1,15 +1,21 @@
 name: release
 
+# Tag-triggered release builds — all four targets cross-compiled on a
+# single ubuntu runner (cheap: ~2-3 min total per release).
+
 on:
   push:
     tags: ["v*"]
 
+permissions:
+  contents: write
+
 jobs:
   build:
+    runs-on: ubuntu-latest
     strategy:
       matrix:
-        target: [x86_64-linux-gnu, aarch64-linux-gnu, x86_64-linux-musl, aarch64-linux-musl]
-    runs-on: ubuntu-latest
+        target: [x86_64-linux-musl, x86_64-linux-gnu, aarch64-linux-musl, aarch64-macos, x86_64-macos]
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
