@@ -1,7 +1,8 @@
 name: release
 
-# Tag-triggered release builds — all four targets cross-compiled on a
-# single ubuntu runner (cheap: ~2-3 min total per release).
+# Tag-triggered release builds. All five targets cross-compile on ubuntu
+# runners; a final publish job attaches everything to the release in one
+# step (avoids concurrent-upload races between matrix jobs).
 
 on:
   push:
@@ -27,8 +28,21 @@ jobs:
         run: |
           tar -czf "ifnh-${{ matrix.target }}.tar.gz" -C zig-out/bin ifnh
           sha256sum "ifnh-${{ matrix.target }}.tar.gz" > "ifnh-${{ matrix.target }}.tar.gz.sha256"
-      - uses: softprops/action-gh-release@v2
+      - uses: actions/upload-artifact@v4
         with:
-          files: |
+          name: dist-${{ matrix.target }}
+          path: |
             ifnh-*.tar.gz
             ifnh-*.tar.gz.sha256
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
