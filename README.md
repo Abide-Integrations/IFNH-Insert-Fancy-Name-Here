@@ -21,12 +21,8 @@ Status: pre-alpha, active architecture/scaffolding phase.
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<org>/ifnh/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Abide-Integrations/ifnh/main/install.sh | sh
 ```
-
-(One-time setup: replace `ifnh/ifnh` at the top of `install.sh` with your
-`<org>/<repo>` after pushing, or `export IFNH_REPO=<org>/<repo>`.)
-
 Or from source:
 
 ```bash
