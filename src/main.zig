@@ -47,7 +47,18 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (parsed.subcommand == .none) {
-        try repl.run(io, arena, init.environ_map, .{ .no_color = parsed.flags.no_color });
+        repl.run(io, arena, init.environ_map, .{ .no_color = parsed.flags.no_color }) catch |err| {
+            if (err == error.AccessDenied) {
+                try printOut(io, arena, "error: permission denied\n" ++
+                    "ifnh needs to write .ifnh/ in the current directory.\n" ++
+                    "Is '{s}' writable by you? (check ownership with 'ls -ld')\n" ++
+                    "Run ifnh from a directory you own, or fix ownership:\n" ++
+                    "  sudo chown -R $(whoami) <directory>\n", .{cwdPath(arena, init.environ_map)});
+            } else {
+                try printOut(io, arena, "error: {s}\n(run 'ifnh doctor' for diagnostics)\n", .{@errorName(err)});
+            }
+            std.process.exit(1);
+        };
         return;
     }
 
@@ -349,6 +360,13 @@ fn runDoctor(io: std.Io, arena: std.mem.Allocator, environ: *const std.process.E
 }
 
 /// `ifnh init` — create the .ifnh/ skeleton (tracker M0-T38; minimal now).
+/// Current working directory for diagnostics (best effort; AT_FDCWD
+/// cannot be realPath'd, so use $PWD like the session code).
+fn cwdPath(arena: std.mem.Allocator, environ: *const std.process.Environ.Map) []const u8 {
+    _ = arena;
+    return environ.get("PWD") orelse "<unknown>";
+}
+
 fn runInit(io: std.Io, arena: std.mem.Allocator, args: []const []const u8) !void {
     _ = args;
     const cwd = std.Io.Dir.cwd();
