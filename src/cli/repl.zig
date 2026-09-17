@@ -109,6 +109,13 @@ pub fn run(
 
     palette = style_mod.Palette.detect(arena, io, envLookup, cfg.getBool("ui.colors", true), g_no_color);
 
+    // ---- first-run setup (interactive TTY only; skipped when piped) ----
+    if (cfg.getString("model.model", "").len == 0 and
+        (std.Io.File.stdin().isTty(io) catch false))
+    {
+        runFirstRunSetup(io, arena, &cfg, environ) catch {};
+    }
+
     // ---- session state (zero-config: lazily create .ifnh) ----
     ensureIfnh(io, cwd) catch {};
     const sessions_dir_name = ".ifnh/sessions";
@@ -169,7 +176,11 @@ pub fn run(
         sess.store.manifest.id,
         provider_name,
         if (pcfg.model.len > 0) pcfg.model else "<unset>",
-        if (pcfg.api_key.len == 0) ", no api key" else "",
+        if (pcfg.api_key.len == 0) blk: {
+            const key_env = cfg.getOptionalString("model.api_key_env") orelse
+                (if (std.mem.eql(u8, provider_name, "anthropic")) "ANTHROPIC_API_KEY" else "OPENAI_API_KEY");
+            break :blk std.fmt.allocPrint(arena, ", no api key — run /provider key {s} <value>", .{key_env}) catch ", no api key";
+        } else "",
     });
     try out(io, "type a message, or /help for commands\n", .{});
 
@@ -241,11 +252,12 @@ fn submitTurn(
     cwd: std.Io.Dir,
 ) !void {
     if (pcfg.model.len == 0) {
-        try out(io, "no model configured: set model.model in .ifnh/config.json or IFNH_MODEL__MODEL\n", .{});
+        try out(io, "no model configured — run /provider set <openai|anthropic> <model> [base_url] [key_env]\n", .{});
         return;
     }
     if (pcfg.api_key.len == 0) {
-        try out(io, "note: no api key found in environment; the provider will likely reject the request\n", .{});
+        const key_env = cfg.getOptionalString("model.api_key_env") orelse "OPENAI_API_KEY";
+        try out(io, "note: no api key — run /provider key {s} <value> (or export it) before sending a message\n", .{key_env});
     }
 
     _ = try sess.store.append(.{ .user = .{ .text = user_text } });
@@ -712,6 +724,115 @@ fn persistProjectConfig(
     return "saved .ifnh/config.json — applied to this session";
 }
 
+// -------------------------------------------------------------- first-run setup
+
+pub const ProviderPreset = struct {
+    id: []const u8, // "openai" | "anthropic"
+    label: []const u8,
+    base_url: []const u8,
+    key_env: []const u8,
+    default_model: []const u8,
+    needs_key: bool,
+};
+
+pub const presets = [_]ProviderPreset{
+    .{ .id = "openai", .label = "OpenRouter", .base_url = "https://openrouter.ai/api/v1", .key_env = "OPENROUTER_API_KEY", .default_model = "anthropic/claude-sonnet-4.5", .needs_key = true },
+    .{ .id = "anthropic", .label = "Anthropic", .base_url = "https://api.anthropic.com", .key_env = "ANTHROPIC_API_KEY", .default_model = "claude-sonnet-4-6", .needs_key = true },
+    .{ .id = "openai", .label = "OpenAI", .base_url = "https://api.openai.com/v1", .key_env = "OPENAI_API_KEY", .default_model = "gpt-4.1", .needs_key = true },
+    .{ .id = "openai", .label = "Ollama (local)", .base_url = "http://localhost:11434/v1", .key_env = "", .default_model = "qwen3-coder", .needs_key = false },
+    .{ .id = "openai", .label = "Anthropic (Claude subscription via Anthropic)", .base_url = "https://api.anthropic.com", .key_env = "ANTHROPIC_API_KEY", .default_model = "claude-sonnet-4-6", .needs_key = true },
+};
+
+pub fn presetForChoice(choice: u8) ?ProviderPreset {
+    if (choice == 0 or choice > presets.len) return null;
+    return presets[choice - 1];
+}
+
+/// Guided first-run setup. Only invoked when stdin is a TTY and no model
+/// is configured. Writes the USER config so every project inherits it.
+fn runFirstRunSetup(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    cfg: *config_mod.Store,
+    environ: *const std.process.Environ.Map,
+) !void {
+    try out(io, "\nfirst-run setup: no model is configured yet.\n", .{});
+    try out(io, "pick a provider (enter a number, or press enter to skip and configure later with /provider):\n", .{});
+    for (presets, 0..) |p, i| {
+        try out(io, "  {d}) {s}  ({s})\n", .{ i + 1, p.label, p.default_model });
+    }
+    try out(io, "choice: ", .{});
+
+    var stdin_buf: [256]u8 = undefined;
+    var stdin_r = std.Io.File.stdin().reader(io, &stdin_buf);
+    const line_raw = stdin_r.interface.takeDelimiterInclusive('\n') catch return error.SetupAborted;
+    const line = std.mem.trim(u8, line_raw, " \t\r\n");
+    if (line.len == 0) {
+        try out(io, "(skipped — configure later with /provider set ...)\n", .{});
+        return;
+    }
+    const choice = std.fmt.parseInt(u8, line, 10) catch return error.SetupAborted;
+    const preset = presetForChoice(choice) orelse return error.SetupAborted;
+
+    // Model name (default suggested).
+    try out(io, "model [{s}]: ", .{preset.default_model});
+    const model_line_raw = stdin_r.interface.takeDelimiterInclusive('\n') catch return error.SetupAborted;
+    var model_name = std.mem.trim(u8, model_line_raw, " \t\r\n");
+    if (model_name.len == 0) model_name = preset.default_model;
+
+    // API key.
+    var key_value: ?[]const u8 = null;
+    if (preset.needs_key) {
+        try out(io, "{s} (input saved to ~/.config/ifnh/env, 0600): ", .{preset.key_env});
+        const key_raw = stdin_r.interface.takeDelimiterInclusive('\n') catch return error.SetupAborted;
+        const key = std.mem.trim(u8, key_raw, " \t\r\n");
+        if (key.len > 0) key_value = key;
+    }
+
+    // Persist to USER config (applies to all projects).
+    const user_cfg_path = config_mod.userConfigPath(arena, environ) orelse return error.SetupAborted;
+    const cwd = std.Io.Dir.cwd();
+    var root: std.json.Value = blk: {
+        const text = fsutil.readSmallFile(cwd, io, arena, user_cfg_path, config_mod.max_config_bytes) catch
+            break :blk .{ .object = try std.json.ObjectMap.init(arena, &.{}, &.{}) };
+        break :blk std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch
+            .{ .object = try std.json.ObjectMap.init(arena, &.{}, &.{}) };
+    };
+    var tmp_store = try config_mod.Store.init(arena);
+    defer tmp_store.deinit();
+    tmp_store.value = root;
+    try tmp_store.setPath("model.provider", .{ .string = preset.id });
+    try tmp_store.setPath("model.model", .{ .string = model_name });
+    try tmp_store.setPath("model.base_url", .{ .string = preset.base_url });
+    if (preset.key_env.len > 0) {
+        try tmp_store.setPath("model.api_key_env", .{ .string = preset.key_env });
+    }
+    root = tmp_store.value;
+    if (std.mem.lastIndexOfScalar(u8, user_cfg_path, '/')) |slash| {
+        try cwd.createDirPath(io, user_cfg_path[0..slash]);
+    }
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    try std.json.Stringify.value(root, .{ .whitespace = .indent_2 }, &aw.writer);
+    try aw.writer.writeByte('\n');
+    try cwd.writeFile(io, .{ .sub_path = user_cfg_path, .data = aw.written() });
+
+    // Store the key.
+    if (key_value) |kv| {
+        try global_user_keys.store(io, arena, environ, preset.key_env, kv);
+        g_merged_env.?.put(preset.key_env, kv) catch {};
+    }
+
+    // Live-apply.
+    try cfg.applyOverride("model.provider", try std.fmt.allocPrint(arena, "\"{s}\"", .{preset.id}), .{ .layer = .user, .origin = user_cfg_path });
+    try cfg.applyOverride("model.model", try std.fmt.allocPrint(arena, "\"{s}\"", .{model_name}), .{ .layer = .user, .origin = user_cfg_path });
+    try cfg.applyOverride("model.base_url", try std.fmt.allocPrint(arena, "\"{s}\"", .{preset.base_url}), .{ .layer = .user, .origin = user_cfg_path });
+    if (preset.key_env.len > 0) {
+        try cfg.applyOverride("model.api_key_env", try std.fmt.allocPrint(arena, "\"{s}\"", .{preset.key_env}), .{ .layer = .user, .origin = user_cfg_path });
+    }
+
+    try out(io, "\nsetup complete — model {s}/{s} saved to {s}\n", .{ preset.id, model_name, user_cfg_path });
+}
+
 fn buildProviderConfig(cfg: *config_mod.Store, environ: *const std.process.Environ.Map) agent_engine.ProviderConfig {
     const provider_name = cfg.getString("model.provider", "openai");
     const is_anthropic = std.mem.eql(u8, provider_name, "anthropic");
@@ -720,7 +841,14 @@ fn buildProviderConfig(cfg: *config_mod.Store, environ: *const std.process.Envir
     const model = cfg.getString("model.model", "");
     const api_key_env = cfg.getOptionalString("model.api_key_env") orelse
         (if (is_anthropic) "ANTHROPIC_API_KEY" else "OPENAI_API_KEY");
-    const api_key = environ.get(api_key_env) orelse "";
+    // g_environ is the merged overlay (process env + ~/.config/ifnh/env);
+    // fall back to the raw process env.
+    const api_key = blk2: {
+        if (g_environ) |ge| {
+            if (ge.get(api_key_env)) |k| break :blk2 k;
+        }
+        break :blk2 (environ.get(api_key_env) orelse "");
+    };
     return .{
         .provider = if (is_anthropic) anthropic.instance else openai.instance,
         .model = model,
