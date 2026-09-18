@@ -24,6 +24,8 @@ const compaction_mod = @import("../core/compaction.zig");
 const lifecycle_mod = @import("../core/lifecycle.zig");
 const executions_mod = @import("../core/executions.zig");
 const style_mod = @import("../ui/style.zig");
+const secret_mod = @import("../ui/secret.zig");
+const models_mod = @import("../providers/models.zig");
 const tool_mod = @import("../tools/tool.zig");
 const core_types = @import("../core/types.zig");
 const openai = @import("../providers/openai.zig");
@@ -172,17 +174,24 @@ pub fn run(
     const instr = try instructions_mod.assemble(cwd, io, arena, builtin_prompt, &.{});
 
     // ---- welcome ----
-    try out(io, "ifnh session {s} (model: {s}/{s}{s})\n", .{
-        sess.store.manifest.id,
-        provider_name,
-        if (pcfg.model.len > 0) pcfg.model else "<unset>",
-        if (pcfg.api_key.len == 0) blk: {
+    {
+        const key_note = if (pcfg.api_key.len == 0) blk: {
             const key_env = cfg.getOptionalString("model.api_key_env") orelse
                 (if (std.mem.eql(u8, provider_name, "anthropic")) "ANTHROPIC_API_KEY" else "OPENAI_API_KEY");
-            break :blk std.fmt.allocPrint(arena, ", no api key — run /provider key {s} <value>", .{key_env}) catch ", no api key";
-        } else "",
-    });
-    try out(io, "type a message, or /help for commands\n", .{});
+            break :blk std.fmt.allocPrint(arena, " — {s}run /provider key {s} <value>{s}", .{ palette.warn("", arena), key_env, "\x1b[0m" }) catch ", no api key";
+        } else "";
+        try out(io, "{s}ifnh session{s} {s} ({s}{s}/{s}{s}){s}\n", .{
+            palette.accent("", arena),
+            "\x1b[0m",
+            sess.store.manifest.id,
+            palette.dim("", arena),
+            provider_name,
+            pcfg.model,
+            "\x1b[0m",
+            key_note,
+        });
+        try out(io, "{s}type a message, or /help for commands{s}\n", .{ palette.dim("", arena), "\x1b[0m" });
+    }
 
     // ---- input loop ----
     var stdin_buf: [4096]u8 = undefined;
@@ -521,7 +530,10 @@ const Approver = struct {
         var fba: [4096]u8 = undefined;
         var fba_state = std.heap.FixedBufferAllocator.init(&fba);
         if (!self.verifyPolicy(fba_state.allocator())) return .denied;
-        out(self.io, "\napproval needed: {s}\n  {s}\n[y] once  [s] session  [n] no: ", .{ req.title, req.detail }) catch return .denied;
+        const head = std.fmt.allocPrint(std.heap.page_allocator, "\n{s}approval needed:{s} {s}\n  {s}\n[y] once  [s] session  [n] no: ", .{
+            palette.warn("", std.heap.page_allocator), "\x1b[0m", req.title, req.detail,
+        }) catch "approval needed: ";
+        out(self.io, "{s}", .{head}) catch return .denied;
         var buf: [64]u8 = undefined;
         var stdin_r = std.Io.File.stdin().reader(self.io, &buf);
         const line = stdin_r.interface.takeDelimiterInclusive('\n') catch return .denied;
@@ -736,12 +748,23 @@ pub const ProviderPreset = struct {
 };
 
 pub const presets = [_]ProviderPreset{
-    .{ .id = "openai", .label = "OpenRouter", .base_url = "https://openrouter.ai/api/v1", .key_env = "OPENROUTER_API_KEY", .default_model = "anthropic/claude-sonnet-4.5", .needs_key = true },
+    .{ .id = "openai", .label = "OpenRouter", .base_url = "https://openrouter.ai/api/v1", .key_env = "OPENROUTER_API_KEY", .default_model = "openrouter/auto", .needs_key = true },
     .{ .id = "anthropic", .label = "Anthropic", .base_url = "https://api.anthropic.com", .key_env = "ANTHROPIC_API_KEY", .default_model = "claude-sonnet-4-6", .needs_key = true },
-    .{ .id = "openai", .label = "OpenAI", .base_url = "https://api.openai.com/v1", .key_env = "OPENAI_API_KEY", .default_model = "gpt-4.1", .needs_key = true },
+    .{ .id = "openai", .label = "OpenAI", .base_url = "https://api.openai.com/v1", .key_env = "OPENAI_API_KEY", .default_model = "gpt-5.1", .needs_key = true },
     .{ .id = "openai", .label = "Ollama (local)", .base_url = "http://localhost:11434/v1", .key_env = "", .default_model = "qwen3-coder", .needs_key = false },
-    .{ .id = "openai", .label = "Anthropic (Claude subscription via Anthropic)", .base_url = "https://api.anthropic.com", .key_env = "ANTHROPIC_API_KEY", .default_model = "claude-sonnet-4-6", .needs_key = true },
 };
+
+/// A model id must not look like a credential: rejects API-key shapes
+/// (the `sk-or-v1-... is not a valid model ID` bug class), overlong
+/// strings, and multi-token values.
+pub fn validModelId(s: []const u8) bool {
+    if (s.len == 0 or s.len > 100) return false;
+    if (std.mem.startsWith(u8, s, "sk-")) return false;
+    for (s) |c| {
+        if (c == ' ' or c == '\t' or c == '=' or c == '"') return false;
+    }
+    return true;
+}
 
 pub fn presetForChoice(choice: u8) ?ProviderPreset {
     if (choice == 0 or choice > presets.len) return null;
@@ -749,17 +772,19 @@ pub fn presetForChoice(choice: u8) ?ProviderPreset {
 }
 
 /// Guided first-run setup. Only invoked when stdin is a TTY and no model
-/// is configured. Writes the USER config so every project inherits it.
+/// is configured. Flow: provider -> API key (noecho) -> live model list
+/// picker (or typed fallback) -> persist to USER config so every project
+/// inherits it.
 fn runFirstRunSetup(
     io: std.Io,
     arena: std.mem.Allocator,
     cfg: *config_mod.Store,
     environ: *const std.process.Environ.Map,
 ) !void {
-    try out(io, "\nfirst-run setup: no model is configured yet.\n", .{});
-    try out(io, "pick a provider (enter a number, or press enter to skip and configure later with /provider):\n", .{});
+    try out(io, "{s}", .{palette.heading("\nfirst-run setup: no model is configured yet.", arena)});
+    try out(io, "\npick a provider (enter a number, or press enter to skip and configure later with /provider):\n", .{});
     for (presets, 0..) |p, i| {
-        try out(io, "  {d}) {s}  ({s})\n", .{ i + 1, p.label, p.default_model });
+        try out(io, "  {d}) {s}\n", .{ i + 1, p.label });
     }
     try out(io, "choice: ", .{});
 
@@ -768,25 +793,66 @@ fn runFirstRunSetup(
     const line_raw = stdin_r.interface.takeDelimiterInclusive('\n') catch return error.SetupAborted;
     const line = std.mem.trim(u8, line_raw, " \t\r\n");
     if (line.len == 0) {
-        try out(io, "(skipped — configure later with /provider set ...)\n", .{});
+        try out(io, "{s}(skipped — configure later with /provider set ...)\n", .{palette.dim("", arena)});
         return;
     }
     const choice = std.fmt.parseInt(u8, line, 10) catch return error.SetupAborted;
     const preset = presetForChoice(choice) orelse return error.SetupAborted;
 
-    // Model name (default suggested).
-    try out(io, "model [{s}]: ", .{preset.default_model});
-    const model_line_raw = stdin_r.interface.takeDelimiterInclusive('\n') catch return error.SetupAborted;
-    var model_name = std.mem.trim(u8, model_line_raw, " \t\r\n");
-    if (model_name.len == 0) model_name = preset.default_model;
-
-    // API key.
-    var key_value: ?[]const u8 = null;
+    // API key first (noecho, never echoed back).
+    var key_value: []const u8 = "";
     if (preset.needs_key) {
-        try out(io, "{s} (input saved to ~/.config/ifnh/env, 0600): ", .{preset.key_env});
-        const key_raw = stdin_r.interface.takeDelimiterInclusive('\n') catch return error.SetupAborted;
-        const key = std.mem.trim(u8, key_raw, " \t\r\n");
-        if (key.len > 0) key_value = key;
+        try out(io, "{s}\n", .{palette.info(preset.key_env, arena)});
+        try out(io, "paste your API key (input hidden): ", .{});
+        key_value = secret_mod.readSecret(io, arena) catch "";
+        if (key_value.len == 0) {
+            try out(io, "{s}no key entered — continuing; set it later with /provider key {s} <value>{s}\n", .{
+                palette.warn("", arena), preset.key_env, "\x1b[0m",
+            });
+        }
+    }
+
+    // Live model list; typed fallback when unavailable.
+    var model_name: []const u8 = preset.default_model;
+    const models_res = models_mod.fetchModels(arena, io, preset.base_url, key_value, std.mem.eql(u8, preset.id, "anthropic"));
+    switch (models_res) {
+        .models => |list| {
+            try out(io, "{s}({d} models available — enter a number, or type a model id){s}\n", .{
+                palette.dim("", arena), list.len, "\x1b[0m",
+            });
+            const shown = @min(list.len, 30);
+            for (list[0..shown], 0..) |m, i| {
+                try out(io, "  {d}) {s}\n", .{ i + 1, m });
+            }
+            if (list.len > shown) {
+                try out(io, "  {s}...and {d} more — type the exact model id{s}\n", .{ palette.dim("", arena), list.len - shown, "\x1b[0m" });
+            }
+            try out(io, "model: ", .{});
+            const pick_raw = stdin_r.interface.takeDelimiterInclusive('\n') catch return error.SetupAborted;
+            const pick = std.mem.trim(u8, pick_raw, " \t\r\n");
+            if (pick.len > 0) {
+                if (std.fmt.parseInt(usize, pick, 10)) |n| {
+                    if (n >= 1 and n <= list.len) {
+                        model_name = list[n - 1];
+                    } else {
+                        try out(io, "{s}number not in list; using default {s}{s}\n", .{ palette.warn("", arena), preset.default_model, "\x1b[0m" });
+                    }
+                } else |_| {
+                    if (validModelId(pick)) {
+                        model_name = pick;
+                    } else {
+                        try out(io, "{s}that does not look like a model id; using default {s}{s}\n", .{ palette.warn("", arena), preset.default_model, "\x1b[0m" });
+                    }
+                }
+            }
+        },
+        .failure => |why| {
+            try out(io, "{s}could not fetch models ({s}) — type the model id manually.{s}\n", .{ palette.warn("", arena), why, "\x1b[0m" });
+            try out(io, "model [{s}]: ", .{preset.default_model});
+            const pick_raw = stdin_r.interface.takeDelimiterInclusive('\n') catch return error.SetupAborted;
+            const pick = std.mem.trim(u8, pick_raw, " \t\r\n");
+            if (pick.len > 0 and validModelId(pick)) model_name = pick;
+        },
     }
 
     // Persist to USER config (applies to all projects).
@@ -817,9 +883,9 @@ fn runFirstRunSetup(
     try cwd.writeFile(io, .{ .sub_path = user_cfg_path, .data = aw.written() });
 
     // Store the key.
-    if (key_value) |kv| {
-        try global_user_keys.store(io, arena, environ, preset.key_env, kv);
-        g_merged_env.?.put(preset.key_env, kv) catch {};
+    if (key_value.len > 0) {
+        try global_user_keys.store(io, arena, environ, preset.key_env, key_value);
+        g_merged_env.?.put(preset.key_env, key_value) catch {};
     }
 
     // Live-apply.
@@ -830,7 +896,12 @@ fn runFirstRunSetup(
         try cfg.applyOverride("model.api_key_env", try std.fmt.allocPrint(arena, "\"{s}\"", .{preset.key_env}), .{ .layer = .user, .origin = user_cfg_path });
     }
 
-    try out(io, "\nsetup complete — model {s}/{s} saved to {s}\n", .{ preset.id, model_name, user_cfg_path });
+    try out(io, "\n{s}setup complete — model {s}/{s} saved to {s}{s}\n", .{
+        palette.success("", arena), preset.id, model_name, user_cfg_path, "\x1b[0m",
+    });
+    if (key_value.len > 0) {
+        try out(io, "{s}key stored ({s}){s}\n", .{ palette.dim("", arena), secret_mod.masked(arena, key_value), "\x1b[0m" });
+    }
 }
 
 fn buildProviderConfig(cfg: *config_mod.Store, environ: *const std.process.Environ.Map) agent_engine.ProviderConfig {
@@ -921,6 +992,10 @@ fn handleCommand(
         , .{}) catch {};
     } else if (std.mem.eql(u8, cmd, "model")) {
         if (rest.len > 0) {
+            if (!validModelId(rest)) {
+                out(io, "{s}'{s}' does not look like a model id (api keys are not model ids){s}\n", .{ palette.warn("", arena), rest, "\x1b[0m" }) catch {};
+                return .none;
+            }
             const json = std.fmt.allocPrint(arena, "\"{s}\"", .{rest}) catch return .none;
             cfg.applyOverride("model.model", json, .{ .layer = .session, .origin = "session" }) catch {
                 out(io, "invalid model value\n", .{}) catch {};
@@ -1067,12 +1142,16 @@ fn handleCommand(
     } else if (std.mem.eql(u8, cmd, "provider")) {
         const pcfg_now = buildProviderConfig(cfg, g_environ.?);
         if (rest.len == 0 or std.mem.eql(u8, rest, "show")) {
+            const key_state = if (pcfg_now.api_key.len > 0)
+                palette.success("found", arena)
+            else
+                palette.warn("MISSING", arena);
             out(io, "provider: {s}\nmodel: {s}\nbase_url: {s}\nkey env: {s} ({s})\n", .{
                 cfg.getString("model.provider", "openai"),
                 pcfg_now.model,
                 pcfg_now.base_url,
                 cfg.getOptionalString("model.api_key_env") orelse "(default)",
-                if (pcfg_now.api_key.len > 0) "found" else "MISSING",
+                key_state,
             }) catch {};
             if (rest.len == 0) out(io, "usage: /provider set <provider> <model> [base_url] [key_env]\n       /provider key <ENV_NAME> <value>\n", .{}) catch {};
         } else if (std.mem.startsWith(u8, rest, "set ")) {
@@ -1085,6 +1164,10 @@ fn handleCommand(
                 out(io, "usage: /provider set <provider> <model> [base_url] [key_env]\n", .{}) catch {};
                 return .none;
             };
+            if (!validModelId(model_name)) {
+                out(io, "{s}'{s}' does not look like a model id (api keys are not model ids){s}\n", .{ palette.warn("", arena), model_name, "\x1b[0m" }) catch {};
+                return .none;
+            }
             const base = toks.next();
             const key_env = toks.next();
             if (persistProjectConfig(io, arena, cfg, prov, model_name, base, key_env)) |msg| {
@@ -1095,24 +1178,32 @@ fn handleCommand(
         } else if (std.mem.startsWith(u8, rest, "key ")) {
             var toks = std.mem.tokenizeAny(u8, rest[4..], " ");
             const name = toks.next() orelse {
-                out(io, "usage: /provider key <ENV_NAME> <value>\n", .{}) catch {};
+                out(io, "usage: /provider key <ENV_NAME> [value]  (value prompted hidden if omitted)\n", .{}) catch {};
                 return .none;
             };
-            const value = toks.next() orelse {
-                out(io, "usage: /provider key <ENV_NAME> <value>\n", .{}) catch {};
-                return .none;
-            };
-            if (std.mem.indexOfScalar(u8, value, ' ') != null) {
+            var value = toks.next();
+            if (value != null and std.mem.indexOfScalar(u8, value.?, ' ') != null) {
                 out(io, "key values must not contain spaces\n", .{}) catch {};
                 return .none;
             }
-            global_user_keys.store(io, arena, environ, name, value) catch |err| {
+            if (value == null) {
+                // Secure entry: no echo, nothing in scrollback or args.
+                out(io, "value for {s} (input hidden): ", .{name}) catch {};
+                value = secret_mod.readSecret(io, arena) catch null;
+                if (value == null or value.?.len == 0) {
+                    out(io, "no key entered\n", .{}) catch {};
+                    return .none;
+                }
+            }
+            global_user_keys.store(io, arena, environ, name, value.?) catch |err| {
                 out(io, "failed to store key: {s}\n", .{@errorName(err)}) catch {};
                 return .none;
             };
             // Visible for the rest of this session immediately.
-            g_merged_env.?.put(name, value) catch {};
-            out(io, "stored {s} in ~/.config/ifnh/env (0600); takes effect immediately\n", .{name}) catch {};
+            g_merged_env.?.put(name, value.?) catch {};
+            out(io, "{s}stored {s} in ~/.config/ifnh/env (0600); takes effect immediately{s}\n", .{
+                palette.success("", arena), name, "\x1b[0m",
+            }) catch {};
         } else {
             out(io, "usage: /provider [show|set <provider> <model> [base_url] [key_env]|key <ENV_NAME> <value>]\n", .{}) catch {};
         }
