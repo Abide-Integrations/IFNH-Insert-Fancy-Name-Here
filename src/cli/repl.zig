@@ -175,17 +175,18 @@ pub fn run(
 
     // ---- welcome ----
     {
+        const provider_display = cfg.getOptionalString("model.provider_label") orelse provider_name;
         const key_note = if (pcfg.api_key.len == 0) blk: {
             const key_env = cfg.getOptionalString("model.api_key_env") orelse
                 (if (std.mem.eql(u8, provider_name, "anthropic")) "ANTHROPIC_API_KEY" else "OPENAI_API_KEY");
             break :blk std.fmt.allocPrint(arena, " — {s}run /provider key {s} <value>{s}", .{ palette.warn("", arena), key_env, "\x1b[0m" }) catch ", no api key";
         } else "";
-        try out(io, "{s}ifnh session{s} {s} ({s}{s}/{s}{s}){s}\n", .{
+        try out(io, "{s}ifnh session{s} {s} ({s}{s} · {s}{s}){s}\n", .{
             palette.accent("", arena),
             "\x1b[0m",
             sess.store.manifest.id,
             palette.dim("", arena),
-            provider_name,
+            provider_display,
             pcfg.model,
             "\x1b[0m",
             key_note,
@@ -739,19 +740,32 @@ fn persistProjectConfig(
 // -------------------------------------------------------------- first-run setup
 
 pub const ProviderPreset = struct {
-    id: []const u8, // "openai" | "anthropic"
+    /// Wire protocol: "openai" (any OpenAI-compatible endpoint) | "anthropic".
+    id: []const u8,
+    /// Human-readable provider name (display only).
     label: []const u8,
     base_url: []const u8,
     key_env: []const u8,
     default_model: []const u8,
     needs_key: bool,
+    /// Ask for base_url + key env + model manually.
+    custom: bool = false,
 };
 
 pub const presets = [_]ProviderPreset{
     .{ .id = "openai", .label = "OpenRouter", .base_url = "https://openrouter.ai/api/v1", .key_env = "OPENROUTER_API_KEY", .default_model = "openrouter/auto", .needs_key = true },
     .{ .id = "anthropic", .label = "Anthropic", .base_url = "https://api.anthropic.com", .key_env = "ANTHROPIC_API_KEY", .default_model = "claude-sonnet-4-6", .needs_key = true },
     .{ .id = "openai", .label = "OpenAI", .base_url = "https://api.openai.com/v1", .key_env = "OPENAI_API_KEY", .default_model = "gpt-5.1", .needs_key = true },
+    .{ .id = "openai", .label = "xAI (Grok)", .base_url = "https://api.x.ai/v1", .key_env = "XAI_API_KEY", .default_model = "grok-4", .needs_key = true },
+    .{ .id = "openai", .label = "Groq", .base_url = "https://api.groq.com/openai/v1", .key_env = "GROQ_API_KEY", .default_model = "llama-3.3-70b-versatile", .needs_key = true },
+    .{ .id = "openai", .label = "DeepSeek", .base_url = "https://api.deepseek.com/v1", .key_env = "DEEPSEEK_API_KEY", .default_model = "deepseek-chat", .needs_key = true },
+    .{ .id = "openai", .label = "Mistral", .base_url = "https://api.mistral.ai/v1", .key_env = "MISTRAL_API_KEY", .default_model = "mistral-large-latest", .needs_key = true },
+    .{ .id = "openai", .label = "Z.AI (GLM)", .base_url = "https://api.z.ai/api/paas/v4", .key_env = "ZAI_API_KEY", .default_model = "glm-4.6", .needs_key = true },
+    .{ .id = "openai", .label = "Together", .base_url = "https://api.together.xyz/v1", .key_env = "TOGETHER_API_KEY", .default_model = "moonshotai/Kimi-K2-Instruct", .needs_key = true },
+    .{ .id = "openai", .label = "Fireworks", .base_url = "https://api.fireworks.ai/inference/v1", .key_env = "FIREWORKS_API_KEY", .default_model = "accounts/fireworks/models/kimi-k2-instruct", .needs_key = true },
     .{ .id = "openai", .label = "Ollama (local)", .base_url = "http://localhost:11434/v1", .key_env = "", .default_model = "qwen3-coder", .needs_key = false },
+    .{ .id = "openai", .label = "LM Studio (local)", .base_url = "http://localhost:1234/v1", .key_env = "", .default_model = "", .needs_key = false },
+    .{ .id = "openai", .label = "Custom OpenAI-compatible endpoint", .base_url = "", .key_env = "", .default_model = "", .needs_key = true, .custom = true },
 };
 
 /// A model id must not look like a credential: rejects API-key shapes
@@ -791,7 +805,7 @@ fn runFirstRunSetup(
     var stdin_buf: [256]u8 = undefined;
     var stdin_r = std.Io.File.stdin().reader(io, &stdin_buf);
     const line_raw = stdin_r.interface.takeDelimiterInclusive('\n') catch return error.SetupAborted;
-    const line = std.mem.trim(u8, line_raw, " \t\r\n");
+    const line = try arena.dupe(u8, std.mem.trim(u8, line_raw, " \t\r\n"));
     if (line.len == 0) {
         try out(io, "{s}(skipped — configure later with /provider set ...)\n", .{palette.dim("", arena)});
         return;
@@ -799,22 +813,44 @@ fn runFirstRunSetup(
     const choice = std.fmt.parseInt(u8, line, 10) catch return error.SetupAborted;
     const preset = presetForChoice(choice) orelse return error.SetupAborted;
 
+    // Custom endpoint: ask for the details.
+    var base_url = preset.base_url;
+    var key_env = preset.key_env;
+    if (preset.custom) {
+        try out(io, "base URL (OpenAI-compatible, e.g. https://api.example.com/v1): ", .{});
+        const url_raw = stdin_r.interface.takeDelimiterInclusive('\n') catch return error.SetupAborted;
+        base_url = try arena.dupe(u8, std.mem.trim(u8, url_raw, " \t\r\n"));
+        if (base_url.len == 0 or !std.mem.startsWith(u8, base_url, "http")) {
+            try out(io, "{s}invalid base url{s}\n", .{ palette.err("", arena), "\x1b[0m" });
+            return error.SetupAborted;
+        }
+        try out(io, "API key env var name (enter to skip if none): ", .{});
+        const env_raw = stdin_r.interface.takeDelimiterInclusive('\n') catch return error.SetupAborted;
+        key_env = try arena.dupe(u8, std.mem.trim(u8, env_raw, " \t\r\n"));
+    }
+
     // API key first (noecho, never echoed back).
     var key_value: []const u8 = "";
     if (preset.needs_key) {
-        try out(io, "{s}\n", .{palette.info(preset.key_env, arena)});
+        if (key_env.len == 0) {
+            try out(io, "API key env var name: ", .{});
+            const env_raw = stdin_r.interface.takeDelimiterInclusive('\n') catch return error.SetupAborted;
+            key_env = try arena.dupe(u8, std.mem.trim(u8, env_raw, " \t\r\n"));
+            if (key_env.len == 0) key_env = "API_KEY";
+        }
+        try out(io, "{s}\n", .{palette.info(key_env, arena)});
         try out(io, "paste your API key (input hidden): ", .{});
         key_value = secret_mod.readSecret(io, arena) catch "";
         if (key_value.len == 0) {
             try out(io, "{s}no key entered — continuing; set it later with /provider key {s} <value>{s}\n", .{
-                palette.warn("", arena), preset.key_env, "\x1b[0m",
+                palette.warn("", arena), key_env, "\x1b[0m",
             });
         }
     }
 
     // Live model list; typed fallback when unavailable.
     var model_name: []const u8 = preset.default_model;
-    const models_res = models_mod.fetchModels(arena, io, preset.base_url, key_value, std.mem.eql(u8, preset.id, "anthropic"));
+    const models_res = models_mod.fetchModels(arena, io, base_url, key_value, std.mem.eql(u8, preset.id, "anthropic"));
     switch (models_res) {
         .models => |list| {
             try out(io, "{s}({d} models available — enter a number, or type a model id){s}\n", .{
@@ -829,7 +865,7 @@ fn runFirstRunSetup(
             }
             try out(io, "model: ", .{});
             const pick_raw = stdin_r.interface.takeDelimiterInclusive('\n') catch return error.SetupAborted;
-            const pick = std.mem.trim(u8, pick_raw, " \t\r\n");
+            const pick = try arena.dupe(u8, std.mem.trim(u8, pick_raw, " \t\r\n"));
             if (pick.len > 0) {
                 if (std.fmt.parseInt(usize, pick, 10)) |n| {
                     if (n >= 1 and n <= list.len) {
@@ -850,7 +886,7 @@ fn runFirstRunSetup(
             try out(io, "{s}could not fetch models ({s}) — type the model id manually.{s}\n", .{ palette.warn("", arena), why, "\x1b[0m" });
             try out(io, "model [{s}]: ", .{preset.default_model});
             const pick_raw = stdin_r.interface.takeDelimiterInclusive('\n') catch return error.SetupAborted;
-            const pick = std.mem.trim(u8, pick_raw, " \t\r\n");
+            const pick = try arena.dupe(u8, std.mem.trim(u8, pick_raw, " \t\r\n"));
             if (pick.len > 0 and validModelId(pick)) model_name = pick;
         },
     }
@@ -869,9 +905,12 @@ fn runFirstRunSetup(
     tmp_store.value = root;
     try tmp_store.setPath("model.provider", .{ .string = preset.id });
     try tmp_store.setPath("model.model", .{ .string = model_name });
-    try tmp_store.setPath("model.base_url", .{ .string = preset.base_url });
-    if (preset.key_env.len > 0) {
-        try tmp_store.setPath("model.api_key_env", .{ .string = preset.key_env });
+    try tmp_store.setPath("model.base_url", .{ .string = base_url });
+    if (key_env.len > 0) {
+        try tmp_store.setPath("model.api_key_env", .{ .string = key_env });
+    }
+    if (!std.mem.eql(u8, preset.id, preset.label)) {
+        try tmp_store.setPath("model.provider_label", .{ .string = preset.label });
     }
     root = tmp_store.value;
     if (std.mem.lastIndexOfScalar(u8, user_cfg_path, '/')) |slash| {
@@ -883,21 +922,22 @@ fn runFirstRunSetup(
     try cwd.writeFile(io, .{ .sub_path = user_cfg_path, .data = aw.written() });
 
     // Store the key.
-    if (key_value.len > 0) {
-        try global_user_keys.store(io, arena, environ, preset.key_env, key_value);
-        g_merged_env.?.put(preset.key_env, key_value) catch {};
+    if (key_value.len > 0 and key_env.len > 0) {
+        try global_user_keys.store(io, arena, environ, key_env, key_value);
+        g_merged_env.?.put(key_env, key_value) catch {};
     }
 
     // Live-apply.
     try cfg.applyOverride("model.provider", try std.fmt.allocPrint(arena, "\"{s}\"", .{preset.id}), .{ .layer = .user, .origin = user_cfg_path });
     try cfg.applyOverride("model.model", try std.fmt.allocPrint(arena, "\"{s}\"", .{model_name}), .{ .layer = .user, .origin = user_cfg_path });
-    try cfg.applyOverride("model.base_url", try std.fmt.allocPrint(arena, "\"{s}\"", .{preset.base_url}), .{ .layer = .user, .origin = user_cfg_path });
-    if (preset.key_env.len > 0) {
-        try cfg.applyOverride("model.api_key_env", try std.fmt.allocPrint(arena, "\"{s}\"", .{preset.key_env}), .{ .layer = .user, .origin = user_cfg_path });
+    try cfg.applyOverride("model.base_url", try std.fmt.allocPrint(arena, "\"{s}\"", .{base_url}), .{ .layer = .user, .origin = user_cfg_path });
+    if (key_env.len > 0) {
+        try cfg.applyOverride("model.api_key_env", try std.fmt.allocPrint(arena, "\"{s}\"", .{key_env}), .{ .layer = .user, .origin = user_cfg_path });
     }
+    try cfg.applyOverride("model.provider_label", try std.fmt.allocPrint(arena, "\"{s}\"", .{preset.label}), .{ .layer = .user, .origin = user_cfg_path });
 
-    try out(io, "\n{s}setup complete — model {s}/{s} saved to {s}{s}\n", .{
-        palette.success("", arena), preset.id, model_name, user_cfg_path, "\x1b[0m",
+    try out(io, "\n{s}setup complete{s} — {s} · {s}\nsaved to {s}\n", .{
+        palette.success("", arena), "\x1b[0m", preset.label, model_name, user_cfg_path,
     });
     if (key_value.len > 0) {
         try out(io, "{s}key stored ({s}){s}\n", .{ palette.dim("", arena), secret_mod.masked(arena, key_value), "\x1b[0m" });
@@ -1146,8 +1186,9 @@ fn handleCommand(
                 palette.success("found", arena)
             else
                 palette.warn("MISSING", arena);
+            const show_label = cfg.getOptionalString("model.provider_label") orelse cfg.getString("model.provider", "openai");
             out(io, "provider: {s}\nmodel: {s}\nbase_url: {s}\nkey env: {s} ({s})\n", .{
-                cfg.getString("model.provider", "openai"),
+                show_label,
                 pcfg_now.model,
                 pcfg_now.base_url,
                 cfg.getOptionalString("model.api_key_env") orelse "(default)",
