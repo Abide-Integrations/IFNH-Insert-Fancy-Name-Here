@@ -1,6 +1,6 @@
 //! Single source of truth for the IFNH application version.
 //! Keep this the only place the release version appears.
 
-pub const version = "0.1.6";
+pub const version = "0.1.7";
 
 pub const user_agent = "ifnh/" ++ version;
