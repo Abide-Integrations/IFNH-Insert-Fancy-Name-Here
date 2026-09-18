@@ -250,6 +250,22 @@ Linux, verifies sha256 when available, installs to `~/.local/bin`, and
 warns if that directory is not on your PATH. Set `IFNH_PREFIX` to install
 elsewhere, `IFNH_VERSION=v0.1.0` to pin a version.
 
+Uninstall (k3s-style — the installer drops a companion script next to the
+binary):
+
+```bash
+ifnh-uninstall.sh           # remove binary + runtime state (keeps config + API keys)
+ifnh-uninstall.sh --purge   # also delete ~/.config/ifnh (config + keys)
+```
+
+Project-local `.ifnh/` directories are never touched by the uninstaller.
+
+A hosted copy works too:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/<org>/ifnh/main/uninstall.sh | sh
+```
+
 CI is deliberately lean: `ci.yml` runs on ubuntu only (auto-cancel,
 docs-only changes skipped) — fmt, tests, ReleaseSafe build, size +
 startup budgets, integration harnesses. `release.yml` builds all five

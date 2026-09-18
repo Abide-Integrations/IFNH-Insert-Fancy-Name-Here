@@ -84,6 +84,40 @@ if [ "$installed" != 1 ]; then
   exit 1
 fi
 
+# Companion uninstaller (k3s pattern): installed next to the binary.
+cat > "$tmp/ifnh-uninstall.sh" <<'UNINSTALL'
+#!/bin/sh
+# IFNH uninstaller: removes the binary and runtime state.
+#   ifnh-uninstall.sh          keep ~/.config/ifnh (config + API keys)
+#   ifnh-uninstall.sh --purge  also delete ~/.config/ifnh
+set -eu
+PREFIX="${IFNH_PREFIX:-$HOME/.local/bin}"
+CONFIG_DIR="$HOME/.config/ifnh"
+STATE_DIR="$HOME/.local/state/ifnh"
+purge=0
+for arg in "$@"; do
+  case "$arg" in
+    --purge) purge=1 ;;
+    *) echo "ifnh-uninstall: unknown option '$arg' (use --purge)" >&2; exit 1 ;;
+  esac
+done
+echo "ifnh uninstall:"
+removed=0
+for f in "$PREFIX/ifnh" "$PREFIX/ifnh-uninstall.sh"; do
+  if [ -f "$f" ]; then rm -f "$f"; echo "  removed $f"; removed=1; fi
+done
+[ -d "$STATE_DIR" ] && { rm -rf "$STATE_DIR"; echo "  removed $STATE_DIR"; }
+if [ "$purge" = 1 ] && [ -d "$CONFIG_DIR" ]; then
+  rm -rf "$CONFIG_DIR"
+  echo "  removed $CONFIG_DIR (configuration and stored API keys)"
+fi
+[ "$purge" = 0 ] && [ -d "$CONFIG_DIR" ] && echo "  kept $CONFIG_DIR (config + API keys) - use --purge to delete"
+echo "  note: project-local .ifnh/ directories were left untouched."
+[ "$removed" = 1 ] && echo "ifnh uninstalled." || echo "ifnh was not found in $PREFIX."
+UNINSTALL
+install -m 0755 "$tmp/ifnh-uninstall.sh" "$PREFIX/ifnh-uninstall.sh"
+echo "ifnh: installed $PREFIX/ifnh-uninstall.sh  (run it to remove ifnh)"
+
 case ":$PATH:" in
   *":$PREFIX:"*) ;;
   *) echo "ifnh: NOTE '$PREFIX' is not on your PATH" >&2
