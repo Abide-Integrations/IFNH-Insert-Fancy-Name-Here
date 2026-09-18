@@ -342,14 +342,21 @@ fn runDoctor(io: std.Io, arena: std.mem.Allocator, environ: *const std.process.E
     const is_anthropic = std.mem.eql(u8, provider_name, "anthropic");
     const key_env = cfg.getOptionalString("model.api_key_env") orelse
         (if (is_anthropic) "ANTHROPIC_API_KEY" else "OPENAI_API_KEY");
-    const has_key = environ.get(key_env) != null;
+    // Key lookup uses the same merged view as sessions: process env +
+    // stored keys (~/.config/ifnh/env).
+    const keys_mod = @import("core/config/keys.zig");
+    var stored_keys = keys_mod.Keys.init(arena);
+    stored_keys.load(io, arena, environ);
+    const has_key = environ.get(key_env) != null or stored_keys.map.get(key_env) != null;
     const has_model = cfg.getString("model.model", "").len > 0;
     if (has_key and has_model) {
-        try printOut(io, arena, "  provider: ok ({s}/{s}, key from {s})\n", .{ provider_name, cfg.getString("model.model", ""), key_env });
+        const pd = cfg.getOptionalString("model.provider_label") orelse provider_name;
+        const key_where: []const u8 = if (environ.get(key_env) != null) "environment" else "~/.config/ifnh/env";
+        try printOut(io, arena, "  provider: ok ({s} · {s}, key from {s})\n", .{ pd, cfg.getString("model.model", ""), key_where });
     } else {
         problems += 1;
-        if (!has_model) try printOut(io, arena, "  provider: model.model not set (IFNH_MODEL__MODEL or .ifnh/config.json)\n", .{});
-        if (!has_key) try printOut(io, arena, "  provider: {s} not set in environment\n", .{key_env});
+        if (!has_model) try printOut(io, arena, "  provider: model.model not set (run `ifnh` — first-run setup will ask)\n", .{});
+        if (!has_key) try printOut(io, arena, "  provider: {s} not set (export it, or run `ifnh` -> /provider key {s})\n", .{ key_env, key_env });
     }
 
     // Git.
@@ -428,7 +435,7 @@ fn runInit(io: std.Io, arena: std.mem.Allocator, args: []const []const u8) !void
 
     try printOut(io, arena,
         \\created .ifnh/ (config.json, skills/, commands/, instructions/, plans/)
-        \\next: set a provider key (e.g. IFNH model config or ANTHROPIC_API_KEY) and run `ifnh`
+        \\next: run `ifnh` — first-run setup will configure your provider, model, and key
         \\
     , .{});
 }
