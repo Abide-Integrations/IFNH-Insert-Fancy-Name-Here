@@ -130,6 +130,9 @@ pub const RunParams = struct {
     callbacks: Callbacks,
     cancel: *std.atomic.Value(bool),
     max_tool_rounds: usize = max_tool_rounds_default,
+    /// Chat-only mode: no tool schemas advertised (models without tool
+    /// calling still work for Q&A).
+    include_tools: bool = true,
     max_retries: usize = 3,
     /// Secret strings redacted from tool output before it enters history.
     redactions: []const []const u8 = &.{},
@@ -150,7 +153,10 @@ pub fn runTurn(p: RunParams) !Outcome {
         }
 
         var collector = Collector{ .arena = p.arena };
-        const tools_json = try renderToolsJson(p.arena, null);
+        const tools_json = if (p.include_tools)
+            try renderToolsJson(p.arena, null)
+        else
+            "[]";
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
             collector = Collector{ .arena = p.arena };

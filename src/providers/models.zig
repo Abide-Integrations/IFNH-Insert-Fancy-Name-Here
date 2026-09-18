@@ -10,8 +10,15 @@ const std = @import("std");
 pub const max_models: usize = 200;
 pub const max_body_bytes: usize = 1024 * 1024;
 
+pub const ModelEntry = struct {
+    id: []const u8,
+    /// Context window in tokens when the provider advertises it
+    /// (OpenRouter: `context_length`). Null = unknown.
+    context_length: ?u64 = null,
+};
+
 pub const Result = union(enum) {
-    models: [][]const u8,
+    models: []ModelEntry,
     failure: []const u8,
 };
 
@@ -89,13 +96,23 @@ pub fn parseModelsResponse(arena: std.mem.Allocator, body: []const u8) Result {
     const data = v.object.get("data") orelse return .{ .failure = "no model list in response" };
     if (data != .array) return .{ .failure = "unexpected response shape" };
 
-    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+    var out: std.ArrayListUnmanaged(ModelEntry) = .empty;
     for (data.array.items) |item| {
         if (out.items.len >= max_models) break;
         if (item != .object) continue;
         const id = item.object.get("id") orelse continue;
         if (id != .string or id.string.len == 0) continue;
-        out.append(arena, arena.dupe(u8, id.string) catch continue) catch continue;
+        var entry = ModelEntry{ .id = arena.dupe(u8, id.string) catch continue };
+        // Context window: OpenRouter exposes context_length; tolerate
+        // common aliases.
+        inline for (.{ "context_length", "context_window", "max_context_length" }) |field| {
+            if (entry.context_length == null) {
+                if (item.object.get(field)) |cl| {
+                    if (cl == .integer and cl.integer > 0) entry.context_length = @intCast(cl.integer);
+                }
+            }
+        }
+        out.append(arena, entry) catch continue;
     }
     if (out.items.len == 0) return .{ .failure = "provider returned no models" };
     return .{ .models = out.items };
@@ -109,12 +126,15 @@ test "parse OpenAI-shaped model list" {
     const a = arena_state.allocator();
 
     const result = parseModelsResponse(a,
-        \\{"data":[{"id":"openai/gpt-5"},{"id":"anthropic/claude-sonnet-4-6"},{"id":"z-ai/glm-4.6"}],"not-a-model":1}
+        \\{"data":[{"id":"openai/gpt-5"},{"id":"anthropic/claude-sonnet-4-6","context_length":200000},{"id":"z-ai/glm-4.6","context_window":131072}]}
     );
     const models = result.models;
     try std.testing.expectEqual(@as(usize, 3), models.len);
-    try std.testing.expectEqualStrings("openai/gpt-5", models[0]);
-    try std.testing.expectEqualStrings("z-ai/glm-4.6", models[2]);
+    try std.testing.expectEqualStrings("openai/gpt-5", models[0].id);
+    try std.testing.expectEqualStrings("z-ai/glm-4.6", models[2].id);
+    try std.testing.expect(models[0].context_length == null);
+    try std.testing.expectEqual(@as(u64, 200000), models[1].context_length.?);
+    try std.testing.expectEqual(@as(u64, 131072), models[2].context_length.?);
 }
 
 test "parse failures are descriptive" {

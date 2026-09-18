@@ -496,6 +496,7 @@ test {
     _ = @import("ui/style.zig");
     _ = @import("ui/secret.zig");
     _ = @import("providers/models.zig");
+    _ = @import("providers/probe.zig");
     _ = @import("core/config/keys.zig");
     _ = @import("core/agent/system_prompt.zig");
     _ = @import("cli/repl.zig");

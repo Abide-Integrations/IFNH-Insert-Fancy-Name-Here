@@ -417,6 +417,7 @@ fn submitTurn(
             .on_notice = TurnUi.onNotice,
         },
         .cancel = &cancel,
+        .include_tools = cfg.getBool("model.tools_enabled", true),
         .max_retries = cfg.getU32("agents.max_retries", 3),
         .redactions = redactionsFor(arena, pcfg.api_key),
     }) catch |err| {
@@ -431,7 +432,10 @@ fn submitTurn(
             _ = try sess.store.append(.{ .assistant = .{ .text = outcome.reply } });
         },
         .failed => {
-            try out(io, "provider error: {s}\n", .{outcome.error_message});
+            try out(io, "{s}provider error: {s}{s}\n", .{ palette.err("", arena), outcome.error_message, "\x1b[0m" });
+            if (@import("../providers/probe.zig").looksLikeToolRejection(outcome.error_message)) {
+                try out(io, "{s}hint: this model may not support tool calling. Set it up as chat-only with /provider tools off{s}\n", .{ palette.warn("", arena), "\x1b[0m" });
+            }
             _ = try sess.store.append(.{ .note = .{ .text = outcome.error_message } });
         },
         .cancelled => {
@@ -858,7 +862,7 @@ fn runFirstRunSetup(
             });
             const shown = @min(list.len, 30);
             for (list[0..shown], 0..) |m, i| {
-                try out(io, "  {d}) {s}\n", .{ i + 1, m });
+                try out(io, "  {d}) {s}\n", .{ i + 1, m.id });
             }
             if (list.len > shown) {
                 try out(io, "  {s}...and {d} more — type the exact model id{s}\n", .{ palette.dim("", arena), list.len - shown, "\x1b[0m" });
@@ -869,7 +873,7 @@ fn runFirstRunSetup(
             if (pick.len > 0) {
                 if (std.fmt.parseInt(usize, pick, 10)) |n| {
                     if (n >= 1 and n <= list.len) {
-                        model_name = list[n - 1];
+                        model_name = list[n - 1].id;
                     } else {
                         try out(io, "{s}number not in list; using default {s}{s}\n", .{ palette.warn("", arena), preset.default_model, "\x1b[0m" });
                     }
@@ -889,6 +893,50 @@ fn runFirstRunSetup(
             const pick = try arena.dupe(u8, std.mem.trim(u8, pick_raw, " \t\r\n"));
             if (pick.len > 0 and validModelId(pick)) model_name = pick;
         },
+    }
+
+    // Capability probe: one tiny tool-call request. Chat-only models are
+    // detected here instead of failing mid-session.
+    var tools_enabled = true;
+    var context_window: ?u64 = null;
+    {
+        try out(io, "testing tool support ({s})... ", .{model_name});
+        const probe = @import("../providers/probe.zig").probeToolSupport(arena, io, if (std.mem.eql(u8, preset.id, "anthropic")) anthropic.instance else openai.instance, base_url, key_value, model_name);
+        switch (probe) {
+            .supported => {
+                try out(io, "{s}ok — tool calling works{s}\n", .{ palette.success("", arena), "\x1b[0m" });
+            },
+            .unsupported => |why| {
+                try out(io, "{s}no tool calls detected ({s}){s}\n", .{ palette.warn("", arena), why, "\x1b[0m" });
+                try out(io, "use as chat-only (no file edits/commands)? [Y/n]: ", .{});
+                const ans_raw = stdin_r.interface.takeDelimiterInclusive('\n') catch return error.SetupAborted;
+                const ans = std.mem.trim(u8, ans_raw, " \t\r\n");
+                if (ans.len == 0 or std.ascii.eqlIgnoreCase(ans, "y")) {
+                    tools_enabled = false;
+                    try out(io, "{s}chat-only mode enabled{s}\n", .{ palette.info("", arena), "\x1b[0m" });
+                }
+            },
+            .error_ => |why| {
+                try out(io, "{s}probe failed ({s}) — continuing{s}\n", .{ palette.warn("", arena), why, "\x1b[0m" });
+            },
+        }
+    }
+
+    // Context window from the fetched list (when the provider advertises
+    // it); small windows scale the compaction threshold automatically.
+    if (models_res == .models) {
+        for (models_res.models) |entry| {
+            if (std.mem.eql(u8, entry.id, model_name)) {
+                context_window = entry.context_length;
+                break;
+            }
+        }
+        if (context_window) |w| {
+            try out(io, "{s}context window: {d} tokens{s}\n", .{ palette.dim("", arena), w, "\x1b[0m" });
+            if (w < 32_000) {
+                try out(io, "{s}small context window — compaction will run aggressively{s}\n", .{ palette.warn("", arena), "\x1b[0m" });
+            }
+        }
     }
 
     // Persist to USER config (applies to all projects).
@@ -911,6 +959,11 @@ fn runFirstRunSetup(
     }
     if (!std.mem.eql(u8, preset.id, preset.label)) {
         try tmp_store.setPath("model.provider_label", .{ .string = preset.label });
+    }
+    try tmp_store.setPath("model.tools_enabled", .{ .bool = tools_enabled });
+    if (context_window) |w| {
+        const scaled: u64 = @max(w * 3 / 4, 4096);
+        try tmp_store.setPath("context.max_context_tokens", .{ .integer = @intCast(scaled) });
     }
     root = tmp_store.value;
     if (std.mem.lastIndexOfScalar(u8, user_cfg_path, '/')) |slash| {
@@ -935,6 +988,11 @@ fn runFirstRunSetup(
         try cfg.applyOverride("model.api_key_env", try std.fmt.allocPrint(arena, "\"{s}\"", .{key_env}), .{ .layer = .user, .origin = user_cfg_path });
     }
     try cfg.applyOverride("model.provider_label", try std.fmt.allocPrint(arena, "\"{s}\"", .{preset.label}), .{ .layer = .user, .origin = user_cfg_path });
+    try cfg.applyOverride("model.tools_enabled", (if (tools_enabled) "true" else "false"), .{ .layer = .user, .origin = user_cfg_path });
+    if (context_window) |w| {
+        const scaled: u64 = @max(w * 3 / 4, 4096);
+        try cfg.applyOverride("context.max_context_tokens", try std.fmt.allocPrint(arena, "{d}", .{scaled}), .{ .layer = .user, .origin = user_cfg_path });
+    }
 
     try out(io, "\n{s}setup complete{s} — {s} · {s}\nsaved to {s}\n", .{
         palette.success("", arena), "\x1b[0m", preset.label, model_name, user_cfg_path,
@@ -1187,12 +1245,19 @@ fn handleCommand(
             else
                 palette.warn("MISSING", arena);
             const show_label = cfg.getOptionalString("model.provider_label") orelse cfg.getString("model.provider", "openai");
-            out(io, "provider: {s}\nmodel: {s}\nbase_url: {s}\nkey env: {s} ({s})\n", .{
+            const tools_state = if (cfg.getBool("model.tools_enabled", true))
+                palette.success("on", arena)
+            else
+                palette.warn("off (chat-only)", arena);
+            const cw = cfg.getOptionalU32("context.max_context_tokens");
+            out(io, "provider: {s}\nmodel: {s}\nbase_url: {s}\nkey env: {s} ({s})\ntools: {s}{s}\n", .{
                 show_label,
                 pcfg_now.model,
                 pcfg_now.base_url,
                 cfg.getOptionalString("model.api_key_env") orelse "(default)",
                 key_state,
+                tools_state,
+                if (cw != null) std.fmt.allocPrint(arena, ", compaction threshold {d} tokens", .{cw.?}) catch "" else "",
             }) catch {};
             if (rest.len == 0) out(io, "usage: /provider set <provider> <model> [base_url] [key_env]\n       /provider key <ENV_NAME> <value>\n", .{}) catch {};
         } else if (std.mem.startsWith(u8, rest, "set ")) {
@@ -1245,8 +1310,21 @@ fn handleCommand(
             out(io, "{s}stored {s} in ~/.config/ifnh/env (0600); takes effect immediately{s}\n", .{
                 palette.success("", arena), name, "\x1b[0m",
             }) catch {};
+        } else if (std.mem.startsWith(u8, rest, "tools ")) {
+            const mode = std.mem.trim(u8, rest[6..], " \t");
+            if (std.mem.eql(u8, mode, "off")) {
+                cfg.applyOverride("model.tools_enabled", "false", .{ .layer = .session, .origin = "session" }) catch {};
+                sess.overrides.append(arena, .{ .path = "model.tools_enabled", .json = "false" }) catch {};
+                out(io, "{s}tools disabled — chat-only mode (persists this session; use /provider tools on to re-enable){s}\n", .{ palette.warn("", arena), "\x1b[0m" }) catch {};
+            } else if (std.mem.eql(u8, mode, "on")) {
+                cfg.applyOverride("model.tools_enabled", "true", .{ .layer = .session, .origin = "session" }) catch {};
+                sess.overrides.append(arena, .{ .path = "model.tools_enabled", .json = "true" }) catch {};
+                out(io, "{s}tools enabled{s}\n", .{ palette.success("", arena), "\x1b[0m" }) catch {};
+            } else {
+                out(io, "usage: /provider tools <on|off>\n", .{}) catch {};
+            }
         } else {
-            out(io, "usage: /provider [show|set <provider> <model> [base_url] [key_env]|key <ENV_NAME> <value>]\n", .{}) catch {};
+            out(io, "usage: /provider [show|set <provider> <model> [base_url] [key_env]|key <ENV_NAME> <value>|tools <on|off>]\n", .{}) catch {};
         }
     } else if (std.mem.eql(u8, cmd, "review")) {
         // M2-T03 (G96/97): developer-only override of the last blocked review.
