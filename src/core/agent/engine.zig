@@ -46,6 +46,8 @@ pub const Outcome = struct {
 
 const Collector = struct {
     arena: std.mem.Allocator,
+    /// Receives each text delta as it arrives (live streaming to the UI).
+    callbacks: Callbacks,
     text: std.ArrayListUnmanaged(u8) = .empty,
     tool_calls: std.ArrayListUnmanaged(core_types.ToolCall) = .empty,
     usage: core_types.Usage = .{},
@@ -56,6 +58,9 @@ const Collector = struct {
         switch (ev) {
             .content_delta => |d| {
                 self.text.appendSlice(self.arena, d) catch {};
+                // The delta is only valid for this call; UIs must copy or
+                // write it immediately.
+                self.callbacks.on_text(self.callbacks.ctx, d);
             },
             .reasoning_delta => {},
             .tool_call => |tc| {
@@ -152,14 +157,14 @@ pub fn runTurn(p: RunParams) !Outcome {
             return .{ .status = .cancelled, .reply = last_reply, .tool_rounds = rounds, .tool_calls = total_calls, .usage = total_usage };
         }
 
-        var collector = Collector{ .arena = p.arena };
+        var collector = Collector{ .arena = p.arena, .callbacks = p.callbacks };
         const tools_json = if (p.include_tools)
             try renderToolsJson(p.arena, null)
         else
             "[]";
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
-            collector = Collector{ .arena = p.arena };
+            collector = Collector{ .arena = p.arena, .callbacks = p.callbacks };
             try p.pcfg.provider.stream(p.arena, p.io, .{
                 .model = p.pcfg.model,
                 .base_url = p.pcfg.base_url,
@@ -392,6 +397,11 @@ test "runTurn executes scripted tool call and feeds result back" {
     try std.testing.expectEqualStrings("The file has two lines: alpha, beta.", outcome.reply);
     try std.testing.expectEqual(@as(usize, 1), outcome.tool_calls);
     try std.testing.expectEqual(@as(u64, 30), outcome.usage.input_tokens);
+    // Text is streamed to the UI as it arrives, one call per delta, in order
+    // (regression: on_text was never invoked and replies never rendered).
+    try std.testing.expectEqual(@as(usize, 2), log.texts.items.len);
+    try std.testing.expectEqualStrings("Looking at the file.", log.texts.items[0]);
+    try std.testing.expectEqualStrings("The file has two lines: alpha, beta.", log.texts.items[1]);
     try std.testing.expectEqual(@as(usize, 1), log.tool_starts.items.len);
     try std.testing.expectEqualStrings("read", log.tool_starts.items[0]);
     try std.testing.expectEqual(tool_mod.Status.ok, log.tool_results.items[0]);

@@ -12,6 +12,7 @@ them before making architectural choices:
 - `DECISIONS.md` — resolved discovery backlog; every answer references its question number.
 - `DESIGN.md` — technical spec: module layout, interfaces, schemas, budgets.
 - `MASTER_TRACKER.md` — implementation tasks and status. Update task statuses as you land work.
+- `ACTIVE_PLAN.md` — living plan from the 2026-09-18 review (defects, performance, features, distribution). Update it whenever work lands; it is the current work queue.
 
 ## Toolchain
 
@@ -29,13 +30,25 @@ zig fmt src/           # format; the canonical check is `zig fmt --check src/`
 
 ## Verification rules
 
-Do not report work as done until:
+The owner runs the Zig toolchain on their own machine (8 GB RAM; builds are
+kept cheap). Agents write code and colocated tests but do not run `zig`.
 
-1. `zig build` succeeds.
-2. `zig build test` passes with no leak reports.
-3. `zig fmt src/` produces no diff.
-4. You ran the built binary (`./zig-out/bin/ifnh`) on the changed path if it
-   is user-facing. "Tests pass" is not a substitute for running the app.
+For every change, an agent must:
+
+1. Mark the task `[?]` (landed, awaiting verification) in `ACTIVE_PLAN.md`,
+   never `[x]`; only the owner's confirmation makes it `[x]`.
+2. Hand over the exact commands to run and the expected result. Cheapest
+   first: `zig fmt --check src/`, `zig build check`,
+   `zig build test -Dtest-filter=<substr>`, then full `zig build test`
+   (no leak reports) once per phase.
+3. For user-facing changes, name the manual smoke step to run with the built
+   binary (`./zig-out/bin/ifnh`). "Tests pass" is not a substitute for
+   running the app.
+
+Heavy checks (ReleaseSafe, size/startup budgets, kill-9, bench) run in CI.
+Keep changes small (one task per verify cycle) and mirror existing patterns,
+because agent-written Zig 0.16 `std.Io` code is not compiler-checked before
+hand-off.
 
 ## Code style
 

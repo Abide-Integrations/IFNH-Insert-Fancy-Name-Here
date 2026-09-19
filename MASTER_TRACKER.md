@@ -13,7 +13,7 @@
 | **M0** | Vertical-slice core | Tool loop works e2e against fake provider; sessions resume; undo restores files; permission gates hold; startup budget measured | **code complete** (2026-09-14) — 54 tests green, 1.3 MiB stripped; residual `[~]` items tracked above (raw-mode editor, retry policy, disk-backed commands → M1) |
 | **M1** | Agents, extensions, observability | Subagents + worktrees + MCP + skills + hooks functional with tests; usage tracking; doctor | **code complete** (2026-09-14) — subagents/worktrees/MCP/skills/hooks/compaction/usage/doctor landed; deferred: background execs, read_tool_result, HTTP MCP |
 | **M2** | Lifecycle, governance, budgets | Lifecycle engine + review gates + forks; CI budgets enforced; go-public checklist green | **code complete** (2026-09-14) — all M2 tasks landed except `fork diff` (post). Remaining open items are polish (`[~]`) and post-1.0 features |
-| **Post** | Roadmap | DECISIONS `[post]` items, 0.17.0 compat | ongoing |
+| **Post** | Roadmap | DECISIONS `[post]` items, 0.17.0 compat | ongoing — tracked in [ACTIVE_PLAN.md](ACTIVE_PLAN.md) (review of 2026-09-18: correctness P0s, performance, UX, adaptability, distribution). Note: several M0–M2 `[x]` items there are overstated (see findings F-A01..F-A10) |
 
 ---
 
