@@ -30,8 +30,10 @@ zig fmt src/           # format; the canonical check is `zig fmt --check src/`
 
 ## Verification rules
 
-The owner runs the Zig toolchain on their own machine (8 GB RAM; builds are
-kept cheap). Agents write code and colocated tests but do not run `zig`.
+The owner runs the Zig toolchain on their own test host (resource-limited;
+builds are kept cheap). It must be exactly Zig 0.16.0; distro packages
+(e.g. Zig 0.14) cannot compile this code. Agents write code and colocated
+tests but do not run `zig`.
 
 For every change, an agent must:
 

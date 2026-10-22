@@ -8,7 +8,9 @@
 
 ## How this document works
 
-**Who runs what.** The agent writes code and colocated tests and never runs `zig`. The owner runs every build/test locally (M3, 8 GB RAM: keep it cheap) and reports the result. A task only becomes `[x]` on the owner's confirmation.
+**Who runs what.** The agent writes code and colocated tests and never runs `zig` (the agent's Mac has no toolchain). The owner runs every build/test on their **Linux test host** (clone at `/opt/ifnh`; keep runs cheap) and reports the result. A task only becomes `[x]` on the owner's confirmation.
+
+**Test-host requirements (learned 2026-09-18).** The project needs **Zig 0.16.0 exactly** (`build.zig.zon` `minimum_zig_version`; the code uses `std.Io`, `std.testing.io`, `std.mem.trimEnd`, which do not exist in 0.14). The host's distro package is Zig 0.14 (`/usr/lib/zig0.14`), which fails with 60 unrelated compile errors. Before reporting results: `zig version` must print `0.16.0`, and `git pull` must have fetched the commit under test (`git log -1`).
 
 **Status legend**
 
@@ -41,7 +43,7 @@ Heavy checks (ReleaseSafe, size/startup budgets, kill-9, bench) run in CI: `gh r
 
 ## Current focus
 
-1. **Owner: verify W-01, W-02, A-01** (all `[?]`; commands in their Verify cells).
+1. **Owner: W-06** (install Zig 0.16.0 on the test host, `git pull`), then verify W-01, W-02, A-01 (commands in their Verify cells).
 2. **A-02** — Anthropic tool wire format (next to land once W-04's golden-test scaffold is agreed).
 3. **W-04 / W-05** — golden-wire tests and config-key coverage.
 
@@ -51,8 +53,9 @@ Heavy checks (ReleaseSafe, size/startup budgets, kill-9, bench) run in CI: `gh r
 
 | ID | Task | Status | Verify | Notes |
 |---|---|---|---|---|
-| W-01 | `zig build check` step: compile with no codegen | `[?]` | `zig build check` (expect: exits 0, no `zig-out/bin/ifnh` produced/updated); `zig build --help` lists `check` | `build.zig`: second `addExecutable` on the same module, never installed, so no bin is requested. If 0.16 rejects the API, paste the error |
-| W-02 | `-Dtest-filter=<substr>` build option wired to test step `filters` | `[?]` | `zig build test -Dtest-filter=runTurn` (expect: only the engine `runTurn` tests run); `zig build test` still runs everything | `build.zig`: `b.option([]const []const u8, "test-filter", ...)` -> `.filters`. Repeatable flag. Tagging thread/subprocess tests `slow:` is still to do |
+| W-06 | **Test host has Zig 0.16.0** and a current clone (owner action) | `[ ]` | `zig version` prints `0.16.0`; `git -C /opt/ifnh log -1 --oneline` shows `e88af60` or later | Blocks verification of everything below. Distro package is 0.14; use the official tarball from ziglang.org/download (put it first on PATH), or a version manager |
+| W-01 | `zig build check` step: compile with no codegen | `[!]` blocked by W-06 (first run invalid: Zig 0.14, stale clone) | `zig build check` (expect: exits 0, no `zig-out/bin/ifnh` produced/updated); `zig build --help` lists `check` | `build.zig`: second `addExecutable` on the same module, never installed, so no bin is requested. If 0.16 rejects the API, paste the error |
+| W-02 | `-Dtest-filter=<substr>` build option wired to test step `filters` | `[!]` blocked by W-06 (first run invalid: stale clone had no such option) | `zig build test -Dtest-filter=runTurn` (expect: only the engine `runTurn` tests run); `zig build test` still runs everything | `build.zig`: `b.option([]const []const u8, "test-filter", ...)` -> `.filters`. Repeatable flag. Tagging thread/subprocess tests `slow:` is still to do |
 | W-03 | AGENTS.md verification rule (owner runs toolchain) + `[?]` legend + tracker pointer | `[?]` | read AGENTS.md | landed 2026-09-18 with this file |
 | W-04 | Golden-wire test scaffold: `buildBody` snapshots + SSE byte fixtures, both adapters | `[ ]` | `zig build test -Dtest-filter=wire` | Prevents A-02-class regressions; pure functions, no network |
 | W-05 | Config-key-coverage test: fails if a key in `default_config_json` is never read | `[ ]` | `zig build test -Dtest-filter=coverage` | Drives A-07 |
@@ -63,7 +66,7 @@ Heavy checks (ReleaseSafe, size/startup budgets, kill-9, bench) run in CI: `gh r
 
 | ID | Task | Status | Verify | Notes |
 |---|---|---|---|---|
-| A-01 | Stream assistant text: engine forwards `content_delta` to `on_text` | `[?]` | `zig fmt --check src/` · `zig build check` · `zig build test -Dtest-filter="runTurn executes scripted"` (new assertions: 2 text deltas, in order). **Manual smoke:** build, run `./zig-out/bin/ifnh`, send "hi": the reply must appear as it streams (before this fix it did not appear at all) | see F-A01. `engine.zig`: `Collector` now holds `Callbacks` and calls `on_text` per delta. Known limits: (1) a retry after a partially streamed reply will repeat the text on screen (fix in A-05); (2) `reasoning_delta` callback deferred: neither adapter emits reasoning events yet (E-01/D-05); (3) REPL writes each delta with its own syscall, fine now, revisit with C-07 |
+| A-01 | Stream assistant text: engine forwards `content_delta` to `on_text` | `[!]` blocked by W-06 (first run invalid: error line numbers match the pre-change `engine.zig`) | `zig fmt --check src/` · `zig build check` · `zig build test -Dtest-filter="runTurn executes scripted"` (new assertions: 2 text deltas, in order). **Manual smoke:** build, run `./zig-out/bin/ifnh`, send "hi": the reply must appear as it streams (before this fix it did not appear at all) | see F-A01. `engine.zig`: `Collector` now holds `Callbacks` and calls `on_text` per delta. Known limits: (1) a retry after a partially streamed reply will repeat the text on screen (fix in A-05); (2) `reasoning_delta` callback deferred: neither adapter emits reasoning events yet (E-01/D-05); (3) REPL writes each delta with its own syscall, fine now, revisit with C-07 |
 | A-02 | Anthropic tools: neutral tool list, per-adapter wire render, merge tool_result blocks | `[ ]` | golden `buildBody` test (W-04); manual Anthropic tool round-trip | see F-A02 |
 | A-03 | `bash`: always `sh -c` after classification; add `background` + `timeout_s`; honor `agents.timeout_tool_s` | `[ ]` | argv/quoting tests: `git commit -m "a b"`, `ls *.zig` | see F-A03 |
 | A-04 | Persist tool-call assistant messages + tool results; paginate replay; warn on truncation | `[ ]` | session test: scripted tool turn, resume, history equal; `tests/integration-kill9.sh` | see F-A04 |
@@ -243,3 +246,4 @@ Why: W first so each owner verify cycle takes seconds; A removes defects that ma
 |---|---|
 | 2026-09-18 | Full static review of v0.1.7. Created this document. W-03 landed (AGENTS.md verification rule, MASTER_TRACKER pointer). No code changed; nothing built or run by the agent. |
 | 2026-09-18 | Landed (awaiting owner verification, not compiled by agent): W-01 `check` step and W-02 `-Dtest-filter` in `build.zig`; A-01 live text streaming in `src/core/agent/engine.zig` (+ new assertions in the existing `runTurn executes scripted tool call...` test). Only two `runTurn` callers exist (REPL prints, subagent no-ops), so no other output changes. |
+| 2026-09-19 | First owner run reported: `zig fmt --check` flagged `src/tools/tool.zig`; `zig build check` and `-Dtest-filter` "not found"; `zig build test` gave 60 compile errors. Diagnosis: host runs **Zig 0.14** (`/usr/lib/zig0.14`) on a clone that predates the changes (error line numbers match the old `engine.zig`; commit `e88af60` carries them). All 60 errors are 0.16-only APIs in files not touched (`std.Io`, `std.testing.io`, `std.mem.trimEnd`, `ArrayList.print`, `ObjectMap.init` arity). Not a code defect; W-01/W-02/A-01 set to `[!]` pending W-06. The `tool.zig` fmt result is unreliable under 0.14 and must be re-checked with 0.16.0 (file untouched by the agent). Added W-06. |
