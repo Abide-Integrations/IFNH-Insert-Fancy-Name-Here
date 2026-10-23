@@ -25,6 +25,7 @@ const compaction_mod = @import("../core/compaction.zig");
 const lifecycle_mod = @import("../core/lifecycle.zig");
 const executions_mod = @import("../core/executions.zig");
 const style_mod = @import("../ui/style.zig");
+const render_mod = @import("../ui/render.zig");
 const secret_mod = @import("../ui/secret.zig");
 const models_mod = @import("../providers/models.zig");
 const tool_mod = @import("../tools/tool.zig");
@@ -429,12 +430,15 @@ fn submitTurn(
     tool_ctx.approval_ctx = &approver;
     tool_ctx.approval_fn = Approver.approve;
 
+    var renderer = render_mod.Renderer.init(io, std.Io.File.stdout(), arena, palette);
+
     const TurnUi = struct {
         io: std.Io,
         store: *session_mod.Session,
+        renderer: *render_mod.Renderer,
         fn onText(ctx: *anyopaque, text: []const u8) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
-            std.Io.File.stdout().writeStreamingAll(self.io, text) catch {};
+            self.renderer.feed(text, render_mod.terminalWidth(self.io) orelse 0);
         }
         fn onToolStart(ctx: *anyopaque, call_id: []const u8, name: []const u8, arguments_json: []const u8) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
@@ -465,10 +469,11 @@ fn submitTurn(
         /// as it is produced, so a resumed session can replay tool rounds.
         fn onAssistantMessage(ctx: *anyopaque, content: []const u8, tool_calls_json: ?[]const u8) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.renderer.finish(render_mod.terminalWidth(self.io) orelse 0);
             _ = self.store.append(.{ .assistant = .{ .text = content, .tool_calls_json = tool_calls_json } }) catch {};
         }
     };
-    var ui = TurnUi{ .io = io, .store = &sess.store };
+    var ui = TurnUi{ .io = io, .store = &sess.store, .renderer = &renderer };
 
     var hook_engine = hooks_mod.Engine.init(io, cwd, try hooks_mod.Engine.fromConfig(arena, cfg.get("hooks")), arena);
     const pre = hook_engine.dispatch(.before_agent, "{}");
@@ -533,12 +538,14 @@ fn submitTurn(
         .budget_usd = budget_usd,
         .spent_usd = spent_before.cost_usd,
     }) catch |err| {
+        renderer.finish(render_mod.terminalWidth(io) orelse 0);
         rollbackTurn(sess, history_start);
         try out(io, "\nturn failed: {s}\n", .{@errorName(err)});
         return;
     };
 
     _ = hook_engine.dispatch(.after_agent, "{}");
+    renderer.finish(render_mod.terminalWidth(io) orelse 0);
     try out(io, "\n", .{});
     switch (outcome.status) {
         .completed => {},

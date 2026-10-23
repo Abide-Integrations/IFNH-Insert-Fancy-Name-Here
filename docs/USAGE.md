@@ -142,6 +142,20 @@ The full annotated default lives in `src/core/config/config.zig`
 
 `NO_COLOR` / `--no-color` disable styling.
 
+Assistant markdown is rendered streaming-safe: incomplete `**bold**`,
+inline code, headings, lists, and code fences stay buffered until the
+construct is complete, so no literal markers leak mid-stream. Fenced code
+gets light syntax highlighting and the output wraps to the terminal width;
+resizing during a message reflows the current block. Plain/piped output and
+headless `--json` remain unstyled and unwrapped.
+
+Manual check for C-07: build, run `./zig-out/bin/ifnh`, and send a reply
+containing a heading, a bullet list, `**bold**`, and a fenced code block
+(e.g. a `zig` function). While it streams, split `**`/a fence across the
+first chunks if you can; the terminal must not show stray markers. Resize
+the terminal mid-message: the current block reflows. `NO_COLOR=1
+./zig-out/bin/ifnh` must print the same text without ANSI escapes.
+
 ## 5. What the agent can do (tool kernel)
 
 `read` `glob` `grep` `edit` `write` `bash` `git` — plus:
