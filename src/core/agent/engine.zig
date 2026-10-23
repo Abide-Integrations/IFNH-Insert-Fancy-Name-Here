@@ -259,16 +259,19 @@ pub fn runTurn(p: RunParams) !Outcome {
             if (p.cancel.load(.acquire)) {
                 return .{ .status = .cancelled, .reply = last_reply, .tool_rounds = rounds, .tool_calls = total_calls, .usage = total_usage };
             }
-            if (isAgentCall(calls[i])) {
+            const kind = batchKind(calls[i]);
+            if (kind != .sequential) {
+                // Batch consecutive calls of the same kind: read/glob/grep
+                // run in parallel with each other (B-06), agent calls keep
+                // their existing parallel batch (E58).
                 var j = i + 1;
-                while (j < calls.len and isAgentCall(calls[j])) j += 1;
+                while (j < calls.len and batchKind(calls[j]) == kind) j += 1;
                 const batch = calls[i..j];
                 const results = if (batch.len > 1)
-                    try runAgentBatch(p, batch)
+                    try runParallelBatch(p, batch)
                 else blk: {
                     const one = try p.arena.alloc(tool_mod.ToolResult, 1);
                     one[0] = executeOne(p, batch[0]);
-                    total_calls += 1;
                     break :blk one;
                 };
                 for (batch, results) |tc, result| {
@@ -479,6 +482,16 @@ fn isAgentCall(tc: core_types.ToolCall) bool {
     return std.mem.eql(u8, tc.name, "agent");
 }
 
+fn batchKind(tc: core_types.ToolCall) enum { agent, read_only, sequential } {
+    if (isAgentCall(tc)) return .agent;
+    // Read-only tools never prompt, so a batch cannot reorder approvals;
+    // results are still appended in call order.
+    if (std.mem.eql(u8, tc.name, "read") or
+        std.mem.eql(u8, tc.name, "glob") or
+        std.mem.eql(u8, tc.name, "grep")) return .read_only;
+    return .sequential;
+}
+
 fn executeOne(p: RunParams, tc: core_types.ToolCall) tool_mod.ToolResult {
     // Per-call scratch arena (B-05): tool intermediates (file bodies, glob
     // lists) are freed before the next call; only the final output is copied
@@ -494,9 +507,9 @@ fn executeOne(p: RunParams, tc: core_types.ToolCall) tool_mod.ToolResult {
     };
 }
 
-/// Run consecutive agent calls on parallel threads, each with its own
-/// arena and ToolContext copy; results are ordered on return.
-fn runAgentBatch(p: RunParams, calls: []const core_types.ToolCall) ![]tool_mod.ToolResult {
+/// Run a parallel-safe batch (read/glob/grep or agent calls), each on its
+/// own arena and ToolContext copy; results are ordered on return.
+fn runParallelBatch(p: RunParams, calls: []const core_types.ToolCall) ![]tool_mod.ToolResult {
     const Slot = struct {
         thread: ?std.Thread = null,
         arena_state: ?std.heap.ArenaAllocator = null,
@@ -648,4 +661,67 @@ test "consecutive agent calls run in parallel and append in order" {
     const r2 = history.items[3].content;
     try std.testing.expect(std.mem.indexOf(u8, r1, "child-one") != null);
     try std.testing.expect(std.mem.indexOf(u8, r2, "child-two") != null);
+}
+
+test "read-only tool batch preserves call order" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "alpha\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "beta\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "c.txt", .data = "gamma\n" });
+
+    var fake = testing.Fake{ .script = &.{
+        &.{
+            .{ .tool_call = .{ .id = "r1", .name = "read", .arguments_json = "{\"path\":\"a.txt\"}" } },
+            .{ .tool_call = .{ .id = "r2", .name = "read", .arguments_json = "{\"path\":\"b.txt\"}" } },
+            .{ .tool_call = .{ .id = "r3", .name = "read", .arguments_json = "{\"path\":\"c.txt\"}" } },
+        },
+        &.{.{ .text = "read all three" }},
+    } };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var perm_engine = @import("../permissions/engine.zig").Engine.init(arena, .auto);
+    var cancel = std.atomic.Value(bool).init(false);
+    var tool_ctx: tool_mod.ToolContext = .{
+        .io = io,
+        .arena = arena,
+        .workspace = tmp.dir,
+        .engine = &perm_engine,
+        .journal = null,
+        .max_file_read_bytes = 64 * 1024,
+        .approval_ctx = undefined,
+        .approval_fn = undefined,
+        .agent_spawn_fn = undefined,
+        .agent_spawn_ctx = undefined,
+        .agent_depth = 0,
+        .agent_label = "parent",
+    };
+    var history: std.ArrayListUnmanaged(core_types.ChatMessage) = .empty;
+    try history.append(arena, .{ .role = .user, .content = "read three files" });
+
+    const outcome = try runTurn(.{
+        .io = io,
+        .arena = arena,
+        .pcfg = .{ .provider = fake.provider(), .model = "fake", .base_url = "", .api_key = "" },
+        .system = "",
+        .history = &history,
+        .tool_ctx = &tool_ctx,
+        .callbacks = .{
+            .ctx = undefined,
+            .on_text = noopText,
+            .on_tool_start = noopStart,
+            .on_tool_result = noopResult,
+            .on_notice = noopNotice,
+        },
+        .cancel = &cancel,
+    });
+
+    try std.testing.expectEqual(Status.completed, outcome.status);
+    try std.testing.expectEqual(@as(usize, 3), outcome.tool_calls);
+    try std.testing.expect(std.mem.indexOf(u8, history.items[2].content, "alpha") != null);
+    try std.testing.expect(std.mem.indexOf(u8, history.items[3].content, "beta") != null);
+    try std.testing.expect(std.mem.indexOf(u8, history.items[4].content, "gamma") != null);
 }
