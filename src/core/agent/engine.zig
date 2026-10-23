@@ -202,6 +202,11 @@ pub fn runTurn(p: RunParams) !Outcome {
         total_usage.input_tokens += collector.usage.input_tokens;
         total_usage.output_tokens += collector.usage.output_tokens;
 
+        // Keep the text streamed before a failure so the caller can show (and
+        // roll back) a partial reply instead of losing it.
+        const reply = collector.text.items;
+        last_reply = reply;
+
         if (collector.failure) |f| {
             return .{
                 .status = .failed,
@@ -212,9 +217,6 @@ pub fn runTurn(p: RunParams) !Outcome {
                 .error_message = f.message,
             };
         }
-
-        const reply = collector.text.items;
-        last_reply = reply;
 
         if (collector.tool_calls.items.len == 0) {
             try p.history.append(p.arena, .{ .role = .assistant, .content = reply });
@@ -659,11 +661,31 @@ test "partial stream failure is not retried" {
     try history.append(arena, .{ .role = .user, .content = "hi" });
     var cancel = std.atomic.Value(bool).init(false);
 
+    // The scripted stream fails before any tool call, so the context is only
+    // needed to satisfy `RunParams`; the approval hook denies by default.
+    var perm_engine = @import("../permissions/engine.zig").Engine.init(arena, .auto);
+    var tool_ctx: tool_mod.ToolContext = .{
+        .io = std.testing.io,
+        .arena = arena,
+        .workspace = std.Io.Dir.cwd(),
+        .engine = &perm_engine,
+        .journal = null,
+        .max_file_read_bytes = 64 * 1024,
+        .approval_ctx = undefined,
+        .approval_fn = struct {
+            fn approve(_: *anyopaque, _: tool_mod.ApprovalRequest) tool_mod.ApprovalResponse {
+                return .denied;
+            }
+        }.approve,
+    };
+
     const outcome = try runTurn(.{
         .arena = arena,
         .io = std.testing.io,
         .pcfg = .{ .provider = fake.provider(), .model = "fake", .base_url = "", .api_key = "" },
+        .system = "",
         .history = &history,
+        .tool_ctx = &tool_ctx,
         .cancel = &cancel,
         .callbacks = .{
             .ctx = undefined,

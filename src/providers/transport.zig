@@ -34,7 +34,7 @@ pub fn openConnection(
     const host = try uri.getHost(&host_buffer);
     const protocol = std.http.Client.Protocol.fromUri(uri) orelse
         return error.UnsupportedUriScheme;
-    const port = uri.port orelse switch (protocol) {
+    const port: u16 = uri.port orelse switch (protocol) {
         .plain => 80,
         .tls => 443,
     };
@@ -259,7 +259,7 @@ fn daysFromCivil(year: i64, month: u32, day: u32) i64 {
     const era = @divFloor(y, 400);
     const yoe = y - era * 400; // [0, 399]
     const mp = (month + 9) % 12; // March = 0
-    const doy = (153 * @as(i64, mp) + 2) / 5 + @as(i64, day) - 1;
+    const doy = @divFloor(153 * @as(i64, mp) + 2, 5) + @as(i64, day) - 1;
     const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
     return era * 146_097 + doe - 719_468;
 }
