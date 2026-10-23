@@ -95,6 +95,45 @@ Custom commands: drop a Markdown file into `.ifnh/commands/<name>.md`
 (optional `---` frontmatter); `$ARGS` in the body is replaced by what you
 type after the command.
 
+### Headless scripting (`ifnh ask`)
+
+`ifnh ask "<prompt>"` and `ifnh -p "<prompt>"` run exactly one turn against
+the configured provider and tools, with no TUI, then exit. With no prompt
+argument the prompt is read from piped stdin.
+
+```bash
+ifnh ask "explain src/core/journal.zig"
+ifnh -p "summarize AGENTS.md" --json
+echo "list the failing tests" | ifnh ask
+ifnh ask --yes "fix the failing test and run the suite"
+ifnh ask --deny-all --policy .ifnh/headless-policy.json "..."
+```
+
+`--json` writes NDJSON to stdout, one JSON object per line: `text` (a
+streaming delta), `tool_call`, `tool_result`, `notice`, `usage`, and a
+final `done` carrying `ok`, `status`, the final assistant text, and any
+error. Headless output never contains ANSI escapes.
+
+Approval policy:
+
+- `--deny-all` denies every approval request. This is the default for
+  non-interactive runs.
+- `--yes` auto-approves everything the permission classifier asks about.
+- `--policy <path>` loads a permissions policy for this run only. The file
+  has the same shape as the config `permissions` block (or nests it under
+  `"permissions"`): `default_mode`, `read`, `write`, `command_allow`,
+  `command_deny`, `env_allow`, `mcp_allow`, `mcp_deny`.
+
+Exit codes:
+
+| Code | Meaning |
+|---|---|
+| `0` | turn completed and no tool was denied |
+| `1` | turn failed (hook blocked, cancelled, internal error) |
+| `2` | bad arguments, unreadable/invalid policy, or empty prompt |
+| `3` | provider/transport error |
+| `4` | a tool approval was denied (also when the turn then completes) |
+
 ## 4. Configuration
 
 Precedence (low to high): **built-in defaults < user < project < session <

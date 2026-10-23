@@ -15,6 +15,7 @@ const engine_mod = @import("../core/permissions/engine.zig");
 const instructions_mod = @import("../core/instructions.zig");
 const system_prompt = @import("../core/agent/system_prompt.zig");
 const agent_engine = @import("../core/agent/engine.zig");
+const session_runtime = @import("../core/agent/session_runtime.zig");
 const subagent_mod = @import("../core/agent/subagent.zig");
 const git_mod = @import("../core/git.zig");
 const mcp_mod = @import("../core/mcp.zig");
@@ -265,80 +266,9 @@ fn submitTurn(
         try out(io, "no model configured — run /provider set <openai|anthropic> <model> [base_url] [key_env]\n", .{});
         return;
     }
-    if (pcfg.api_key.len == 0) {
-        const key_env = cfg.getOptionalString("model.api_key_env") orelse "OPENAI_API_KEY";
-        try out(io, "note: no api key — run /provider key {s} <value> (or export it) before sending a message\n", .{key_env});
-    }
-
-    _ = try sess.store.append(.{ .user = .{ .text = user_text } });
-    try sess.history.append(arena, .{ .role = .user, .content = user_text });
 
     var cancel = std.atomic.Value(bool).init(false);
     var approver = Approver{ .io = io, .engine = &sess.engine };
-    var host = subagent_mod.Host{
-        .io = io,
-        .workspace = cwd,
-        .base_system = system,
-        .provider = pcfg.provider,
-        .base_url = pcfg.base_url,
-        .api_key = pcfg.api_key,
-        .default_model = pcfg.model,
-        .mode = sess.engine.mode,
-        .read_globs = sess.engine.read_globs,
-        .write_globs = sess.engine.write_globs,
-        .command_allow = sess.engine.command_allow,
-        .command_deny = sess.engine.command_deny,
-        .env_allow = sess.engine.env_allow,
-        .journal = &sess.journal,
-        .approval_ctx = &approver,
-        .approval_fn = Approver.approve,
-        .max_depth = cfg.getU32("agents.max_depth", 1),
-        .max_concurrent = cfg.getU32("agents.max_concurrent", 4),
-        .max_rounds = 25,
-        .redactions = redactionsFor(arena, pcfg.api_key),
-        .temperature = cfg.getOptionalF64("model.temperature"),
-        .max_output_tokens = cfg.getOptionalU32("model.max_output_tokens"),
-        .cancel = &cancel,
-        .git = blk: {
-            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-            const n = cwd.realPath(io, &path_buf) catch break :blk null;
-            const repo_path = arena.dupe(u8, path_buf[0..n]) catch break :blk null;
-            const g = git_mod.Git.init(io, repo_path);
-            if (!g.isRepo(arena)) break :blk null;
-            break :blk g;
-        },
-        .worktree_root = blk: {
-            const home = environ.get("HOME") orelse break :blk null;
-            const root = std.fmt.allocPrint(arena, "{s}/.local/state/ifnh/worktrees", .{home}) catch break :blk null;
-            std.Io.Dir.cwd().createDirPath(io, root) catch {};
-            break :blk root;
-        },
-        .session_hint = sess.store.manifest.id,
-    };
-    var tool_ctx = tool_mod.ToolContext{
-        .io = io,
-        .arena = arena,
-        .workspace = cwd,
-        .engine = &sess.engine,
-        .journal = &sess.journal,
-        .max_file_read_bytes = cfg.getU32("context.max_file_read_bytes", 262144),
-        .approval_ctx = &approver,
-        .approval_fn = Approver.approve,
-        .agent_spawn_fn = subagent_mod.spawnHookFn,
-        .agent_spawn_ctx = &host,
-        .agent_depth = 0,
-        .agent_label = "parent",
-        .mcp_list_fn = mcpListHook,
-        .mcp_call_fn = mcpCallHook,
-        .mcp_ctx = sess.mcp_registry orelse mcp_registry_sentinel,
-        .skill_load_fn = skillLoadHook,
-        .skill_ctx = sess,
-        .exec_start_fn = execStartHook,
-        .exec_query_fn = execQueryHook,
-        .exec_ctx = sess,
-    };
-    tool_ctx.approval_ctx = &approver;
-    tool_ctx.approval_fn = Approver.approve;
 
     const TurnUi = struct {
         io: std.Io,
@@ -369,46 +299,29 @@ fn submitTurn(
             const self: *@This() = @ptrCast(@alignCast(ctx));
             out(self.io, "! {s}\n", .{text}) catch {};
         }
+        fn onStatus(ctx: *anyopaque, text: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            out(self.io, "{s}\n", .{text}) catch {};
+        }
     };
     var ui = TurnUi{ .io = io };
 
-    var hook_engine = hooks_mod.Engine.init(io, cwd, try hooks_mod.Engine.fromConfig(arena, cfg.get("hooks")), arena);
-    const pre = hook_engine.dispatch(.before_agent, "{}");
-    if (pre.blocked) {
-        try out(io, "before_agent hook blocked the turn: {s}\n", .{pre.output});
-        return;
-    }
-
-    // ---- automatic context compaction (C36, PLAN §24) ----
-    if (cfg.getBool("context.auto_compact", true)) {
-        const threshold: usize = cfg.getU32("context.max_context_tokens", 96_000);
-        const plan = compaction_mod.planCompaction(sess.history.items, threshold, cfg.getF64("context.compact_at_fraction", 0.8));
-        if (plan.should_compact) {
-            try out(io, "[compacting context... {d} tokens]\n", .{plan.estimated_tokens});
-            const res_opt: ?compaction_mod.Result = blk: {
-                break :blk compaction_mod.compact(arena, io, pcfg, &sess.history, redactionsFor(arena, pcfg.api_key)) catch |err| {
-                    try out(io, "[compaction failed: {s}; continuing with full context]\n", .{@errorName(err)});
-                    break :blk null;
-                };
-            };
-            if (res_opt) |res| {
-                sess.history.clearRetainingCapacity();
-                try sess.history.appendSlice(arena, res.history);
-                _ = try sess.store.append(.{ .note = .{
-                    .text = try std.fmt.allocPrint(arena, "context compacted: {d} -> {d} tokens", .{ res.tokens_before, res.tokens_after }),
-                } });
-                try out(io, "[context compacted: {d} -> {d} tokens]\n", .{ res.tokens_before, res.tokens_after });
-            }
-        }
-    }
-
-    const outcome = agent_engine.runTurn(.{
+    var runtime = session_runtime.Runtime{
         .io = io,
         .arena = arena,
+        .cwd = cwd,
+        .cfg = cfg,
         .pcfg = pcfg,
         .system = system,
         .history = &sess.history,
-        .tool_ctx = &tool_ctx,
+        .engine = &sess.engine,
+        .journal = &sess.journal,
+        .store = &sess.store,
+        .mcp_registry = sess.mcp_registry,
+        .skills = sess.skills,
+        .executions = sess.executions,
+        .session_id = sess.store.manifest.id,
+        .environ = environ,
         .callbacks = .{
             .ctx = &ui,
             .on_text = TurnUi.onText,
@@ -416,53 +329,31 @@ fn submitTurn(
             .on_tool_result = TurnUi.onToolResult,
             .on_notice = TurnUi.onNotice,
         },
+        .approval = .{ .ctx = &approver, .approve_fn = Approver.approve },
         .cancel = &cancel,
-        .include_tools = cfg.getBool("model.tools_enabled", true),
-        .max_retries = cfg.getU32("agents.max_retries", 3),
-        .redactions = redactionsFor(arena, pcfg.api_key),
-    }) catch |err| {
-        try out(io, "\nturn failed: {s}\n", .{@errorName(err)});
-        return;
+        .notice = .{ .ctx = &ui, .notify_fn = TurnUi.onStatus },
     };
+    const result = runtime.submit(user_text);
 
-    _ = hook_engine.dispatch(.after_agent, "{}");
+    if (result.hook_blocked) return;
+    if (std.mem.startsWith(u8, result.error_message, "turn failed:")) {
+        try out(io, "\n{s}\n", .{result.error_message});
+        return;
+    }
     try out(io, "\n", .{});
-    switch (outcome.status) {
-        .completed => {
-            _ = try sess.store.append(.{ .assistant = .{ .text = outcome.reply } });
-        },
+    switch (result.status) {
+        .completed => {},
         .failed => {
-            try out(io, "{s}provider error: {s}{s}\n", .{ palette.err("", arena), outcome.error_message, "\x1b[0m" });
-            if (@import("../providers/probe.zig").looksLikeToolRejection(outcome.error_message)) {
+            try out(io, "{s}provider error: {s}{s}\n", .{ palette.err("", arena), result.error_message, "\x1b[0m" });
+            if (@import("../providers/probe.zig").looksLikeToolRejection(result.error_message)) {
                 try out(io, "{s}hint: this model may not support tool calling. Set it up as chat-only with /provider tools off{s}\n", .{ palette.warn("", arena), "\x1b[0m" });
             }
-            _ = try sess.store.append(.{ .note = .{ .text = outcome.error_message } });
         },
-        .cancelled => {
-            try out(io, "(interrupted)\n", .{});
-            _ = try sess.store.append(.interrupted);
-        },
+        .cancelled => try out(io, "(interrupted)\n", .{}),
     }
-    if (outcome.usage.input_tokens > 0 or outcome.usage.output_tokens > 0) {
-        try out(io, "[tokens: {d} in / {d} out, {d} tool calls]\n", .{ outcome.usage.input_tokens, outcome.usage.output_tokens, outcome.tool_calls });
-        // Session usage log (S254-258).
-        const usage_line = try std.fmt.allocPrint(arena, "{{\"ts_ms\":{d},\"input_tokens\":{d},\"output_tokens\":{d},\"tool_calls\":{d}}}\n", .{
-            @as(i64, @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms))),
-            outcome.usage.input_tokens,
-            outcome.usage.output_tokens,
-            outcome.tool_calls,
-        });
-        var usage_buf: [256]u8 = undefined;
-        @memcpy(usage_buf[0..usage_line.len], usage_line);
-        const f = sess.store.dir.createFile(io, "usage.jsonl", .{ .truncate = false }) catch null;
-        if (f) |file| {
-            defer file.close(io);
-            const st = file.stat(io) catch null;
-            const off: u64 = if (st) |s| s.size else 0;
-            file.writePositionalAll(io, usage_line, off) catch {};
-        }
+    if (result.usage.input_tokens > 0 or result.usage.output_tokens > 0) {
+        try out(io, "[tokens: {d} in / {d} out, {d} tool calls]\n", .{ result.usage.input_tokens, result.usage.output_tokens, result.tool_calls });
     }
-    try sess.store.syncWatermark();
 }
 
 const Approver = struct {
@@ -619,49 +510,6 @@ fn mcpListHook(ctx: *anyopaque, arena: std.mem.Allocator) []const u8 {
     return buf.items;
 }
 
-fn execStartHook(ctx: *anyopaque, arena: std.mem.Allocator, command: []const u8) []const u8 {
-    const sess: *Session = @ptrCast(@alignCast(ctx));
-    const reg = sess.executions orelse return "error: background executions unavailable";
-    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
-    argv.append(arena, "/bin/sh") catch return "error: oom";
-    argv.append(arena, "-c") catch return "error: oom";
-    argv.append(arena, command) catch return "error: oom";
-    const id = reg.start(argv.items) catch |err| {
-        return std.fmt.allocPrint(arena, "error: start failed: {s}", .{@errorName(err)}) catch "error: start failed";
-    };
-    return std.fmt.allocPrint(arena, "started background execution {d}; poll with exec action=status id={d}, output with action=output", .{ id, id }) catch "started";
-}
-
-fn execQueryHook(ctx: *anyopaque, arena: std.mem.Allocator, action: []const u8, id_str: []const u8) []const u8 {
-    const sess: *Session = @ptrCast(@alignCast(ctx));
-    const reg = sess.executions orelse return "error: background executions unavailable";
-    const id = std.fmt.parseInt(u32, id_str, 10) catch {
-        if (std.mem.eql(u8, action, "list")) {
-            var buf: std.ArrayListUnmanaged(u8) = .empty;
-            for (&reg.slots) |*s| {
-                if (!s.used) continue;
-                buf.print(arena, "  exec {d}: {s}\n", .{ s.id, s.command[0..s.command_len] }) catch {};
-            }
-            if (buf.items.len == 0) return "no background executions";
-            return buf.items;
-        }
-        return "error: exec requires numeric id";
-    };
-    if (std.mem.eql(u8, action, "status")) {
-        const snap = reg.snapshot(id) orelse return "error: unknown execution id";
-        return std.fmt.allocPrint(arena, "exec {d}: {s} (exit: {any}), {d} bytes output in {s}", .{
-            snap.id, @tagName(snap.state), snap.exit_code, snap.output_bytes, snap.output_file,
-        }) catch "error: oom";
-    }
-    if (std.mem.eql(u8, action, "output")) {
-        return reg.readOutput(id, arena, 32 * 1024) orelse "error: no output available";
-    }
-    if (std.mem.eql(u8, action, "stop")) {
-        return if (reg.stop(id)) "stopped" else "error: unknown execution id";
-    }
-    return "error: unknown action (status|output|stop|list)";
-}
-
 fn u8ToStateLocal(v: u8) executions_mod.State {
     return switch (v) {
         1 => .completed,
@@ -669,32 +517,6 @@ fn u8ToStateLocal(v: u8) executions_mod.State {
         3 => .failed_spawn,
         else => .running,
     };
-}
-
-fn skillLoadHook(ctx: *anyopaque, arena: std.mem.Allocator, name: []const u8) ?[]const u8 {
-    const sess: *Session = @ptrCast(@alignCast(ctx));
-    const catalog = sess.skills orelse return null;
-    const cwd = std.Io.Dir.cwd();
-    return skills_mod.loadSkill(cwd, sess.io, arena, catalog, name) catch null;
-}
-
-fn mcpCallHook(ctx: *anyopaque, arena: std.mem.Allocator, server: []const u8, tool: []const u8, arguments_json: []const u8) []const u8 {
-    const reg: *mcp_mod.Registry = @ptrCast(@alignCast(ctx));
-    if (reg == mcp_registry_sentinel) return "error: MCP not configured";
-    const res = reg.call(arena, server, tool, arguments_json) catch |err| {
-        return std.fmt.allocPrint(arena, "error: mcp call failed: {s}", .{@errorName(err)}) catch "error: mcp call failed";
-    };
-    if (res.is_error) {
-        return std.fmt.allocPrint(arena, "mcp error: {s}", .{res.text}) catch res.text;
-    }
-    return res.text;
-}
-
-fn redactionsFor(arena: std.mem.Allocator, api_key: []const u8) []const []const u8 {
-    if (api_key.len < 8) return &.{};
-    var list: std.ArrayListUnmanaged([]const u8) = .empty;
-    list.append(arena, api_key) catch return &.{};
-    return list.items;
 }
 
 /// Persist provider settings into .ifnh/config.json (developer action,
