@@ -20,6 +20,8 @@ pub const ProviderConfig = struct {
     model: []const u8,
     base_url: []const u8,
     api_key: []const u8,
+    /// Session-scoped HTTP client (B-02); null creates one per request.
+    http_client: ?*std.http.Client = null,
 };
 
 pub const Callbacks = struct {
@@ -178,6 +180,7 @@ pub fn runTurn(p: RunParams) !Outcome {
                 .model = p.pcfg.model,
                 .base_url = p.pcfg.base_url,
                 .api_key = p.pcfg.api_key,
+                .http_client = p.pcfg.http_client,
                 .system = p.system,
                 .messages = p.history.items,
                 .tools_json = tools_json,

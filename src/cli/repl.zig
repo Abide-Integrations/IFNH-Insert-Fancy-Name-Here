@@ -56,6 +56,10 @@ const Session = struct {
     last_blocked_stage: ?[]const u8 = null,
     /// Persistent key store (user env file) for /provider key.
     user_keys: ?*keys_mod.Keys = null,
+    /// Session-scoped HTTP client (B-02): one TLS/keep-alive pool for every
+    /// provider request in this session. Uses a thread-safe allocator because
+    /// the connection pool may be touched from subagent threads.
+    http_client: ?*std.http.Client = null,
 };
 
 var global_user_keys: keys_mod.Keys = undefined;
@@ -140,6 +144,18 @@ pub fn run(
         }
     };
     sess.user_keys = &global_user_keys;
+
+    // ---- one HTTP client per session (B-02) ----
+    // std.http.Client is safe to keep for the session (its connection pool is
+    // mutex-protected); individual Request values remain single-threaded.
+    // page_allocator is thread-safe, unlike the REPL arena.
+    const http_client = arena.create(std.http.Client) catch null;
+    if (http_client) |c| {
+        c.* = .{ .allocator = std.heap.page_allocator, .io = io };
+        sess.http_client = c;
+    }
+    defer if (http_client) |c| c.deinit();
+
     defer {
         if (sess.executions) |reg| reg.deinit(); // kill background children (I125)
         if (sess.mcp_registry) |reg| reg.deinit();
@@ -275,11 +291,14 @@ fn submitTurn(
     user_text: []const u8,
     cwd: std.Io.Dir,
 ) !void {
-    if (pcfg.model.len == 0) {
+    var pcfg_eff = pcfg;
+    pcfg_eff.http_client = sess.http_client;
+
+    if (pcfg_eff.model.len == 0) {
         try out(io, "no model configured — run /provider set <openai|anthropic> <model> [base_url] [key_env]\n", .{});
         return;
     }
-    if (pcfg.api_key.len == 0) {
+    if (pcfg_eff.api_key.len == 0) {
         const key_env = cfg.getOptionalString("model.api_key_env") orelse "OPENAI_API_KEY";
         try out(io, "note: no api key — run /provider key {s} <value> (or export it) before sending a message\n", .{key_env});
     }
@@ -293,10 +312,11 @@ fn submitTurn(
         .io = io,
         .workspace = cwd,
         .base_system = system,
-        .provider = pcfg.provider,
-        .base_url = pcfg.base_url,
-        .api_key = pcfg.api_key,
-        .default_model = pcfg.model,
+        .provider = pcfg_eff.provider,
+        .base_url = pcfg_eff.base_url,
+        .api_key = pcfg_eff.api_key,
+        .http_client = pcfg_eff.http_client,
+        .default_model = pcfg_eff.model,
         .mode = sess.engine.mode,
         .read_globs = sess.engine.read_globs,
         .write_globs = sess.engine.write_globs,
@@ -309,7 +329,7 @@ fn submitTurn(
         .max_depth = cfg.getU32("agents.max_depth", 1),
         .max_concurrent = cfg.getU32("agents.max_concurrent", 4),
         .max_rounds = 25,
-        .redactions = redactionsFor(arena, pcfg.api_key),
+        .redactions = redactionsFor(arena, pcfg_eff.api_key),
         .temperature = cfg.getOptionalF64("model.temperature"),
         .max_output_tokens = cfg.getOptionalU32("model.max_output_tokens"),
         .cancel = &cancel,
@@ -402,7 +422,7 @@ fn submitTurn(
         if (plan.should_compact) {
             try out(io, "[compacting context... {d} tokens]\n", .{plan.estimated_tokens});
             const res_opt: ?compaction_mod.Result = blk: {
-                break :blk compaction_mod.compact(arena, io, pcfg, &sess.history, redactionsFor(arena, pcfg.api_key)) catch |err| {
+                break :blk compaction_mod.compact(arena, io, pcfg_eff, &sess.history, redactionsFor(arena, pcfg_eff.api_key)) catch |err| {
                     try out(io, "[compaction failed: {s}; continuing with full context]\n", .{@errorName(err)});
                     break :blk null;
                 };
@@ -421,7 +441,7 @@ fn submitTurn(
     const outcome = agent_engine.runTurn(.{
         .io = io,
         .arena = arena,
-        .pcfg = pcfg,
+        .pcfg = pcfg_eff,
         .system = system,
         .history = &sess.history,
         .tool_ctx = &tool_ctx,
@@ -435,7 +455,7 @@ fn submitTurn(
         .cancel = &cancel,
         .include_tools = cfg.getBool("model.tools_enabled", true),
         .max_retries = cfg.getU32("agents.max_retries", 3),
-        .redactions = redactionsFor(arena, pcfg.api_key),
+        .redactions = redactionsFor(arena, pcfg_eff.api_key),
     }) catch |err| {
         try out(io, "\nturn failed: {s}\n", .{@errorName(err)});
         return;
@@ -868,9 +888,13 @@ fn runFirstRunSetup(
         }
     }
 
+    // Live model list + capability probe share one client (B-02).
+    var setup_client: std.http.Client = .{ .allocator = std.heap.page_allocator, .io = io };
+    defer setup_client.deinit();
+
     // Live model list; typed fallback when unavailable.
     var model_name: []const u8 = preset.default_model;
-    const models_res = models_mod.fetchModels(arena, io, base_url, key_value, std.mem.eql(u8, preset.id, "anthropic"));
+    const models_res = models_mod.fetchModels(arena, io, &setup_client, base_url, key_value, std.mem.eql(u8, preset.id, "anthropic"));
     switch (models_res) {
         .models => |list| {
             try out(io, "{s}({d} models available — enter a number, or type a model id){s}\n", .{
@@ -917,7 +941,7 @@ fn runFirstRunSetup(
     var context_window: ?u64 = null;
     {
         try out(io, "testing tool support ({s})... ", .{model_name});
-        const probe = @import("../providers/probe.zig").probeToolSupport(arena, io, if (std.mem.eql(u8, preset.id, "anthropic")) anthropic.instance else openai.instance, base_url, key_value, model_name);
+        const probe = @import("../providers/probe.zig").probeToolSupport(arena, io, if (std.mem.eql(u8, preset.id, "anthropic")) anthropic.instance else openai.instance, base_url, key_value, model_name, &setup_client);
         switch (probe) {
             .supported => {
                 try out(io, "{s}ok — tool calling works{s}\n", .{ palette.success("", arena), "\x1b[0m" });
@@ -1181,6 +1205,7 @@ fn handleCommand(
             .provider = buildProviderConfig(cfg, environ).provider,
             .base_url = buildProviderConfig(cfg, environ).base_url,
             .api_key = buildProviderConfig(cfg, environ).api_key,
+            .http_client = sess.http_client,
             .default_model = buildProviderConfig(cfg, environ).model,
             .mode = sess.engine.mode,
             .read_globs = sess.engine.read_globs,
@@ -1422,7 +1447,8 @@ fn handleCommand(
         }
         out(io, "session usage: {d} turns, {d} tokens in, {d} tokens out\n", .{ turns, total_in, total_out }) catch {};
     } else if (std.mem.eql(u8, cmd, "compact")) {
-        const pcfg2 = buildProviderConfig(cfg, environ);
+        var pcfg2 = buildProviderConfig(cfg, environ);
+        pcfg2.http_client = sess.http_client;
         out(io, "[compacting context...]\n", .{}) catch {};
         const res_opt: ?compaction_mod.Result = blk: {
             break :blk compaction_mod.compact(arena, io, pcfg2, &sess.history, &.{}) catch |err| {

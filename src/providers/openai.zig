@@ -39,8 +39,12 @@ pub fn streamFn(
     const body = try buildBody(arena, req);
     _ = trace.end(io, build_span);
 
-    var client: std.http.Client = .{ .allocator = alloc, .io = io };
-    defer client.deinit();
+    var local_client: std.http.Client = undefined;
+    const client = if (req.http_client) |c| c else blk: {
+        local_client = .{ .allocator = alloc, .io = io };
+        break :blk &local_client;
+    };
+    defer if (req.http_client == null) local_client.deinit();
 
     var extra = [_]std.http.Header{
         .{ .name = "accept", .value = "text/event-stream" },

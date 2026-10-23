@@ -26,6 +26,7 @@ pub const Result = union(enum) {
 pub fn fetchModels(
     arena: std.mem.Allocator,
     io: std.Io,
+    client_opt: ?*std.http.Client,
     base_url: []const u8,
     api_key: []const u8,
     is_anthropic: bool,
@@ -34,8 +35,12 @@ pub fn fetchModels(
     const uri = std.Uri.parse(url) catch
         return .{ .failure = "invalid base URL" };
 
-    var client: std.http.Client = .{ .allocator = arena, .io = io };
-    defer client.deinit();
+    var local_client: std.http.Client = undefined;
+    const client = if (client_opt) |c| c else blk: {
+        local_client = .{ .allocator = arena, .io = io };
+        break :blk &local_client;
+    };
+    defer if (client_opt == null) local_client.deinit();
 
     var extra: [2]std.http.Header = undefined;
     var extra_len: usize = 0;

@@ -27,6 +27,15 @@ pub const ModelRequest = struct {
     model: []const u8,
     base_url: []const u8,
     api_key: []const u8,
+    /// Session-scoped HTTP client, owned by the caller (the REPL session or
+    /// wizard). Adapters reuse its keep-alive pool. Null keeps the old
+    /// one-client-per-request behaviour for tests and standalone probes.
+    ///
+    /// Lifetime constraint (Zig 0.16): the client must outlive every request
+    /// and must use a thread-safe allocator. Its connection pool is
+    /// thread-safe, but individual `std.http.Request` values are not, so
+    /// concurrent users need one request each.
+    http_client: ?*std.http.Client = null,
     system: []const u8,
     messages: []const core_types.ChatMessage,
     /// Tool schemas as a JSON array string (already rendered).

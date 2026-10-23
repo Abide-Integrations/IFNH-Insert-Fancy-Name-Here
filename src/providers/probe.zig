@@ -59,6 +59,7 @@ pub fn probeToolSupport(
     base_url: []const u8,
     api_key: []const u8,
     model: []const u8,
+    http_client: ?*std.http.Client,
 ) ProbeResult {
     var collector = Collector{ .arena = arena };
     var cancel = std.atomic.Value(bool).init(false);
@@ -71,6 +72,7 @@ pub fn probeToolSupport(
         .model = model,
         .base_url = base_url,
         .api_key = api_key,
+        .http_client = http_client,
         .system = probe_system,
         .messages = msgs[0..],
         .tools_json = probe_tools_json,

@@ -41,6 +41,8 @@ pub const Host = struct {
     provider: provider_mod.Provider,
     base_url: []const u8,
     api_key: []const u8,
+    /// Session-scoped HTTP client shared with the parent (B-02).
+    http_client: ?*std.http.Client = null,
     default_model: []const u8,
     // Parent permission snapshot (borrowed slices, stable for the session).
     mode: engine_mod.Mode,
@@ -242,6 +244,7 @@ fn runChild(
             .model = model orelse host.default_model,
             .base_url = host.base_url,
             .api_key = host.api_key,
+            .http_client = host.http_client,
         },
         .system = system,
         .history = &history,

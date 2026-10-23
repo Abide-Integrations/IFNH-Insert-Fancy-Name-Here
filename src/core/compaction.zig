@@ -115,6 +115,7 @@ pub fn compact(
         .model = pcfg.model,
         .base_url = pcfg.base_url,
         .api_key = pcfg.api_key,
+        .http_client = pcfg.http_client,
         .system = compaction_instructions,
         .messages = msgs[0..],
         .cancel = &cancel,
