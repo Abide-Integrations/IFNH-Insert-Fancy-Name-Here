@@ -39,6 +39,9 @@ const protected_paths = [_][]const u8{
     ".ifnh/instructions/",
     ".ifnh/commands/",
     ".ifnh/skills/",
+    // Data-defined tools are executable policy (ADR-0004): like config,
+    // an agent must never author a tool that runs without approval later.
+    ".ifnh/tools/",
     "AGENTS.md",
     "CLAUDE.md",
 };
