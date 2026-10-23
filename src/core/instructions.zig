@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const fsutil = @import("fsutil.zig");
+const system_prompt = @import("agent/system_prompt.zig");
 
 pub const max_instruction_bytes: usize = 128 * 1024;
 
@@ -190,4 +191,36 @@ test "focus dirs pull in nested AGENTS.md" {
     const asm2 = try assemble(tmp.dir, io, arena_state.allocator(), "builtin", &.{"src/core"});
     try std.testing.expect(std.mem.indexOf(u8, asm2.text, "core rules") != null);
     try std.testing.expectEqual(@as(usize, 2), asm2.sources.len);
+}
+
+test "stable system prefix survives a simulated turn with focus dirs" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = "repo rules" });
+    try tmp.dir.createDirPath(io, "src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/AGENTS.md", .data = "src rules" });
+    try tmp.dir.createDirPath(io, "tests");
+    try tmp.dir.writeFile(io, .{ .sub_path = "tests/AGENTS.md", .data = "test rules" });
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // Session start: base prompt + repo/project instructions, no focus dirs.
+    const stable = try assemble(tmp.dir, io, a, "builtin prompt", &.{});
+
+    // Turn 1 and turn 2 focus different directories; only the suffix moves.
+    const turn1 = try assemble(tmp.dir, io, a, "builtin prompt", &.{"src"});
+    const turn2 = try assemble(tmp.dir, io, a, "builtin prompt", &.{"tests"});
+    try std.testing.expect(std.mem.startsWith(u8, turn1.text, stable.text));
+    try std.testing.expect(std.mem.startsWith(u8, turn2.text, stable.text));
+
+    const sys1 = try system_prompt.compose(a, stable.text, turn1.text[stable.text.len..]);
+    const sys2 = try system_prompt.compose(a, stable.text, turn2.text[stable.text.len..]);
+    try std.testing.expectEqual(stable.text.len, sys1.stable_len);
+    try std.testing.expectEqual(stable.text.len, sys2.stable_len);
+    try std.testing.expectEqualStrings(sys1.text[0..sys1.stable_len], sys2.text[0..sys2.stable_len]);
+    try std.testing.expect(std.mem.indexOf(u8, sys1.text[sys1.stable_len..], "src rules") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sys2.text[sys2.stable_len..], "test rules") != null);
 }

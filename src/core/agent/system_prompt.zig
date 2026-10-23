@@ -2,6 +2,25 @@
 //! rules. Project/user instructions are appended after this by the
 //! assembler (PLAN §62-64, D037, D044).
 
+const std = @import("std");
+
+pub const Composed = struct {
+    text: []const u8,
+    /// Byte length of the stable prefix; the provider marks it as cacheable.
+    stable_len: usize,
+};
+
+/// Join a byte-stable prefix with per-turn volatile sections. `volatile_text`
+/// must already include its own separator (the assembler emits a leading
+/// blank line); the prefix is copied byte-for-byte so it can be cached.
+pub fn compose(arena: std.mem.Allocator, stable: []const u8, volatile_text: []const u8) !Composed {
+    if (volatile_text.len == 0) return .{ .text = stable, .stable_len = stable.len };
+    return .{
+        .text = try std.fmt.allocPrint(arena, "{s}{s}", .{ stable, volatile_text }),
+        .stable_len = stable.len,
+    };
+}
+
 pub const system_prompt =
     \\You are IFNH, a lightweight agentic coding harness operating inside the
     \\user's repository. You help the developer understand, plan, and modify
@@ -44,3 +63,18 @@ pub const system_prompt =
     \\  results with `read` offsets instead of guessing.
     \\
 ;
+
+test "compose keeps the stable prefix byte-identical across volatile turns" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const stable = "base prompt + tool list + static instructions";
+    const first = try compose(a, stable, "\n\nfocus: src");
+    const second = try compose(a, stable, "\n\nfocus: tests");
+    try std.testing.expectEqual(stable.len, first.stable_len);
+    try std.testing.expectEqual(stable.len, second.stable_len);
+    try std.testing.expectEqualStrings(stable, first.text[0..first.stable_len]);
+    try std.testing.expectEqualStrings(stable, second.text[0..second.stable_len]);
+    try std.testing.expect(!std.mem.eql(u8, first.text, second.text));
+}

@@ -216,8 +216,24 @@ fn buildBody(arena: std.mem.Allocator, req: provider.ModelRequest) ![]u8 {
     try w.print(",\"max_tokens\":{d},\"stream\":true", .{req.max_output_tokens orelse 4096});
 
     if (req.system.len > 0) {
-        try w.writeAll(",\"system\":");
-        try std.json.Stringify.value(req.system, .{}, w);
+        const stable_len = @min(req.system_cache_prefix_len, req.system.len);
+        if (stable_len == 0) {
+            try w.writeAll(",\"system\":");
+            try std.json.Stringify.value(req.system, .{}, w);
+        } else {
+            // Cache breakpoint after the byte-stable prefix (B-03). Tool
+            // definitions precede the system blocks in Anthropic's cache
+            // prefix, so tools are covered by the same breakpoint.
+            try w.writeAll(",\"system\":[{\"type\":\"text\",\"text\":");
+            try std.json.Stringify.value(req.system[0..stable_len], .{}, w);
+            try w.writeAll(",\"cache_control\":{\"type\":\"ephemeral\"}}");
+            if (stable_len < req.system.len) {
+                try w.writeAll(",{\"type\":\"text\",\"text\":");
+                try std.json.Stringify.value(req.system[stable_len..], .{}, w);
+                try w.writeByte('}');
+            }
+            try w.writeByte(']');
+        }
     }
 
     try w.writeAll(",\"messages\":[");
@@ -289,6 +305,33 @@ fn buildBody(arena: std.mem.Allocator, req: provider.ModelRequest) ![]u8 {
 fn strOrEmpty(v: ?std.json.Value) []const u8 {
     const val = v orelse return "";
     return if (val == .string) val.string else "";
+}
+
+test "golden body: prompt cache breakpoint after stable prefix" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var cancel = std.atomic.Value(bool).init(false);
+    const stable = "STABLE PREFIX";
+    const system = try std.fmt.allocPrint(a, "{s}\n\nVOLATILE SUFFIX", .{stable});
+
+    const body = try buildBody(a, .{
+        .model = "claude-sonnet-4-5",
+        .base_url = "",
+        .api_key = "",
+        .system = system,
+        .system_cache_prefix_len = stable.len,
+        .messages = &.{},
+        .cancel = &cancel,
+    });
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{});
+    const blocks = v.object.get("system").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    try std.testing.expectEqualStrings(stable, blocks[0].object.get("text").?.string);
+    try std.testing.expectEqualStrings("ephemeral", blocks[0].object.get("cache_control").?.object.get("type").?.string);
+    try std.testing.expectEqualStrings("\n\nVOLATILE SUFFIX", blocks[1].object.get("text").?.string);
+    try std.testing.expect(blocks[1].object.get("cache_control") == null);
 }
 
 pub var instance_context: u8 = 0;

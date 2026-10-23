@@ -245,6 +245,9 @@ fn buildBody(arena: std.mem.Allocator, req: provider.ModelRequest) ![]u8 {
 
     var first = true;
     if (req.system.len > 0) {
+        // OpenAI-compatible providers cache identical request prefixes
+        // automatically; emitting the byte-stable prefix first (B-03) is the
+        // whole protocol, there is no cache_control field to send.
         try w.writeAll("{\"role\":\"system\",\"content\":");
         try std.json.Stringify.value(req.system, .{}, w);
         try w.writeByte('}');

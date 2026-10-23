@@ -37,6 +37,10 @@ pub const ModelRequest = struct {
     /// concurrent users need one request each.
     http_client: ?*std.http.Client = null,
     system: []const u8,
+    /// Byte length of the byte-stable prefix of `system` (B-03). Anthropic
+    /// gets a cache_control breakpoint after this prefix; OpenAI-compatible
+    /// endpoints cache it automatically as the request prefix.
+    system_cache_prefix_len: usize = 0,
     messages: []const core_types.ChatMessage,
     /// Tool schemas as a JSON array string (already rendered).
     tools_json: []const u8 = "[]",

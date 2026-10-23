@@ -135,6 +135,8 @@ pub const RunParams = struct {
     arena: std.mem.Allocator,
     pcfg: ProviderConfig,
     system: []const u8,
+    /// Stable prefix length of `system` for provider prompt caching (B-03).
+    system_cache_prefix_len: usize = 0,
     history: *std.ArrayListUnmanaged(core_types.ChatMessage),
     tool_ctx: *tool_mod.ToolContext,
     callbacks: Callbacks,
@@ -182,6 +184,7 @@ pub fn runTurn(p: RunParams) !Outcome {
                 .api_key = p.pcfg.api_key,
                 .http_client = p.pcfg.http_client,
                 .system = p.system,
+                .system_cache_prefix_len = p.system_cache_prefix_len,
                 .messages = p.history.items,
                 .tools_json = tools_json,
                 .temperature = p.temperature,

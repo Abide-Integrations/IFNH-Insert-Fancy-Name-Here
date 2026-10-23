@@ -247,6 +247,9 @@ fn runChild(
             .http_client = host.http_client,
         },
         .system = system,
+        // The child's role preamble + inherited base prompt are stable
+        // across its rounds, so it gets the same cache breakpoint (B-03).
+        .system_cache_prefix_len = system.len,
         .history = &history,
         .tool_ctx = &child_tool_ctx,
         .callbacks = .{

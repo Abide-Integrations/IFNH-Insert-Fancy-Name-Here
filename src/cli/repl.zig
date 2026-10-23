@@ -242,7 +242,7 @@ pub fn run(
             switch (action) {
                 .quit => break,
                 .submit => |prompt| {
-                    try submitTurn(io, arena, environ, &sess, &cfg, buildProviderConfig(&cfg, environ), instr.text, prompt, cwd);
+                    try submitTurn(io, arena, environ, &sess, &cfg, buildProviderConfig(&cfg, environ), instr.text, instr.text.len, prompt, cwd);
                 },
                 .none => {},
             }
@@ -258,23 +258,33 @@ pub fn run(
         }
         _ = trace.end(io, reload_span);
         const assemble_span = trace.begin(io, "turn.instructions");
+        // (a) Byte-stable prefix: base prompt + repo/project instructions.
+        // Assembly order is deterministic, so unchanged files produce
+        // identical bytes turn to turn (B-03).
+        const stable_instr = instructions_mod.assemble(cwd, io, arena, system_prompt.system_prompt, &.{}) catch instr;
+        // (b) Volatile suffix: nested focus-dir instructions from recent tools.
         const focus = instructions_mod.focusDirsFromHistory(arena, sess.history.items, 8);
-        const turn_instr = instructions_mod.assemble(cwd, io, arena, system_prompt.system_prompt, focus) catch instr;
+        const turn_instr = instructions_mod.assemble(cwd, io, arena, system_prompt.system_prompt, focus) catch stable_instr;
         _ = trace.end(io, assemble_span);
+        const volatile_instr = if (std.mem.startsWith(u8, turn_instr.text, stable_instr.text))
+            turn_instr.text[stable_instr.text.len..]
+        else
+            turn_instr.text;
         const catalog_span = trace.begin(io, "turn.skills_catalog");
         defer _ = trace.end(io, catalog_span);
-        // Skills catalog appendix (budgeted, K148).
-        const skill_prompt = blk: {
+        // Skills catalog appendix (budgeted, K148), also volatile.
+        const volatile_full = blk: {
             if (sess.skills) |catalog| {
                 const rendered = skills_mod.renderCatalog(arena, catalog) catch "";
                 if (rendered.len > 0) {
-                    break :blk std.fmt.allocPrint(arena, "{s}\n\nAvailable skills (load with the skill tool):\n{s}", .{ turn_instr.text, rendered }) catch turn_instr.text;
+                    break :blk std.fmt.allocPrint(arena, "{s}\n\nAvailable skills (load with the skill tool):\n{s}", .{ volatile_instr, rendered }) catch volatile_instr;
                 }
             }
-            break :blk turn_instr.text;
+            break :blk volatile_instr;
         };
+        const turn_system = try system_prompt.compose(arena, stable_instr.text, volatile_full);
 
-        try submitTurn(io, arena, environ, &sess, &cfg, buildProviderConfig(&cfg, environ), skill_prompt, line, cwd);
+        try submitTurn(io, arena, environ, &sess, &cfg, buildProviderConfig(&cfg, environ), turn_system.text, turn_system.stable_len, line, cwd);
     }
 }
 
@@ -288,6 +298,7 @@ fn submitTurn(
     cfg: *config_mod.Store,
     pcfg: agent_engine.ProviderConfig,
     system: []const u8,
+    system_stable_len: usize,
     user_text: []const u8,
     cwd: std.Io.Dir,
 ) !void {
@@ -443,6 +454,7 @@ fn submitTurn(
         .arena = arena,
         .pcfg = pcfg_eff,
         .system = system,
+        .system_cache_prefix_len = system_stable_len,
         .history = &sess.history,
         .tool_ctx = &tool_ctx,
         .callbacks = .{
