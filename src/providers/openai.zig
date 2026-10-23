@@ -120,9 +120,18 @@ pub fn streamFn(
         if (o.get("usage")) |usage_v| {
             if (usage_v == .object) {
                 const u = usage_v.object;
+                // Prompt-cache hits arrive nested under prompt_tokens_details
+                // (B-03); OpenAI reports no cache writes.
+                var cached: u64 = 0;
+                if (u.get("prompt_tokens_details")) |details| {
+                    if (details == .object) {
+                        cached = intOf(details.object.get("cached_tokens")) orelse 0;
+                    }
+                }
                 sink.emit(.{ .usage = .{
                     .input_tokens = intOf(u.get("prompt_tokens")) orelse 0,
                     .output_tokens = intOf(u.get("completion_tokens")) orelse 0,
+                    .cache_read_tokens = cached,
                 } });
             }
         }
@@ -231,7 +240,8 @@ fn extractErrorMessage(arena: std.mem.Allocator, body: []const u8) ![]const u8 {
     return error.NotFound;
 }
 
-fn buildBody(arena: std.mem.Allocator, req: provider.ModelRequest) ![]u8 {
+/// Request body. Exposed for the golden body tests in `testing.zig` (B-03).
+pub fn buildBody(arena: std.mem.Allocator, req: provider.ModelRequest) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
 

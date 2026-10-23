@@ -92,6 +92,8 @@ pub fn streamFn(
     var tool_count: usize = 0;
     var input_tokens: u64 = 0;
     var output_tokens: u64 = 0;
+    var cache_read_tokens: u64 = 0;
+    var cache_write_tokens: u64 = 0;
     var first_token = false;
 
     while (try parser.next(arena)) |payload| {
@@ -110,7 +112,13 @@ pub fn streamFn(
             if (o.get("message")) |m| {
                 if (m == .object) {
                     if (m.object.get("usage")) |u| {
-                        if (u == .object) input_tokens = intOf(u.object.get("input_tokens")) orelse 0;
+                        if (u == .object) {
+                            input_tokens = intOf(u.object.get("input_tokens")) orelse 0;
+                            // Prompt-cache accounting (B-03): reads/writes are
+                            // reported alongside input_tokens.
+                            cache_read_tokens = intOf(u.object.get("cache_read_input_tokens")) orelse 0;
+                            cache_write_tokens = intOf(u.object.get("cache_creation_input_tokens")) orelse 0;
+                        }
                     }
                 }
             }
@@ -173,8 +181,13 @@ pub fn streamFn(
         } });
     }
 
-    if (input_tokens != 0 or output_tokens != 0) {
-        sink.emit(.{ .usage = .{ .input_tokens = input_tokens, .output_tokens = output_tokens } });
+    if (input_tokens != 0 or output_tokens != 0 or cache_read_tokens != 0 or cache_write_tokens != 0) {
+        sink.emit(.{ .usage = .{
+            .input_tokens = input_tokens,
+            .output_tokens = output_tokens,
+            .cache_read_tokens = cache_read_tokens,
+            .cache_write_tokens = cache_write_tokens,
+        } });
     }
     sink.emit(.done);
 }
@@ -206,7 +219,8 @@ fn extractErrorMessage(arena: std.mem.Allocator, body: []const u8) ![]const u8 {
     return error.NotFound;
 }
 
-fn buildBody(arena: std.mem.Allocator, req: provider.ModelRequest) ![]u8 {
+/// Request body. Exposed for the golden body tests in `testing.zig` (B-03).
+pub fn buildBody(arena: std.mem.Allocator, req: provider.ModelRequest) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
 
@@ -214,7 +228,23 @@ fn buildBody(arena: std.mem.Allocator, req: provider.ModelRequest) ![]u8 {
     try std.json.Stringify.value(req.model, .{}, w);
     try w.print(",\"max_tokens\":{d},\"stream\":true", .{req.max_output_tokens orelse 4096});
 
-    if (req.system.len > 0) {
+    // Prompt caching (B-03). With a stable prefix the system prompt goes out
+    // as two text blocks and `cache_control` marks the breakpoint after the
+    // stable one, so the volatile tail (focus-dir instructions, skills
+    // catalog) can change every turn without invalidating the cached prefix.
+    // Without a split the legacy single-string form is byte-identical to
+    // what earlier versions sent.
+    const split = @min(req.system_stable_len, req.system.len);
+    if (split > 0) {
+        try w.writeAll(",\"system\":[{\"type\":\"text\",\"text\":");
+        try std.json.Stringify.value(req.system[0..split], .{}, w);
+        try w.writeAll(",\"cache_control\":{\"type\":\"ephemeral\"}");
+        if (split < req.system.len) {
+            try w.writeAll("},{\"type\":\"text\",\"text\":");
+            try std.json.Stringify.value(req.system[split..], .{}, w);
+        }
+        try w.writeAll("}]");
+    } else if (req.system.len > 0) {
         try w.writeAll(",\"system\":");
         try std.json.Stringify.value(req.system, .{}, w);
     }

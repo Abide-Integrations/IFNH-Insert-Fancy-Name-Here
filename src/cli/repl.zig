@@ -251,7 +251,10 @@ pub fn run(
             switch (action) {
                 .quit => break,
                 .submit => |prompt| {
-                    try submitTurn(io, arena, environ, &sess, &cfg, buildProviderConfig(&cfg, environ), instr.text, prompt, cwd);
+                    try submitTurn(io, arena, environ, &sess, &cfg, buildProviderConfig(&cfg, environ), .{
+                        .text = instr.text,
+                        .stable_len = instr.stable_len,
+                    }, prompt, cwd);
                 },
                 .none => {},
             }
@@ -285,11 +288,22 @@ pub fn run(
             break :blk turn_instr.text;
         };
 
-        try submitTurn(io, arena, environ, &sess, &cfg, buildProviderConfig(&cfg, environ), skill_prompt, line, cwd);
+        try submitTurn(io, arena, environ, &sess, &cfg, buildProviderConfig(&cfg, environ), .{
+            .text = skill_prompt,
+            // Skills catalog is volatile: the cache breakpoint stays before
+            // the focus-dependent instruction tail (B-03).
+            .stable_len = turn_instr.stable_len,
+        }, line, cwd);
     }
 }
 
 // ---------------------------------------------------------------- turn flow
+
+/// System prompt for one turn plus its byte-stable prefix length (B-03).
+const TurnSystem = struct {
+    text: []const u8,
+    stable_len: usize,
+};
 
 fn submitTurn(
     io: std.Io,
@@ -298,7 +312,7 @@ fn submitTurn(
     sess: *Session,
     cfg: *config_mod.Store,
     pcfg: agent_engine.ProviderConfig,
-    system: []const u8,
+    system: TurnSystem,
     user_text: []const u8,
     cwd: std.Io.Dir,
 ) !void {
@@ -319,7 +333,7 @@ fn submitTurn(
     var host = subagent_mod.Host{
         .io = io,
         .workspace = cwd,
-        .base_system = system,
+        .base_system = system.text,
         .provider = pcfg.provider,
         .base_url = pcfg.base_url,
         .api_key = pcfg.api_key,
@@ -459,7 +473,8 @@ fn submitTurn(
         .arena = arena,
         .pcfg = pcfg_shared,
         .trace = sess.trace,
-        .system = system,
+        .system = system.text,
+        .system_stable_len = system.stable_len,
         .history = &sess.history,
         .tool_ctx = &tool_ctx,
         .callbacks = .{
@@ -497,12 +512,21 @@ fn submitTurn(
         },
     }
     if (outcome.usage.input_tokens > 0 or outcome.usage.output_tokens > 0) {
-        try out(io, "[tokens: {d} in / {d} out, {d} tool calls]\n", .{ outcome.usage.input_tokens, outcome.usage.output_tokens, outcome.tool_calls });
+        // Cache hits are only shown when the provider reported any (B-03).
+        if (outcome.usage.cache_read_tokens > 0 or outcome.usage.cache_write_tokens > 0) {
+            try out(io, "[tokens: {d} in ({d} cached, {d} cache write) / {d} out, {d} tool calls]\n", .{
+                outcome.usage.input_tokens, outcome.usage.cache_read_tokens, outcome.usage.cache_write_tokens, outcome.usage.output_tokens, outcome.tool_calls,
+            });
+        } else {
+            try out(io, "[tokens: {d} in / {d} out, {d} tool calls]\n", .{ outcome.usage.input_tokens, outcome.usage.output_tokens, outcome.tool_calls });
+        }
         // Session usage log (S254-258).
-        const usage_line = try std.fmt.allocPrint(arena, "{{\"ts_ms\":{d},\"input_tokens\":{d},\"output_tokens\":{d},\"tool_calls\":{d}}}\n", .{
+        const usage_line = try std.fmt.allocPrint(arena, "{{\"ts_ms\":{d},\"input_tokens\":{d},\"output_tokens\":{d},\"cache_read_tokens\":{d},\"cache_write_tokens\":{d},\"tool_calls\":{d}}}\n", .{
             @as(i64, @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms))),
             outcome.usage.input_tokens,
             outcome.usage.output_tokens,
+            outcome.usage.cache_read_tokens,
+            outcome.usage.cache_write_tokens,
             outcome.tool_calls,
         });
         var usage_buf: [256]u8 = undefined;

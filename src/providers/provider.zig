@@ -28,7 +28,12 @@ pub const ModelRequest = struct {
     model: []const u8,
     base_url: []const u8,
     api_key: []const u8,
+    /// System prompt. `system[0..system_stable_len]` is the byte-stable
+    /// prefix of the session (base prompt, tool list, static instructions);
+    /// the rest is the volatile tail (focus-dir instructions, skills
+    /// catalog) (B-03). `0` means "no split": the whole string is volatile.
     system: []const u8,
+    system_stable_len: usize = 0,
     messages: []const core_types.ChatMessage,
     /// Tool schemas as a JSON array string (already rendered).
     tools_json: []const u8 = "[]",

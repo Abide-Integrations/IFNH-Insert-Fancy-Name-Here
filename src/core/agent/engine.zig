@@ -80,6 +80,8 @@ const Collector = struct {
             .usage => |u| {
                 self.usage.input_tokens += u.input_tokens;
                 self.usage.output_tokens += u.output_tokens;
+                self.usage.cache_read_tokens += u.cache_read_tokens;
+                self.usage.cache_write_tokens += u.cache_write_tokens;
             },
             .done => {},
             .failure => |f| {
@@ -134,6 +136,8 @@ pub const RunParams = struct {
     arena: std.mem.Allocator,
     pcfg: ProviderConfig,
     system: []const u8,
+    /// Stable prefix of `system` (B-03); 0 = no cache breakpoint.
+    system_stable_len: usize = 0,
     history: *std.ArrayListUnmanaged(core_types.ChatMessage),
     tool_ctx: *tool_mod.ToolContext,
     callbacks: Callbacks,
@@ -193,6 +197,7 @@ fn runRounds(p: RunParams, tool_ms: *f64) !Outcome {
                 .base_url = p.pcfg.base_url,
                 .api_key = p.pcfg.api_key,
                 .system = p.system,
+                .system_stable_len = p.system_stable_len,
                 .messages = p.history.items,
                 .tools_json = tools_json,
                 .temperature = p.temperature,
@@ -215,6 +220,8 @@ fn runRounds(p: RunParams, tool_ms: *f64) !Outcome {
         round_span.end();
         total_usage.input_tokens += collector.usage.input_tokens;
         total_usage.output_tokens += collector.usage.output_tokens;
+        total_usage.cache_read_tokens += collector.usage.cache_read_tokens;
+        total_usage.cache_write_tokens += collector.usage.cache_write_tokens;
 
         if (collector.failure) |f| {
             return .{

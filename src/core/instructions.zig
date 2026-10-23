@@ -19,6 +19,10 @@ pub const Source = struct {
 pub const Assembled = struct {
     text: []const u8,
     sources: []Source,
+    /// Byte length of the byte-stable prefix: everything before the
+    /// focus-dependent nested instructions (B-03). Providers mark a cache
+    /// breakpoint here; the tail may change every turn without disturbing it.
+    stable_len: usize = 0,
 };
 
 /// Load and assemble project instructions from `workspace`.
@@ -77,6 +81,10 @@ pub fn assemble(
         } else |_| {}
     }
 
+    // Everything above is stable for a session; only the nested sections
+    // below depend on recent tool activity (B-03 cache breakpoint).
+    const stable_len = parts.items.len;
+
     // Nested AGENTS.md for focus directories (deepest path wins duplicates).
     var seen_dirs: std.ArrayListUnmanaged([]const u8) = .empty;
     for (focus_dirs) |dir| {
@@ -100,7 +108,7 @@ pub fn assemble(
         } else |_| {}
     }
 
-    return .{ .text = parts.items, .sources = sources.items };
+    return .{ .text = parts.items, .sources = sources.items, .stable_len = stable_len };
 }
 
 /// Extract the directories referenced by tool calls in the history
@@ -176,6 +184,30 @@ test "assemble tolerates missing files" {
     defer arena_state.deinit();
     const assembled = try assemble(tmp.dir, io, arena_state.allocator(), "only builtin", &.{});
     try std.testing.expectEqual(@as(usize, 1), assembled.sources.len);
+}
+
+test "stable_len marks the boundary before focus-dependent sections" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = "repo rules" });
+    try tmp.dir.createDirPath(io, "src/core");
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/core/AGENTS.md", .data = "core rules" });
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const plain = try assemble(tmp.dir, io, a, "builtin", &.{});
+    const focused = try assemble(tmp.dir, io, a, "builtin", &.{"src/core"});
+
+    // The stable prefix is identical with and without focus dirs, and holds
+    // none of the nested content.
+    try std.testing.expectEqual(plain.stable_len, focused.stable_len);
+    try std.testing.expectEqualStrings(plain.text[0..plain.stable_len], focused.text[0..focused.stable_len]);
+    try std.testing.expectEqualStrings(plain.text, focused.text[0..focused.stable_len]);
+    try std.testing.expect(std.mem.indexOf(u8, focused.text[0..focused.stable_len], "core rules") == null);
+    try std.testing.expect(std.mem.indexOf(u8, focused.text[focused.stable_len..], "core rules") != null);
 }
 
 test "focus dirs pull in nested AGENTS.md" {
