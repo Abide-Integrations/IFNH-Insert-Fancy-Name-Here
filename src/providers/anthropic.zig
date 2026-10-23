@@ -72,6 +72,7 @@ pub fn streamFn(
         id: []const u8 = "",
         name: []const u8 = "",
         args: std.ArrayListUnmanaged(u8) = .empty,
+        emitted: bool = false,
     };
     var tools: [16]ToolAcc = undefined;
     var tool_count: usize = 0;
@@ -115,6 +116,19 @@ pub fn streamFn(
                     }
                 }
             }
+        } else if (std.mem.eql(u8, ev, "content_block_stop")) {
+            // Dispatch as soon as a tool_use block closes; later blocks and
+            // message_stop must not delay the engine.
+            const index = intOf(o.get("index")) orelse continue;
+            if (index >= tool_count or tools[index].emitted) continue;
+            const t = &tools[index];
+            if (t.name.len == 0) continue;
+            sink.emit(.{ .tool_call = .{
+                .id = t.id,
+                .name = t.name,
+                .arguments_json = t.args.items,
+            } });
+            t.emitted = true;
         } else if (std.mem.eql(u8, ev, "content_block_delta")) {
             const delta = o.get("delta") orelse continue;
             if (delta != .object) continue;
@@ -142,13 +156,15 @@ pub fn streamFn(
         }
     }
 
+    // Blocks without an explicit stop event (torn stream) still dispatch once.
     for (tools[0..tool_count]) |*t| {
-        if (t.name.len == 0) continue;
+        if (t.name.len == 0 or t.emitted) continue;
         sink.emit(.{ .tool_call = .{
             .id = t.id,
             .name = t.name,
             .arguments_json = t.args.items,
         } });
+        t.emitted = true;
     }
 
     if (input_tokens != 0 or output_tokens != 0) {

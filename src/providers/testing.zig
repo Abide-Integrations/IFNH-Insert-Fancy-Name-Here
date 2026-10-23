@@ -108,29 +108,90 @@ pub const FakeServer = struct {
 // ---------------------------------------------------------------- tests
 
 const openai_adapter = @import("openai.zig");
+const anthropic_adapter = @import("anthropic.zig");
 const provider_mod = @import("provider.zig");
 const core_types = @import("../core/types.zig");
 
 const Collector = struct {
+    const EventKind = enum { text, tool_call, done };
+
     arena: std.mem.Allocator,
     text: std.ArrayListUnmanaged(u8) = .empty,
     tool_calls: std.ArrayListUnmanaged(core_types.ToolCall) = .empty,
+    order: std.ArrayListUnmanaged(EventKind) = .empty,
     failure: ?[]const u8 = null,
     done: bool = false,
 
     fn emit(ctx: *anyopaque, ev: core_types.StreamEvent) void {
         const self: *Collector = @ptrCast(@alignCast(ctx));
         switch (ev) {
-            .content_delta => |d| self.text.appendSlice(self.arena, d) catch {},
+            .content_delta => |d| {
+                self.order.append(self.arena, .text) catch {};
+                self.text.appendSlice(self.arena, d) catch {};
+            },
             .tool_call => |tc| {
+                self.order.append(self.arena, .tool_call) catch {};
                 self.tool_calls.append(self.arena, tc) catch {};
             },
             .failure => |f| self.failure = f.message,
-            .done => self.done = true,
+            .done => {
+                self.order.append(self.arena, .done) catch {};
+                self.done = true;
+            },
             else => {},
         }
     }
 };
+
+test "anthropic adapter dispatches tool_call at block close" {
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const body =
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7}}}\n\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Before.\"}}\n\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"read\"}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"x\\\"}\"}}\n\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"text_delta\",\"text\":\"After.\"}}\n\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":2}\n\n" ++
+        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":3}}\n\n" ++
+        "data: {\"type\":\"message_stop\"}\n\n";
+    const srv = try FakeServer.start(io, arena, body);
+    defer srv.stop();
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var collector = Collector{ .arena = arena };
+    const base = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}", .{srv.port});
+
+    try anthropic_adapter.streamFn(undefined, arena, io, .{
+        .model = "test-model",
+        .base_url = base,
+        .api_key = "test-key-1234567890",
+        .system = "",
+        .messages = &.{},
+        .cancel = &cancel,
+    }, .{ .ctx = &collector, .emit_fn = Collector.emit });
+
+    srv.wait();
+    try std.testing.expect(collector.done);
+    try std.testing.expectEqualStrings("Before.After.", collector.text.items);
+    try std.testing.expectEqual(@as(usize, 1), collector.tool_calls.items.len);
+    const tc = collector.tool_calls.items[0];
+    try std.testing.expectEqualStrings("t1", tc.id);
+    try std.testing.expectEqualStrings("read", tc.name);
+    try std.testing.expectEqualStrings("{\"path\":\"x\"}", tc.arguments_json);
+    // Tool dispatch happens at content_block_stop, before the later text block
+    // and before message_stop. The old adapter emitted it only after parsing.
+    try std.testing.expectEqualSlices(Collector.EventKind, &.{
+        .text, .tool_call, .text, .done,
+    }, collector.order.items);
+}
 
 test "openai adapter streams against fake HTTP server" {
     const io = std.testing.io;
