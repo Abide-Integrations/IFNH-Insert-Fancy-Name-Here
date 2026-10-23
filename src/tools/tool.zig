@@ -66,6 +66,8 @@ pub const ToolContext = struct {
     external_tools: bool = true,
     rg_bin: []const u8 = "rg",
     fd_bin: []const u8 = "fd",
+    /// Root .gitignore rules used by the built-in walk fallback.
+    ignore_rules: []const IgnoreRule = &.{},
 
     pub fn requestApproval(self: *ToolContext, title: []const u8, detail: []const u8, grant: ApprovalRequest.Grant) bool {
         const resp = self.approval_fn(self.approval_ctx, .{ .title = title, .detail = detail, .grant = grant });
@@ -331,6 +333,62 @@ fn toolRead(path: []const u8, offset: ?usize, limit: ?usize, ctx: *ToolContext) 
 
 // ---------------------------------------------------------------- filesystem walk
 
+const IgnoreRule = struct {
+    pattern: []const u8,
+    negated: bool = false,
+};
+
+fn loadIgnore(ctx: *ToolContext) []const IgnoreRule {
+    const data = ctx.workspace.readFileAlloc(ctx.io, ".gitignore", ctx.arena, .limited(256 * 1024)) catch return &.{};
+    var rules: std.ArrayListUnmanaged(IgnoreRule) = .empty;
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |raw| {
+        var line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        var negated = false;
+        if (line[0] == '!') {
+            negated = true;
+            line = line[1..];
+            if (line.len == 0) continue;
+        }
+        if (line[0] == '/') line = line[1..];
+        if (line.len == 0 or std.mem.endsWith(u8, line, "/")) {
+            if (line.len <= 1) continue;
+            line = line[0 .. line.len - 1];
+        }
+        rules.append(ctx.arena, .{ .pattern = line, .negated = negated }) catch break;
+    }
+    return rules.items;
+}
+
+fn ignored(ctx: *ToolContext, rel: []const u8) bool {
+    var i = ctx.ignore_rules.len;
+    while (i > 0) {
+        i -= 1;
+        const rule = ctx.ignore_rules[i];
+        if (globm.match(rule.pattern, rel) or matchesAnySegment(rule.pattern, rel) or matchesParent(rule.pattern, rel)) {
+            return !rule.negated;
+        }
+    }
+    return false;
+}
+
+fn matchesAnySegment(pattern: []const u8, rel: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, pattern, '/') != null) return false;
+    var it = std.mem.splitScalar(u8, rel, '/');
+    while (it.next()) |seg| if (globm.match(pattern, seg)) return true;
+    return false;
+}
+
+fn matchesParent(pattern: []const u8, rel: []const u8) bool {
+    var end = rel.len;
+    while (std.mem.lastIndexOfScalar(u8, rel[0..end], '/')) |slash| {
+        end = slash;
+        if (globm.match(pattern, rel[0..end])) return true;
+    }
+    return false;
+}
+
 const WalkLimits = struct {
     max_files: usize = 20_000,
     max_depth: usize = 16,
@@ -367,13 +425,14 @@ fn collectMatching(
         const child_rel = std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ rel_prefix, entry.name }) catch return;
         limits.max_files -|= 1;
         if (entry.kind == .directory) {
-            if (shouldSkipDir(child_rel)) continue;
+            if (shouldSkipDir(child_rel) or ignored(ctx, child_rel)) continue;
             const sub = dir.openDir(ctx.io, entry.name, .{ .iterate = true }) catch continue;
             defer sub.close(ctx.io);
             const next_prefix = std.fmt.allocPrint(ctx.arena, "{s}/", .{child_rel}) catch return;
             collectMatching(ctx, sub, next_prefix, depth + 1, limits, out, pattern);
-        } else if (globm.match(pattern, child_rel)) {
-            out.append(ctx.arena, child_rel) catch return;
+        } else {
+            if (ignored(ctx, child_rel)) continue;
+            if (globm.match(pattern, child_rel)) out.append(ctx.arena, child_rel) catch return;
         }
     }
 }
@@ -432,6 +491,7 @@ fn tryExternalGlob(pattern: []const u8, ctx: *ToolContext) ?ToolResult {
 
 fn toolGlob(pattern: []const u8, ctx: *ToolContext) ToolResult {
     if (tryExternalGlob(pattern, ctx)) |external| return external;
+    ctx.ignore_rules = loadIgnore(ctx);
     var out: std.ArrayListUnmanaged([]const u8) = .empty;
     var limits = WalkLimits{};
     collectMatching(ctx, ctx.workspace, "", 0, &limits, &out, pattern);
@@ -448,6 +508,7 @@ fn toolGrep(pattern: []const u8, root: []const u8, ctx: *ToolContext) ToolResult
         else => return deniedResult(ctx.arena, "grep under '{s}'", .{root}),
     }
     if (tryExternalGrep(pattern, root, ctx)) |external| return external;
+    ctx.ignore_rules = loadIgnore(ctx);
     var out: std.ArrayListUnmanaged(u8) = .empty;
     var limits = WalkLimits{ .max_matches = 200 };
     grepDir(ctx, ctx.workspace, root, pattern, &limits, &out, 0);
@@ -474,11 +535,12 @@ fn grepDir(
             std.fmt.allocPrint(ctx.arena, "{s}/{s}", .{ rel, entry.name }) catch return;
         limits.max_files -|= 1;
         if (entry.kind == .directory) {
-            if (shouldSkipDir(child_rel)) continue;
+            if (shouldSkipDir(child_rel) or ignored(ctx, child_rel)) continue;
             const sub = dir.openDir(ctx.io, entry.name, .{ .iterate = true }) catch continue;
             defer sub.close(ctx.io);
             grepDir(ctx, sub, child_rel, pattern, limits, out, depth + 1);
         } else {
+            if (ignored(ctx, child_rel)) continue;
             grepFile(ctx, child_rel, pattern, limits, out);
         }
     }
@@ -834,6 +896,35 @@ test "glob and grep tools" {
     try std.testing.expectEqual(Status.ok, gr.status);
     try std.testing.expect(std.mem.indexOf(u8, gr.output, "src/a.zig:1") != null);
     try std.testing.expect(std.mem.indexOf(u8, gr.output, "src/deep/b.zig:1") != null);
+}
+
+test "built-in walk honors root .gitignore" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = ".gitignore", .data = "ignored/\n*.log\n!keep.log\n" });
+    try tmp.dir.createDirPath(io, "ignored");
+    try tmp.dir.writeFile(io, .{ .sub_path = "ignored/a.zig", .data = "needle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "drop.log", .data = "needle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "keep.log", .data = "needle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "keep.zig", .data = "needle\n" });
+
+    var e = engine_mod.Engine.init(std.testing.allocator, .ask);
+    defer e.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ctx = testCtx(arena_state.allocator(), io, tmp.dir, &e);
+
+    const g = execute("glob", "{\"pattern\":\"**\"}", &ctx);
+    try std.testing.expect(std.mem.indexOf(u8, g.output, "keep.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, g.output, "keep.log") != null);
+    try std.testing.expect(std.mem.indexOf(u8, g.output, "ignored/a.zig") == null);
+    try std.testing.expect(std.mem.indexOf(u8, g.output, "drop.log") == null);
+
+    const gr = execute("grep", "{\"pattern\":\"needle\"}", &ctx);
+    try std.testing.expect(std.mem.indexOf(u8, gr.output, "keep.zig:1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gr.output, "ignored/a.zig") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gr.output, "drop.log") == null);
 }
 
 test "edit and write with journal integration" {
