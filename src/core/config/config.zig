@@ -6,7 +6,6 @@
 //! hard startup error, never silently ignored.
 
 const std = @import("std");
-const builtin = @import("builtin");
 
 pub const Layer = enum {
     builtin,
@@ -550,21 +549,81 @@ pub fn load(
 
 pub const max_config_bytes: usize = 256 * 1024;
 
-/// Platform-appropriate user config file path, allocated in `arena`.
-pub fn userConfigPath(arena: std.mem.Allocator, environ: ?*const std.process.Environ.Map) ?[]const u8 {
-    const home = if (environ) |e| e.get("HOME") else null;
-    if (home == null) return null;
-    if (builtin.os.tag == .macos) {
-        return std.fmt.allocPrint(arena, "{s}/Library/Application Support/ifnh/config.json", .{home.?}) catch null;
-    }
+/// Single user config directory convention, on every platform including
+/// macOS: `$XDG_CONFIG_HOME/ifnh` when set, else `~/.config/ifnh`.
+pub fn userConfigDir(arena: std.mem.Allocator, environ: ?*const std.process.Environ.Map) ?[]const u8 {
     if (environ) |e| {
         if (e.get("XDG_CONFIG_HOME")) |xdg| {
             if (xdg.len > 0) {
-                return std.fmt.allocPrint(arena, "{s}/ifnh/config.json", .{xdg}) catch null;
+                return std.fmt.allocPrint(arena, "{s}/ifnh", .{xdg}) catch null;
             }
         }
     }
-    return std.fmt.allocPrint(arena, "{s}/.config/ifnh/config.json", .{home.?}) catch null;
+    const home = if (environ) |e| e.get("HOME") else null;
+    if (home == null or home.?.len == 0) return null;
+    return std.fmt.allocPrint(arena, "{s}/.config/ifnh", .{home.?}) catch null;
+}
+
+/// User config file path, allocated in `arena`.
+pub fn userConfigPath(arena: std.mem.Allocator, environ: ?*const std.process.Environ.Map) ?[]const u8 {
+    const dir = userConfigDir(arena, environ) orelse return null;
+    return std.fmt.allocPrint(arena, "{s}/config.json", .{dir}) catch null;
+}
+
+/// Persistent provider-key file path (`<config dir>/env`).
+pub fn userEnvPath(arena: std.mem.Allocator, environ: ?*const std.process.Environ.Map) ?[]const u8 {
+    const dir = userConfigDir(arena, environ) orelse return null;
+    return std.fmt.allocPrint(arena, "{s}/env", .{dir}) catch null;
+}
+
+/// User skills directory (`<config dir>/skills`).
+pub fn userSkillsDir(arena: std.mem.Allocator, environ: ?*const std.process.Environ.Map) ?[]const u8 {
+    const dir = userConfigDir(arena, environ) orelse return null;
+    return std.fmt.allocPrint(arena, "{s}/skills", .{dir}) catch null;
+}
+
+/// User state root for logs/worktrees: `~/.local/state/ifnh` on every
+/// platform (matching the existing code, macOS included).
+pub fn userStateDir(arena: std.mem.Allocator, environ: ?*const std.process.Environ.Map) ?[]const u8 {
+    const home = if (environ) |e| e.get("HOME") else null;
+    if (home == null or home.?.len == 0) return null;
+    return std.fmt.allocPrint(arena, "{s}/.local/state/ifnh", .{home.?}) catch null;
+}
+
+fn testEnvironment(pairs: []const [2][]const u8) !std.process.Environ.Map {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    errdefer env.deinit();
+    for (pairs) |pair| try env.put(pair[0], pair[1]);
+    return env;
+}
+
+test "user config path honours XDG_CONFIG_HOME and falls back on every platform" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var xdg_env = try testEnvironment(&.{
+        .{ "HOME", "/home/me" },
+        .{ "XDG_CONFIG_HOME", "/xdg" },
+    });
+    defer xdg_env.deinit();
+    try std.testing.expectEqualStrings("/xdg/ifnh/config.json", userConfigPath(arena, &xdg_env).?);
+    try std.testing.expectEqualStrings("/xdg/ifnh", userConfigDir(arena, &xdg_env).?);
+    try std.testing.expectEqualStrings("/xdg/ifnh/env", userEnvPath(arena, &xdg_env).?);
+    try std.testing.expectEqualStrings("/xdg/ifnh/skills", userSkillsDir(arena, &xdg_env).?);
+
+    var home_env = try testEnvironment(&.{
+        .{ "HOME", "/home/me" },
+        .{ "XDG_CONFIG_HOME", "" },
+    });
+    defer home_env.deinit();
+    try std.testing.expectEqualStrings("/home/me/.config/ifnh/config.json", userConfigPath(arena, &home_env).?);
+    try std.testing.expectEqualStrings("/home/me/.local/state/ifnh", userStateDir(arena, &home_env).?);
+
+    var empty_env = try testEnvironment(&.{});
+    defer empty_env.deinit();
+    try std.testing.expect(userConfigPath(arena, &empty_env) == null);
+    try std.testing.expect(userStateDir(arena, &empty_env) == null);
 }
 
 test "defaults parse and validate" {

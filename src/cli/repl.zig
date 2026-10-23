@@ -146,7 +146,7 @@ pub fn run(
 
     // ---- skills catalog (K148/149) ----
     sess.skills = blk: {
-        const user_dir = std.fmt.allocPrint(arena, "{s}/.config/ifnh/skills", .{environ.get("HOME") orelse ""}) catch break :blk null;
+        const user_dir = config_mod.userSkillsDir(arena, environ) orelse break :blk null;
         const catalog = skills_mod.discover(cwd, io, arena, user_dir) catch break :blk null;
         break :blk catalog;
     };
@@ -320,8 +320,8 @@ fn submitTurn(
             break :blk g;
         },
         .worktree_root = blk: {
-            const home = environ.get("HOME") orelse break :blk null;
-            const root = std.fmt.allocPrint(arena, "{s}/.local/state/ifnh/worktrees", .{home}) catch break :blk null;
+            const state_root = config_mod.userStateDir(arena, environ) orelse break :blk null;
+            const root = std.fmt.allocPrint(arena, "{s}/worktrees", .{state_root}) catch break :blk null;
             std.Io.Dir.cwd().createDirPath(io, root) catch {};
             break :blk root;
         },
@@ -1286,8 +1286,8 @@ fn handleCommand(
                 break :blk g;
             },
             .worktree_root = blk: {
-                const home = environ.get("HOME") orelse break :blk null;
-                const root2 = std.fmt.allocPrint(arena, "{s}/.local/state/ifnh/worktrees", .{home}) catch break :blk null;
+                const state_root = config_mod.userStateDir(arena, environ) orelse break :blk null;
+                const root2 = std.fmt.allocPrint(arena, "{s}/worktrees", .{state_root}) catch break :blk null;
                 cwd.createDirPath(io, root2) catch {};
                 break :blk root2;
             },
@@ -1404,8 +1404,9 @@ fn handleCommand(
             };
             // Visible for the rest of this session immediately.
             g_merged_env.?.put(name, value.?) catch {};
-            out(io, "{s}stored {s} in ~/.config/ifnh/env (0600); takes effect immediately{s}\n", .{
-                palette.success("", arena), name, "\x1b[0m",
+            const stored_at = keys_mod.Keys.path(arena, environ) orelse "the user env file";
+            out(io, "{s}stored {s} in {s} (0600); takes effect immediately{s}\n", .{
+                palette.success("", arena), name, stored_at, "\x1b[0m",
             }) catch {};
         } else if (std.mem.startsWith(u8, rest, "tools ")) {
             const mode = std.mem.trim(u8, rest[6..], " \t");
@@ -1520,7 +1521,9 @@ fn handleCommand(
     } else if (std.mem.eql(u8, cmd, "skills")) {
         if (sess.skills) |catalog| {
             if (catalog.skills.len == 0) {
-                out(io, "no skills installed (.ifnh/skills/, ~/.config/ifnh/skills/)\n", .{}) catch {};
+                if (config_mod.userSkillsDir(arena, environ)) |user_skills| {
+                    out(io, "no skills installed (.ifnh/skills/, {s}/)\n", .{user_skills}) catch {};
+                } else out(io, "no skills installed (.ifnh/skills/)\n", .{}) catch {};
             }
             for (catalog.skills) |s| {
                 out(io, "  [{s}] {s}: {s}\n", .{ s.scope, s.name, s.description }) catch {};

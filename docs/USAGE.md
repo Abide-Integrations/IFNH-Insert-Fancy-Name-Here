@@ -105,8 +105,11 @@ ifnh config explain model.model
 ifnh config validate
 ```
 
-- **User config:** `~/.config/ifnh/config.json` (Linux) or
-  `~/Library/Application Support/ifnh/` (macOS)
+- **User config:** `$XDG_CONFIG_HOME/ifnh/config.json` when `XDG_CONFIG_HOME`
+  is set, otherwise `~/.config/ifnh/config.json` — the same on Linux and
+  macOS (there is no `~/Library/Application Support` variant). User skills
+  and the stored API keys (`env`) live in that same directory. Logs and
+  transient state live under `~/.local/state/ifnh/`.
 - **Project config:** `.ifnh/config.json` (+ `.ifnh/config.d/*.json` merged
   alphabetically)
 - **Env:** `IFNH_<SECTION>__<KEY>` — `IFNH_PERMISSIONS__DEFAULT_MODE=auto`
@@ -192,7 +195,7 @@ Inspect with `/mcp`; the agent uses `mcp_list`/`mcp_call`.
 Agent Skills format (`SKILL.md` with `name`/`description` frontmatter):
 
 - Project: `.ifnh/skills/<name>/SKILL.md` (highest precedence)
-- User: `~/.config/ifnh/skills/`
+- User: `~/.config/ifnh/skills/` (or `$XDG_CONFIG_HOME/ifnh/skills/`)
 - Compat (read-only): `.claude/skills/`, `.agents/skills/`
 
 The agent sees a budgeted catalog each turn and loads bodies with the

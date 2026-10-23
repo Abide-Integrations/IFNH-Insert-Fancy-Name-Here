@@ -291,9 +291,9 @@ fn runCleanup(io: std.Io, arena: std.mem.Allocator, environ: *const std.process.
     }
 
     // Orphaned IFNH worktrees (never auto-removed without --yes; A13).
-    const home = environ.get("HOME") orelse "";
-    if (home.len > 0) {
-        const wt_root = try std.fmt.allocPrint(arena, "{s}/.local/state/ifnh/worktrees", .{home});
+    const state_root = config_mod.userStateDir(arena, environ) orelse "";
+    if (state_root.len > 0) {
+        const wt_root = try std.fmt.allocPrint(arena, "{s}/worktrees", .{state_root});
         var wt_dir = cwd.openDir(io, wt_root, .{ .iterate = true }) catch {
             try printOut(io, arena, "worktrees: none\n", .{});
             return;
@@ -351,7 +351,10 @@ fn runDoctor(io: std.Io, arena: std.mem.Allocator, environ: *const std.process.E
     const has_model = cfg.getString("model.model", "").len > 0;
     if (has_key and has_model) {
         const pd = cfg.getOptionalString("model.provider_label") orelse provider_name;
-        const key_where: []const u8 = if (environ.get(key_env) != null) "environment" else "~/.config/ifnh/env";
+        const key_where: []const u8 = if (environ.get(key_env) != null)
+            "environment"
+        else
+            keys_mod.Keys.path(arena, environ) orelse "the user env file";
         try printOut(io, arena, "  provider: ok ({s} · {s}, key from {s})\n", .{ pd, cfg.getString("model.model", ""), key_where });
     } else {
         problems += 1;
