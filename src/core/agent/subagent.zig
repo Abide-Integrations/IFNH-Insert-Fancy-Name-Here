@@ -67,6 +67,8 @@ pub const Host = struct {
     worktree_root: ?[]const u8 = null,
     /// Session hint used in worktree/branch names.
     session_hint: []const u8 = "s",
+    /// Session-scoped external search binaries.
+    external_tools: tool_mod.ExternalTools = .{},
 };
 
 fn rolePreamble(arena: std.mem.Allocator, role: Role, label: []const u8) ![]const u8 {
@@ -221,6 +223,7 @@ fn runChild(
         .agent_spawn_ctx = host,
         .agent_depth = parent_depth + 1,
         .agent_label = label,
+        .external_tools = host.external_tools,
     };
 
     var history: std.ArrayListUnmanaged(core_types.ChatMessage) = .empty;

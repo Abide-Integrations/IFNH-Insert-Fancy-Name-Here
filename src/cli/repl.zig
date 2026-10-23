@@ -55,6 +55,8 @@ const Session = struct {
     last_blocked_stage: ?[]const u8 = null,
     /// Persistent key store (user env file) for /provider key.
     user_keys: ?*keys_mod.Keys = null,
+    /// PATH-detected `rg`/`fd`, resolved once per session.
+    external_tools: tool_mod.ExternalTools = .{},
 };
 
 var global_user_keys: keys_mod.Keys = undefined;
@@ -137,6 +139,11 @@ pub fn run(
         }
     };
     sess.user_keys = &global_user_keys;
+    sess.external_tools = tool_mod.detectExternalTools(
+        arena,
+        io,
+        (g_merged_env orelse environ).get("PATH") orelse "",
+    );
     defer {
         if (sess.executions) |reg| reg.deinit(); // kill background children (I125)
         if (sess.mcp_registry) |reg| reg.deinit();
@@ -290,6 +297,7 @@ fn submitTurn(
         .command_deny = sess.engine.command_deny,
         .env_allow = sess.engine.env_allow,
         .journal = &sess.journal,
+        .external_tools = sess.external_tools,
         .approval_ctx = &approver,
         .approval_fn = Approver.approve,
         .max_depth = cfg.getU32("agents.max_depth", 1),
@@ -328,6 +336,7 @@ fn submitTurn(
         .agent_spawn_ctx = &host,
         .agent_depth = 0,
         .agent_label = "parent",
+        .external_tools = sess.external_tools,
         .mcp_list_fn = mcpListHook,
         .mcp_call_fn = mcpCallHook,
         .mcp_ctx = sess.mcp_registry orelse mcp_registry_sentinel,
