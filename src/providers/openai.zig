@@ -89,6 +89,7 @@ pub fn streamFn(
         id: []const u8 = "",
         name: []const u8 = "",
         args: std.ArrayListUnmanaged(u8) = .empty,
+        emitted: bool = false,
     };
     var tools: [16]ToolAcc = undefined;
     var tool_count: usize = 0;
@@ -147,10 +148,27 @@ pub fn streamFn(
                             if (item != .object) continue;
                             const io_ = item.object;
                             const index = intOf(io_.get("index")) orelse tool_count;
-                            while (tool_count <= index and tool_count < tools.len) : (tool_count += 1) {
+                            if (index >= tools.len) continue;
+                            // A higher index means all lower-index arguments are
+                            // complete: dispatch them now (B-08).
+                            if (index >= tool_count) {
+                                for (tools[0..tool_count]) |*done_t| {
+                                    if (done_t.name.len == 0 or done_t.emitted) continue;
+                                    if (ttft_span) |span| {
+                                        _ = trace.end(io, span);
+                                        ttft_span = null;
+                                    }
+                                    sink.emit(.{ .tool_call = .{
+                                        .id = done_t.id,
+                                        .name = done_t.name,
+                                        .arguments_json = done_t.args.items,
+                                    } });
+                                    done_t.emitted = true;
+                                }
+                            }
+                            while (tool_count <= index) : (tool_count += 1) {
                                 tools[tool_count] = .{};
                             }
-                            if (index >= tools.len) continue;
                             const t = &tools[index];
                             if (io_.get("id")) |idv| {
                                 if (idv == .string and idv.string.len > 0) t.id = try arena.dupe(u8, idv.string);
@@ -175,7 +193,7 @@ pub fn streamFn(
         if (finish_v == .string and std.mem.eql(u8, finish_v.string, "tool_calls")) {
             // Emit completed tool calls at finish.
             for (tools[0..tool_count]) |*t| {
-                if (t.name.len == 0) continue;
+                if (t.name.len == 0 or t.emitted) continue;
                 if (ttft_span) |span| {
                     _ = trace.end(io, span);
                     ttft_span = null;
@@ -192,7 +210,7 @@ pub fn streamFn(
 
     // Emit any accumulated tool calls not flushed by finish_reason.
     for (tools[0..tool_count]) |*t| {
-        if (t.name.len == 0) continue;
+        if (t.name.len == 0 or t.emitted) continue;
         if (ttft_span) |span| {
             _ = trace.end(io, span);
             ttft_span = null;

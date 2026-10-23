@@ -108,6 +108,7 @@ pub const FakeServer = struct {
 // ---------------------------------------------------------------- tests
 
 const openai_adapter = @import("openai.zig");
+const anthropic_adapter = @import("anthropic.zig");
 const provider_mod = @import("provider.zig");
 const core_types = @import("../core/types.zig");
 
@@ -115,15 +116,20 @@ const Collector = struct {
     arena: std.mem.Allocator,
     text: std.ArrayListUnmanaged(u8) = .empty,
     tool_calls: std.ArrayListUnmanaged(core_types.ToolCall) = .empty,
+    order: std.ArrayListUnmanaged([]const u8) = .empty,
     failure: ?[]const u8 = null,
     done: bool = false,
 
     fn emit(ctx: *anyopaque, ev: core_types.StreamEvent) void {
         const self: *Collector = @ptrCast(@alignCast(ctx));
         switch (ev) {
-            .content_delta => |d| self.text.appendSlice(self.arena, d) catch {},
+            .content_delta => |d| {
+                self.text.appendSlice(self.arena, d) catch {};
+                if (d.len > 0) self.order.append(self.arena, "text") catch {};
+            },
             .tool_call => |tc| {
                 self.tool_calls.append(self.arena, tc) catch {};
+                self.order.append(self.arena, tc.name) catch {};
             },
             .failure => |f| self.failure = f.message,
             .done => self.done = true,
@@ -195,4 +201,75 @@ test "openai adapter accumulates tool calls from stream" {
     try std.testing.expectEqualStrings("c1", tc.id);
     try std.testing.expectEqualStrings("read", tc.name);
     try std.testing.expectEqualStrings("{\"path\":\"x\"}", tc.arguments_json);
+}
+
+test "anthropic dispatches a tool call when its block closes" {
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const body = "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"read\"}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"x\\\"}\"}}\n\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"after\"}}\n\n" ++
+        "data: {\"type\":\"message_stop\"}\n\n";
+    const srv = try FakeServer.start(io, arena, body);
+    defer srv.stop();
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var collector = Collector{ .arena = arena };
+    const base = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}", .{srv.port});
+
+    try anthropic_adapter.streamFn(undefined, arena, io, .{
+        .model = "test-model",
+        .base_url = base,
+        .api_key = "",
+        .system = "",
+        .messages = &.{},
+        .cancel = &cancel,
+    }, .{ .ctx = &collector, .emit_fn = Collector.emit });
+
+    srv.wait();
+    try std.testing.expectEqual(@as(usize, 1), collector.tool_calls.items.len);
+    try std.testing.expectEqualStrings("read", collector.tool_calls.items[0].name);
+    try std.testing.expectEqualStrings("text", collector.order.items[1]);
+    try std.testing.expectEqualStrings("read", collector.order.items[0]);
+}
+
+test "openai dispatches earlier tool calls when a new index starts" {
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const body =
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"c2\",\"function\":{\"name\":\"glob\",\"arguments\":\"{}\"}}]}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"content\":\"after\"}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" ++
+        "";
+    const srv = try FakeServer.start(io, arena, body);
+    defer srv.stop();
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var collector = Collector{ .arena = arena };
+    const base = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}", .{srv.port});
+
+    try openai_adapter.streamFn(undefined, arena, io, .{
+        .model = "test-model",
+        .base_url = base,
+        .api_key = "",
+        .system = "",
+        .messages = &.{},
+        .cancel = &cancel,
+    }, .{ .ctx = &collector, .emit_fn = Collector.emit });
+
+    srv.wait();
+    try std.testing.expectEqual(@as(usize, 2), collector.tool_calls.items.len);
+    try std.testing.expectEqualStrings("read", collector.order.items[0]);
+    try std.testing.expectEqualStrings("text", collector.order.items[1]);
+    try std.testing.expectEqualStrings("glob", collector.order.items[2]);
 }

@@ -83,6 +83,7 @@ pub fn streamFn(
         id: []const u8 = "",
         name: []const u8 = "",
         args: std.ArrayListUnmanaged(u8) = .empty,
+        emitted: bool = false,
     };
     var tools: [16]ToolAcc = undefined;
     var tool_count: usize = 0;
@@ -151,6 +152,22 @@ pub fn streamFn(
                     }
                 }
             }
+        } else if (std.mem.eql(u8, ev, "content_block_stop")) {
+            // The block's arguments are complete: dispatch now (B-08), not
+            // after the whole message finishes.
+            const index = intOf(o.get("index")) orelse continue;
+            if (index < tool_count and tools[index].name.len > 0 and !tools[index].emitted) {
+                if (ttft_span) |span| {
+                    _ = trace.end(io, span);
+                    ttft_span = null;
+                }
+                sink.emit(.{ .tool_call = .{
+                    .id = tools[index].id,
+                    .name = tools[index].name,
+                    .arguments_json = tools[index].args.items,
+                } });
+                tools[index].emitted = true;
+            }
         } else if (std.mem.eql(u8, ev, "message_delta")) {
             if (o.get("usage")) |u| {
                 if (u == .object) output_tokens = intOf(u.object.get("output_tokens")) orelse output_tokens;
@@ -161,7 +178,7 @@ pub fn streamFn(
     }
 
     for (tools[0..tool_count]) |*t| {
-        if (t.name.len == 0) continue;
+        if (t.name.len == 0 or t.emitted) continue;
         if (ttft_span) |span| {
             _ = trace.end(io, span);
             ttft_span = null;
