@@ -29,8 +29,8 @@ pub const ModelRequest = struct {
     api_key: []const u8,
     system: []const u8,
     messages: []const core_types.ChatMessage,
-    /// Tool schemas as a JSON array string (already rendered).
-    tools_json: []const u8 = "[]",
+    /// Neutral tool specs; adapters serialize them for their wire format.
+    tools: []const core_types.ToolSpec = &.{},
     temperature: ?f64 = null,
     max_output_tokens: ?u32 = null,
     /// Opaque provider-specific options (JSON object text) or "".

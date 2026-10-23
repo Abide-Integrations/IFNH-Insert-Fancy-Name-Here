@@ -12,6 +12,16 @@ pub const ChatMessage = struct {
     tool_name: ?[]const u8 = null,
     /// JSON array of {id, name, arguments_json} for assistant tool calls.
     tool_calls_json: ?[]const u8 = null,
+    /// Tool result failed/denied (Anthropic `tool_result.is_error`).
+    is_error: bool = false,
+};
+
+/// A tool advertised to the model. `parameters_json` is a JSON Schema object;
+/// each adapter wraps it for its wire format.
+pub const ToolSpec = struct {
+    name: []const u8,
+    description: []const u8,
+    parameters_json: []const u8,
 };
 
 pub const ToolCall = struct {

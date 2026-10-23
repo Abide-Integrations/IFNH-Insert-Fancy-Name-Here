@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const core_types = @import("../core/types.zig");
 const engine_mod = @import("../core/permissions/engine.zig");
 const journal_mod = @import("../core/journal.zig");
 const globm = @import("../core/permissions/glob.zig");
@@ -93,11 +94,7 @@ pub const AgentSpawnResult = struct {
     tool_calls: usize = 0,
 };
 
-pub const Spec = struct {
-    name: []const u8,
-    description: []const u8,
-    parameters_json: []const u8,
-};
+pub const Spec = core_types.ToolSpec;
 
 /// Tool specs advertised to the model (order = advertisement order).
 pub const specs = [_]Spec{

@@ -105,38 +105,6 @@ fn sinkEmit(ctx: *anyopaque, ev: core_types.StreamEvent) void {
     Collector.emit(ctx, ev);
 }
 
-/// Render tool specs (name/description/parameters) as a JSON array for the
-/// provider request.
-pub fn renderToolsJson(arena: std.mem.Allocator, names: ?[]const []const u8) ![]const u8 {
-    var aw: std.Io.Writer.Allocating = .init(arena);
-    const w = &aw.writer;
-    try w.writeByte('[');
-    var first = true;
-    for (tool_mod.specs) |spec| {
-        if (names) |allowed| {
-            var ok = false;
-            for (allowed) |n| {
-                if (std.mem.eql(u8, n, spec.name)) {
-                    ok = true;
-                    break;
-                }
-            }
-            if (!ok) continue;
-        }
-        if (!first) try w.writeByte(',');
-        first = false;
-        try w.writeAll("{\"type\":\"function\",\"function\":{\"name\":");
-        try std.json.Stringify.value(spec.name, .{}, w);
-        try w.writeAll(",\"description\":");
-        try std.json.Stringify.value(spec.description, .{}, w);
-        try w.writeAll(",\"parameters\":");
-        try w.writeAll(spec.parameters_json);
-        try w.writeAll("}}");
-    }
-    try w.writeByte(']');
-    return aw.written();
-}
-
 pub const RunParams = struct {
     io: std.Io,
     arena: std.mem.Allocator,
@@ -170,10 +138,7 @@ pub fn runTurn(p: RunParams) !Outcome {
         }
 
         var collector = Collector{ .arena = p.arena, .callbacks = p.callbacks };
-        const tools_json = if (p.include_tools)
-            try renderToolsJson(p.arena, null)
-        else
-            "[]";
+        const tools: []const core_types.ToolSpec = if (p.include_tools) &tool_mod.specs else &.{};
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
             collector = Collector{ .arena = p.arena, .callbacks = p.callbacks };
@@ -183,7 +148,7 @@ pub fn runTurn(p: RunParams) !Outcome {
                 .api_key = p.pcfg.api_key,
                 .system = p.system,
                 .messages = p.history.items,
-                .tools_json = tools_json,
+                .tools = tools,
                 .temperature = p.temperature,
                 .max_output_tokens = p.max_output_tokens,
                 .cancel = p.cancel,
@@ -294,6 +259,7 @@ pub fn runTurn(p: RunParams) !Outcome {
                     .content = result.output,
                     .tool_call_id = calls[i].id,
                     .tool_name = calls[i].name,
+                    .is_error = result.status != .ok,
                 });
                 i += 1;
             }

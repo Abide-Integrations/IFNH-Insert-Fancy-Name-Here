@@ -607,6 +607,7 @@ fn rebuildHistory(arena: std.mem.Allocator, sess: *Session) !void {
                 .role = .tool,
                 .content = v.output,
                 .tool_call_id = v.call_id,
+                .is_error = !std.mem.eql(u8, v.status, "ok"),
             }),
             .note => {},
             .interrupted => {
