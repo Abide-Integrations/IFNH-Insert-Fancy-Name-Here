@@ -29,6 +29,7 @@ const models_mod = @import("../providers/models.zig");
 const tool_mod = @import("../tools/tool.zig");
 const core_types = @import("../core/types.zig");
 const trace_mod = @import("../core/trace.zig");
+const turn_cache = @import("../core/turn_cache.zig");
 const openai = @import("../providers/openai.zig");
 const anthropic = @import("../providers/anthropic.zig");
 
@@ -65,6 +66,9 @@ const Session = struct {
     /// its connection pool, so keep-alive and TLS sessions survive across
     /// turns instead of being rebuilt per request.
     http: std.http.Client,
+    /// Per-turn prologue memoisation (B-04): unchanged inputs on disk are not
+    /// re-read or re-assembled.
+    memo: turn_cache.Cache = .{},
 };
 
 var global_user_keys: keys_mod.Keys = undefined;
@@ -171,12 +175,24 @@ pub fn run(
     sess.trace = trace;
 
     // ---- skills catalog (K148/149) ----
+    const user_skills_dir: ?[]const u8 = std.fmt.allocPrint(arena, "{s}/.config/ifnh/skills", .{environ.get("HOME") orelse ""}) catch null;
     sess.skills = blk: {
         var sp = trace_mod.start(trace, "startup.skills");
         defer sp.end();
-        const user_dir = std.fmt.allocPrint(arena, "{s}/.config/ifnh/skills", .{environ.get("HOME") orelse ""}) catch break :blk null;
-        const catalog = skills_mod.discover(cwd, io, arena, user_dir) catch break :blk null;
+        const catalog = skills_mod.discover(cwd, io, arena, user_skills_dir) catch break :blk null;
         break :blk catalog;
+    };
+
+    // Prologue inputs watched for change each turn (B-04). Stat-only: the
+    // turn cache hashes mtime/ctime/size, it never reads contents.
+    const config_watch_paths = [_][]const u8{
+        config_mod.userConfigPath(arena, environ) orelse "",
+        ".ifnh/config.json",
+        ".ifnh/config.d",
+    };
+    const skills_roots = [_][]const u8{
+        ".ifnh/skills",
+        user_skills_dir orelse "",
     };
 
     // ---- background executions (I123-125) ----
@@ -265,34 +281,47 @@ pub fn run(
         // instructions with focus dirs from recent tool activity ----
         var setup_span = trace_mod.start(trace, "turn.setup");
         defer setup_span.end();
-        if (reloadConfig(io, arena, cwd, environ, &sess)) |fresh| {
-            cfg.deinit();
-            cfg = fresh;
+        // Per-turn prologue, memoised on stat-only signatures (B-04): config
+        // is re-read only when a config file changed, instructions are
+        // re-assembled and the skills catalog re-rendered only when their
+        // inputs did.
+        const cfg_sig = turn_cache.signature(cwd, io, arena, &config_watch_paths, 1);
+        if (sess.memo.stale(cfg_sig)) {
+            var sp = trace_mod.start(trace, "turn.config_reload");
+            defer sp.end();
+            if (reloadConfig(io, arena, cwd, environ, &sess)) |fresh| {
+                cfg.deinit();
+                cfg = fresh;
+                sess.memo.accept(cfg_sig);
+                trace_mod.note(trace, "turn.config_reload reloaded");
+            }
+        } else {
+            trace_mod.note(trace, "turn.config_reload memo=hit");
         }
         const focus = instructions_mod.focusDirsFromHistory(arena, sess.history.items, 8);
-        const turn_instr = blk: {
+        const turn_prompt = blk: {
             var sp = trace_mod.start(trace, "turn.instructions");
             defer sp.end();
-            break :blk instructions_mod.assemble(cwd, io, arena, system_prompt.system_prompt, focus) catch instr;
-        };
-        // Skills catalog appendix (budgeted, K148).
-        const skill_prompt = blk: {
-            var sp = trace_mod.start(trace, "turn.skills_catalog");
-            defer sp.end();
-            if (sess.skills) |catalog| {
-                const rendered = skills_mod.renderCatalog(arena, catalog) catch "";
-                if (rendered.len > 0) {
-                    break :blk std.fmt.allocPrint(arena, "{s}\n\nAvailable skills (load with the skill tool):\n{s}", .{ turn_instr.text, rendered }) catch turn_instr.text;
-                }
-            }
-            break :blk turn_instr.text;
+            break :blk sess.memo.systemPrompt(.{
+                .workspace = cwd,
+                .io = io,
+                .arena = arena,
+                .builtin = system_prompt.system_prompt,
+                .focus_dirs = focus,
+                .catalog = sess.skills,
+                .skills_roots = &skills_roots,
+            }) catch {
+                // Memoisation must never make the turn fail harder than the
+                // uncached path: fall back to the startup instructions.
+                break :blk turn_cache.Prompt{ .text = instr.text, .stable_len = instr.stable_len };
+            };
         };
 
         try submitTurn(io, arena, environ, &sess, &cfg, buildProviderConfig(&cfg, environ), .{
-            .text = skill_prompt,
+            .text = turn_prompt.text,
             // Skills catalog is volatile: the cache breakpoint stays before
             // the focus-dependent instruction tail (B-03).
-            .stable_len = turn_instr.stable_len,
+            .stable_len = turn_prompt.stable_len,
         }, line, cwd);
     }
 }
@@ -360,9 +389,8 @@ fn submitTurn(
             var path_buf: [std.fs.max_path_bytes]u8 = undefined;
             const n = cwd.realPath(io, &path_buf) catch break :blk null;
             const repo_path = arena.dupe(u8, path_buf[0..n]) catch break :blk null;
-            const g = git_mod.Git.init(io, repo_path);
-            if (!g.isRepo(arena)) break :blk null;
-            break :blk g;
+            // Memoised on .git/HEAD: `git rev-parse` is a subprocess (B-04).
+            break :blk sess.memo.gitRepo(cwd, io, arena, repo_path);
         },
         .worktree_root = blk: {
             const home = environ.get("HOME") orelse break :blk null;
@@ -549,22 +577,14 @@ const Approver = struct {
     /// SHA-256 of policy-relevant files at session start (G99/M0-T30).
     policy_hash: [32]u8 = [_]u8{0} ** 32,
     policy_hashed: bool = false,
+    /// Stat signature the current verdict was computed from (B-04).
+    policy_sig: u64 = 0,
 
     fn policyFingerprint(self: *Approver, arena: std.mem.Allocator) ?[32]u8 {
         const cwd = std.Io.Dir.cwd();
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-        const files = [_][]const u8{
-            ".ifnh/config.json",
-            ".ifnh/config.d",
-            ".ifnh/lifecycle",
-            ".ifnh/instructions",
-            ".ifnh/commands",
-            ".ifnh/skills",
-            "AGENTS.md",
-            "CLAUDE.md",
-        };
         var any = false;
-        for (files) |f| {
+        for (policy_paths) |f| {
             const stat = cwd.statFile(self.io, f, .{}) catch continue;
             any = true;
             hasher.update(f);
@@ -592,16 +612,27 @@ const Approver = struct {
 
     /// Fail-closed on policy tampering between session start and now (G99).
     fn verifyPolicy(self: *Approver, arena: std.mem.Allocator) bool {
+        // The fingerprint hashes file contents; that is the expensive part of
+        // every approval. A stat-only signature decides whether it can have
+        // changed (B-04). `ctime` is part of the signature and cannot be set
+        // by unprivileged code, so restoring a rewritten file's mtime does
+        // not hide the edit from this fast path.
+        const sig = turn_cache.signature(std.Io.Dir.cwd(), self.io, arena, &policy_paths, 1);
+        if (self.policy_hashed and self.policy_sig == sig) return true;
+
+        const current = self.policyFingerprint(arena) orelse [_]u8{0} ** 32;
         if (!self.policy_hashed) {
-            self.policy_hash = self.policyFingerprint(arena) orelse [_]u8{0} ** 32;
+            self.policy_hash = current;
             self.policy_hashed = true;
+            self.policy_sig = sig;
             return true;
         }
-        const current = self.policyFingerprint(arena) orelse [_]u8{0} ** 32;
         if (!std.mem.eql(u8, &current, &self.policy_hash)) {
+            // Do not record `sig`: every later approval re-hashes and denies.
             out(self.io, "\nPOLICY CHANGE DETECTED: .ifnh policy files changed since session start.\nApproval denied (fail-closed). Restart the session to adopt the new policy.\n", .{}) catch {};
             return false;
         }
+        self.policy_sig = sig;
         return true;
     }
 
@@ -682,6 +713,19 @@ fn reloadConfig(
     sess.engine = new_engine;
     return fresh;
 }
+
+/// Files whose contents form the policy fingerprint (G99). Stat-only
+/// signatures over the same list short-circuit the re-hash (B-04).
+const policy_paths = [_][]const u8{
+    ".ifnh/config.json",
+    ".ifnh/config.d",
+    ".ifnh/lifecycle",
+    ".ifnh/instructions",
+    ".ifnh/commands",
+    ".ifnh/skills",
+    "AGENTS.md",
+    "CLAUDE.md",
+};
 
 const mcp_registry_sentinel: *mcp_mod.Registry = @ptrFromInt(@alignOf(usize)); // never dereferenced
 
