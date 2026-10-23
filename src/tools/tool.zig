@@ -58,6 +58,7 @@ pub const ToolContext = struct {
     /// MCP registry hooks (wired by the host; null disables MCP).
     mcp_list_fn: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator) []const u8 = null,
     mcp_call_fn: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, server: []const u8, tool: []const u8, arguments_json: []const u8) []const u8 = null,
+    mcp_describe_fn: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, server: []const u8, tool: []const u8) []const u8 = null,
     mcp_ctx: ?*anyopaque = null,
     /// Turn cancel flag (A-T06). `runCaptured` kills the child process group
     /// when it flips; null when nothing can cancel.
@@ -120,6 +121,9 @@ pub const specs = [_]Spec{
     },
     .{ .name = "mcp_list", .description = "List configured MCP servers and their tools.", .parameters_json =
     \\{"type":"object","properties":{}}
+    },
+    .{ .name = "mcp_describe", .description = "Show an MCP tool's description and input schema. Use it before mcp_call when the arguments are unclear.", .parameters_json =
+    \\{"type":"object","properties":{"server":{"type":"string"},"tool":{"type":"string"}},"required":["server","tool"]}
     },
     .{ .name = "mcp_call", .description = "Call an MCP server tool. Server/tool must be permitted; calls require approval unless allowlisted.", .parameters_json =
     \\{"type":"object","properties":{"server":{"type":"string"},"tool":{"type":"string"},"arguments":{"type":"object"}},"required":["server","tool"]}
@@ -241,6 +245,13 @@ pub fn execute(name: []const u8, args_json: []const u8, ctx: *ToolContext) ToolR
         const list_fn = ctx.mcp_list_fn orelse
             return errResult(ctx.arena, "mcp_list: MCP not configured", .{});
         return .{ .output = list_fn(ctx.mcp_ctx orelse ctx.approval_ctx, ctx.arena), .status = .ok };
+    } else if (std.mem.eql(u8, name, "mcp_describe")) {
+        const describe_fn = ctx.mcp_describe_fn orelse
+            return errResult(ctx.arena, "mcp_describe: MCP not configured", .{});
+        const server = a.str("server") orelse return errResult(ctx.arena, "mcp_describe: missing server", .{});
+        const mcp_tool = a.str("tool") orelse return errResult(ctx.arena, "mcp_describe: missing tool", .{});
+        const out = describe_fn(ctx.mcp_ctx orelse ctx.approval_ctx, ctx.arena, server, mcp_tool);
+        return .{ .output = out, .status = if (std.mem.startsWith(u8, out, "error:")) .failed else .ok };
     } else if (std.mem.eql(u8, name, "mcp_call")) {
         const call_fn = ctx.mcp_call_fn orelse
             return errResult(ctx.arena, "mcp_call: MCP not configured", .{});

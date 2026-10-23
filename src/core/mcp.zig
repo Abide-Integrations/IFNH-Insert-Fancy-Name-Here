@@ -311,6 +311,16 @@ pub const Registry = struct {
         return out.items;
     }
 
+    /// One tool's metadata and input schema, on demand (A-08/F-A08).
+    pub fn describe(self: *Registry, arena: std.mem.Allocator, server: []const u8, tool: []const u8) !?McpTool {
+        const c = try self.clientFor(server);
+        const tools = try c.listTools(arena);
+        for (tools) |t| {
+            if (std.mem.eql(u8, t.name, tool)) return t;
+        }
+        return null;
+    }
+
     pub fn call(self: *Registry, arena: std.mem.Allocator, server: []const u8, tool: []const u8, arguments_json: []const u8) !CallResult {
         const c = try self.clientFor(server);
         return c.callTool(arena, tool, arguments_json);
@@ -390,4 +400,11 @@ test "registry parses config and dispatches calls" {
 
     const res = try reg.call(arena, "fake", "echo", "{}");
     try std.testing.expectEqualStrings("echoed-ok", res.text);
+
+    // On-demand schema lookup (A-08): known tool resolves, unknown is null.
+    const described = (try reg.describe(arena, "fake", "echo")).?;
+    try std.testing.expectEqualStrings("Echo back", described.description);
+    try std.testing.expectEqualStrings("{\"type\":\"object\"}", described.input_schema_json);
+    try std.testing.expect((try reg.describe(arena, "fake", "nope")) == null);
+    try std.testing.expectError(error.UnknownServer, reg.describe(arena, "ghost", "echo"));
 }

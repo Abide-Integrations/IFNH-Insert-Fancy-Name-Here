@@ -343,6 +343,7 @@ fn submitTurn(
         .agent_label = "parent",
         .mcp_list_fn = mcpListHook,
         .mcp_call_fn = mcpCallHook,
+        .mcp_describe_fn = mcpDescribeHook,
         .mcp_ctx = sess.mcp_registry orelse mcp_registry_sentinel,
         .skill_load_fn = skillLoadHook,
         .skill_ctx = sess,
@@ -676,6 +677,16 @@ fn mcpListHook(ctx: *anyopaque, arena: std.mem.Allocator) []const u8 {
     }
     if (buf.items.len == 0) return "no MCP tools available";
     return buf.items;
+}
+
+fn mcpDescribeHook(ctx: *anyopaque, arena: std.mem.Allocator, server: []const u8, tool: []const u8) []const u8 {
+    const reg: *mcp_mod.Registry = @ptrCast(@alignCast(ctx));
+    if (reg == mcp_registry_sentinel or reg.configs.len == 0) return "error: no MCP servers configured";
+    const found = reg.describe(arena, server, tool) catch
+        return std.fmt.allocPrint(arena, "error: server '{s}' unavailable", .{server}) catch "error: server unavailable";
+    const t = found orelse
+        return std.fmt.allocPrint(arena, "error: unknown tool {s}.{s}", .{ server, tool }) catch "error: unknown tool";
+    return std.fmt.allocPrint(arena, "{s}.{s}: {s}\ninput schema: {s}", .{ server, t.name, t.description, t.input_schema_json }) catch "error: oom";
 }
 
 fn execStartHook(ctx: *anyopaque, arena: std.mem.Allocator, command: []const u8) []const u8 {
