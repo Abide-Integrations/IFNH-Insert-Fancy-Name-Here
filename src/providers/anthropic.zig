@@ -458,3 +458,32 @@ test "body drops orphan results and empty messages" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"assistant\",\"content\":[]") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\"") == null);
 }
+
+test "wire golden anthropic body is byte-stable" {
+    // A fixed request renders byte-for-byte: no maps are involved (every
+    // field is written in source order), so the full body is asserted
+    // instead of a substring set.
+    const msgs = [_]core_types.ChatMessage{
+        .{ .role = .user, .content = "first" },
+        .{ .role = .assistant, .content = "checking", .tool_calls_json = "[{\"id\":\"t1\",\"name\":\"read\",\"arguments_json\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}]" },
+        .{ .role = .tool, .content = "alpha", .tool_call_id = "t1" },
+        .{ .role = .user, .content = "second" },
+    };
+    const tools = [_]core_types.ToolSpec{
+        .{
+            .name = "read",
+            .description = "Read a file",
+            .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}}}",
+        },
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const body = try buildBody(arena, testRequest(&msgs, &tools));
+    const expected =
+        \\{"model":"claude-test","max_tokens":4096,"stream":true,"system":"sys","messages":[{"role":"user","content":"first"},{"role":"assistant","content":[{"type":"text","text":"checking"},{"type":"tool_use","id":"t1","name":"read","input":{"path":"a.txt"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"alpha"}]},{"role":"user","content":"second"}],"tools":[{"name":"read","description":"Read a file","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}}]}
+    ;
+    try std.testing.expectEqualStrings(expected, body);
+}

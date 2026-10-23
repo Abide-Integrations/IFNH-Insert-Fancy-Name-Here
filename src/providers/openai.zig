@@ -459,3 +459,32 @@ test "body skips empty assistant turns and keeps plain replies" {
     try std.testing.expectEqualStrings("hello", arr.items[2].object.get("content").?.string);
     try std.testing.expect(parsed.object.get("tools") == null);
 }
+
+test "wire golden openai body is byte-stable" {
+    // A fixed request renders byte-for-byte: no maps are involved (every
+    // field is written in source order), so the full body is asserted
+    // instead of a substring set.
+    const msgs = [_]core_types.ChatMessage{
+        .{ .role = .user, .content = "first" },
+        .{ .role = .assistant, .content = "checking", .tool_calls_json = "[{\"id\":\"c1\",\"name\":\"read\",\"arguments_json\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}]" },
+        .{ .role = .tool, .content = "alpha", .tool_call_id = "c1" },
+        .{ .role = .user, .content = "second" },
+    };
+    const tools = [_]core_types.ToolSpec{
+        .{
+            .name = "read",
+            .description = "Read a file",
+            .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}}}",
+        },
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const body = try buildBody(arena, testRequest(&msgs, &tools));
+    const expected =
+        \\{"model":"gpt-test","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"system","content":"sys"},{"role":"user","content":"first"},{"role":"assistant","content":"checking","tool_calls":[{"id":"c1","type":"function","function":{"name":"read","arguments":"{\"path\":\"a.txt\"}"}}]},{"role":"tool","tool_call_id":"c1","content":"alpha"},{"role":"user","content":"second"}],"tools":[{"type":"function","function":{"name":"read","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}],"tool_choice":"auto"}
+    ;
+    try std.testing.expectEqualStrings(expected, body);
+}
