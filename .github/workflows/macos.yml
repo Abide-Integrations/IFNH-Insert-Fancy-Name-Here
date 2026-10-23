@@ -1,0 +1,42 @@
+name: macos-arm64
+
+# Nightly + manual only: the per-push matrix stays on ubuntu to conserve
+# minutes. This job catches Apple-Silicon-only breakage.
+# Authored on Linux; the owner runs the macOS verification.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"
+
+concurrency:
+  group: macos-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Toolchain
+        run: zig version
+      - name: Format check
+        run: zig fmt --check src/
+      - name: Test
+        run: zig build test
+      - name: Build (ReleaseSafe)
+        run: zig build -Doptimize=ReleaseSafe
+      - name: Verify native arm64 binary
+        run: |
+          file zig-out/bin/ifnh
+          lipo -archs zig-out/bin/ifnh | grep -q arm64
+      - name: Smoke test
+        run: ./zig-out/bin/ifnh --version
+      - name: Binary size budget (< 5 MiB)
+        run: |
+          size=$(wc -c < zig-out/bin/ifnh | tr -d ' ')
+          echo "binary size: $size bytes"
+          test "$size" -lt 5242880
