@@ -9,6 +9,7 @@ const std = @import("std");
 const provider = @import("provider.zig");
 const sse = @import("sse.zig");
 const core_types = @import("../core/types.zig");
+const trace = @import("../core/trace.zig");
 
 pub const default_context: Context = .{};
 
@@ -29,9 +30,14 @@ pub fn streamFn(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    const stream_span = trace.begin(io, "provider.stream_total");
+    defer _ = trace.end(io, stream_span);
+
+    const build_span = trace.begin(io, "provider.request_build");
     const url = try std.fmt.allocPrint(arena, "{s}/chat/completions", .{trimSlash(req.base_url)});
     const uri = std.Uri.parse(url) catch return error.InvalidBaseUrl;
     const body = try buildBody(arena, req);
+    _ = trace.end(io, build_span);
 
     var client: std.http.Client = .{ .allocator = alloc, .io = io };
     defer client.deinit();
@@ -81,6 +87,7 @@ pub fn streamFn(
     };
     var tools: [16]ToolAcc = undefined;
     var tool_count: usize = 0;
+    var ttft_span: ?trace.Span = trace.begin(io, "provider.ttft");
 
     while (try parser.next(arena)) |payload| {
         if (req.cancel.load(.acquire)) {
@@ -122,6 +129,10 @@ pub fn streamFn(
                 const d = delta_v.object;
                 if (d.get("content")) |c| {
                     if (c == .string and c.string.len > 0) {
+                        if (ttft_span) |span| {
+                            _ = trace.end(io, span);
+                            ttft_span = null;
+                        }
                         sink.emit(.{ .content_delta = c.string });
                     }
                 }
@@ -160,6 +171,10 @@ pub fn streamFn(
             // Emit completed tool calls at finish.
             for (tools[0..tool_count]) |*t| {
                 if (t.name.len == 0) continue;
+                if (ttft_span) |span| {
+                    _ = trace.end(io, span);
+                    ttft_span = null;
+                }
                 sink.emit(.{ .tool_call = .{
                     .id = t.id,
                     .name = t.name,
@@ -173,6 +188,10 @@ pub fn streamFn(
     // Emit any accumulated tool calls not flushed by finish_reason.
     for (tools[0..tool_count]) |*t| {
         if (t.name.len == 0) continue;
+        if (ttft_span) |span| {
+            _ = trace.end(io, span);
+            ttft_span = null;
+        }
         sink.emit(.{ .tool_call = .{
             .id = t.id,
             .name = t.name,
@@ -180,6 +199,7 @@ pub fn streamFn(
         } });
     }
 
+    if (ttft_span) |span| _ = trace.end(io, span);
     sink.emit(.done);
 }
 
