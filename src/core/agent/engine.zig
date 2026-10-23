@@ -94,35 +94,48 @@ fn sinkEmit(ctx: *anyopaque, ev: core_types.StreamEvent) void {
 }
 
 /// Render tool specs (name/description/parameters) as a JSON array for the
-/// provider request.
-pub fn renderToolsJson(arena: std.mem.Allocator, names: ?[]const []const u8) ![]const u8 {
+/// provider request. Built-ins come from the tool registry, followed by any
+/// data-defined tools (`extra`).
+pub fn renderToolsJson(
+    arena: std.mem.Allocator,
+    names: ?[]const []const u8,
+    extra: []const tool_mod.ToolDef,
+) ![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
     try w.writeByte('[');
     var first = true;
-    for (tool_mod.specs) |spec| {
-        if (names) |allowed| {
-            var ok = false;
-            for (allowed) |n| {
-                if (std.mem.eql(u8, n, spec.name)) {
-                    ok = true;
-                    break;
-                }
-            }
-            if (!ok) continue;
-        }
-        if (!first) try w.writeByte(',');
-        first = false;
-        try w.writeAll("{\"type\":\"function\",\"function\":{\"name\":");
-        try std.json.Stringify.value(spec.name, .{}, w);
-        try w.writeAll(",\"description\":");
-        try std.json.Stringify.value(spec.description, .{}, w);
-        try w.writeAll(",\"parameters\":");
-        try w.writeAll(spec.parameters_json);
-        try w.writeAll("}}");
-    }
+    for (tool_mod.specs) |spec| try writeToolSpec(w, spec, names, &first);
+    for (extra) |def| try writeToolSpec(w, def.spec, names, &first);
     try w.writeByte(']');
     return aw.written();
+}
+
+fn writeToolSpec(
+    w: *std.Io.Writer,
+    spec: tool_mod.Spec,
+    names: ?[]const []const u8,
+    first: *bool,
+) !void {
+    if (names) |allowed| {
+        var ok = false;
+        for (allowed) |n| {
+            if (std.mem.eql(u8, n, spec.name)) {
+                ok = true;
+                break;
+            }
+        }
+        if (!ok) return;
+    }
+    if (!first.*) try w.writeByte(',');
+    first.* = false;
+    try w.writeAll("{\"type\":\"function\",\"function\":{\"name\":");
+    try std.json.Stringify.value(spec.name, .{}, w);
+    try w.writeAll(",\"description\":");
+    try std.json.Stringify.value(spec.description, .{}, w);
+    try w.writeAll(",\"parameters\":");
+    try w.writeAll(spec.parameters_json);
+    try w.writeAll("}}");
 }
 
 pub const RunParams = struct {
@@ -159,7 +172,7 @@ pub fn runTurn(p: RunParams) !Outcome {
 
         var collector = Collector{ .arena = p.arena, .callbacks = p.callbacks };
         const tools_json = if (p.include_tools)
-            try renderToolsJson(p.arena, null)
+            try renderToolsJson(p.arena, null, p.tool_ctx.custom_tools)
         else
             "[]";
         var attempt: usize = 0;
@@ -621,4 +634,31 @@ test "consecutive agent calls run in parallel and append in order" {
     const r2 = history.items[3].content;
     try std.testing.expect(std.mem.indexOf(u8, r1, "child-one") != null);
     try std.testing.expect(std.mem.indexOf(u8, r2, "child-two") != null);
+}
+
+test "renderToolsJson advertises built-ins then data-defined tools" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Derive a data-defined row from a built-in (handler is irrelevant here).
+    var custom = tool_mod.registry[0];
+    custom.spec = .{
+        .name = "custom_echo",
+        .description = "Echo a value.",
+        .parameters_json = "{\"type\":\"object\",\"properties\":{\"v\":{\"type\":\"string\"}}}",
+    };
+
+    const json = try renderToolsJson(arena, null, &.{custom});
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"read\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"custom_echo\"") != null);
+    // Built-ins first, custom tools appended.
+    const read_at = std.mem.indexOf(u8, json, "\"name\":\"read\"").?;
+    const custom_at = std.mem.indexOf(u8, json, "\"name\":\"custom_echo\"").?;
+    try std.testing.expect(read_at < custom_at);
+
+    // The extras argument is honoured as an allowlist filter too.
+    const filtered = try renderToolsJson(arena, &.{"custom_echo"}, &.{custom});
+    try std.testing.expect(std.mem.indexOf(u8, filtered, "\"name\":\"read\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, filtered, "\"name\":\"custom_echo\"") != null);
 }

@@ -55,6 +55,8 @@ const Session = struct {
     last_blocked_stage: ?[]const u8 = null,
     /// Persistent key store (user env file) for /provider key.
     user_keys: ?*keys_mod.Keys = null,
+    /// Data-defined tools (D-02), loaded once per session.
+    custom_tools: []const tool_mod.ToolDef = &.{},
 };
 
 var global_user_keys: keys_mod.Keys = undefined;
@@ -150,6 +152,17 @@ pub fn run(
         const catalog = skills_mod.discover(cwd, io, arena, user_dir) catch break :blk null;
         break :blk catalog;
     };
+
+    // ---- custom tools as data (D-02) ----
+    const custom_tools = tool_mod.loadCustomTools(arena, io, cwd, blk: {
+        const home = environ.get("HOME") orelse break :blk null;
+        break :blk std.fmt.allocPrint(arena, "{s}/.config/ifnh/tools", .{home}) catch null;
+    });
+    // Invalid definitions are skipped; the session always starts.
+    for (custom_tools.warnings) |warning| {
+        try out(io, "{s}tools: {s}{s}\n", .{ palette.warn("", arena), warning, "\x1b[0m" });
+    }
+    sess.custom_tools = custom_tools.tools;
 
     // ---- background executions (I123-125) ----
     sess.executions = blk: {
@@ -322,6 +335,7 @@ fn submitTurn(
         .engine = &sess.engine,
         .journal = &sess.journal,
         .max_file_read_bytes = cfg.getU32("context.max_file_read_bytes", 262144),
+        .custom_tools = sess.custom_tools,
         .approval_ctx = &approver,
         .approval_fn = Approver.approve,
         .agent_spawn_fn = subagent_mod.spawnHookFn,
