@@ -426,16 +426,27 @@ fn grepDir(
     }
 }
 
+/// Scan one file incrementally with a bounded buffer. Stops reading as soon
+/// as this file's hit cap or the batch result limit is reached.
 fn grepFile(ctx: *ToolContext, rel: []const u8, pattern: []const u8, limits: *WalkLimits, out: *std.ArrayListUnmanaged(u8)) void {
-    const data = ctx.workspace.readFileAlloc(ctx.io, rel, ctx.arena, .limited(max_file_size_bytes)) catch return;
-    if (!std.unicode.utf8ValidateSlice(data)) return; // skip binary
-    var lines = std.mem.splitScalar(u8, data, '\n');
+    const file = ctx.workspace.openFile(ctx.io, rel, .{}) catch return;
+    defer file.close(ctx.io);
+
+    var buf: [64 * 1024]u8 = undefined;
+    var reader = file.reader(ctx.io, &buf);
     var line_no: usize = 0;
     var file_hits: usize = 0;
-    while (lines.next()) |line| : (line_no += 1) {
-        if (file_hits >= 10 or limits.max_matches == 0) return;
+    while (file_hits < 10 and limits.max_matches > 0) {
+        const raw = reader.interface.takeDelimiter('\n') catch |err| switch (err) {
+            // A line longer than the buffer is not worth carrying; skip the
+            // rest of the file rather than growing memory.
+            error.StreamTooLong, error.ReadFailed => return,
+        } orelse break;
+        line_no += 1;
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (!std.unicode.utf8ValidateSlice(line)) continue; // binary-ish line
         if (std.mem.indexOf(u8, line, pattern) != null) {
-            out.print(ctx.arena, "{s}:{d}: {s}\n", .{ rel, line_no + 1, std.mem.trimEnd(u8, line, "\r") }) catch return;
+            out.print(ctx.arena, "{s}:{d}: {s}\n", .{ rel, line_no, line }) catch return;
             file_hits += 1;
             limits.max_matches -= 1;
         }
@@ -746,6 +757,32 @@ test "glob and grep tools" {
     try std.testing.expectEqual(Status.ok, gr.status);
     try std.testing.expect(std.mem.indexOf(u8, gr.output, "src/a.zig:1") != null);
     try std.testing.expect(std.mem.indexOf(u8, gr.output, "src/deep/b.zig:1") != null);
+}
+
+test "grep streams past the old per-file read cap" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+
+    // Old implementation read at most 1 MiB per file, so a match near the
+    // end of a larger file was silently missed.
+    const size = max_file_size_bytes + 1024;
+    const data = try std.testing.allocator.alloc(u8, size);
+    defer std.testing.allocator.free(data);
+    for (data, 0..) |*b, i| b.* = if (i + 1 < size and (i + 1) % 2 == 0) '\n' else 'x';
+    @memcpy(data[size - 7 ..], "needle\n");
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "big.txt", .data = data });
+
+    var e = engine_mod.Engine.init(std.testing.allocator, .ask);
+    defer e.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ctx = testCtx(arena_state.allocator(), io, tmp.dir, &e);
+
+    const r = execute("grep", "{\"pattern\":\"needle\"}", &ctx);
+    try std.testing.expectEqual(Status.ok, r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "big.txt:") != null);
 }
 
 test "edit and write with journal integration" {

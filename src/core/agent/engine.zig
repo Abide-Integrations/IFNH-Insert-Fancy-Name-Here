@@ -460,11 +460,18 @@ fn isAgentCall(tc: core_types.ToolCall) bool {
 }
 
 fn executeOne(p: RunParams, tc: core_types.ToolCall) tool_mod.ToolResult {
-    const raw = tool_mod.execute(tc.name, tc.arguments_json, p.tool_ctx);
-    return .{
-        .output = redact_mod.redact(p.arena, raw.output, p.redactions),
-        .status = raw.status,
-    };
+    // Tool arguments, scratch files and intermediate output live only for this
+    // call. Copy the final, redacted result into the long-lived history arena.
+    var scratch_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+
+    var ctx = p.tool_ctx.*;
+    ctx.arena = scratch;
+    const raw = tool_mod.execute(tc.name, tc.arguments_json, &ctx);
+    const redacted = redact_mod.redact(scratch, raw.output, p.redactions);
+    const output = p.arena.dupe(u8, redacted) catch "error: out of memory";
+    return .{ .output = output, .status = raw.status };
 }
 
 /// Run consecutive agent calls on parallel threads, each with its own
