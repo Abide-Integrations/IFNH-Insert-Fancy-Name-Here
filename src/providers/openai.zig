@@ -8,6 +8,7 @@
 const std = @import("std");
 const provider = @import("provider.zig");
 const sse = @import("sse.zig");
+const models = @import("models.zig");
 const core_types = @import("../core/types.zig");
 
 pub const default_context: Context = .{};
@@ -256,14 +257,86 @@ fn buildBody(arena: std.mem.Allocator, req: provider.ModelRequest) ![]u8 {
     if (req.temperature) |t| {
         try w.print(",\"temperature\":{d}", .{t});
     }
-    if (req.max_output_tokens) |t| {
-        try w.print(",\"max_tokens\":{d}", .{t});
+    if (req.max_output_tokens orelse models.openaiOutputTokens(req.model)) |t| {
+        const field = if (models.usesMaxCompletionTokens(req.model)) "max_completion_tokens" else "max_tokens";
+        try w.print(",\"{s}\":{d}", .{ field, t });
     }
     if (req.provider_options.len > 0) {
         try w.print(",{s}", .{std.mem.trimEnd(u8, req.provider_options, "{}")});
     }
     try w.writeByte('}');
     return aw.written();
+}
+
+test "buildBody uses per-model max_output_tokens defaults" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const cases = [_]struct { model: []const u8, field: []const u8, tokens: i64 }{
+        .{ .model = "gpt-5.1", .field = "max_completion_tokens", .tokens = 128_000 },
+        .{ .model = "o1", .field = "max_completion_tokens", .tokens = 100_000 },
+        .{ .model = "o3-mini", .field = "max_completion_tokens", .tokens = 100_000 },
+        .{ .model = "o4-mini", .field = "max_completion_tokens", .tokens = 100_000 },
+        .{ .model = "gpt-4.1", .field = "max_tokens", .tokens = 32_768 },
+        .{ .model = "gpt-4o-mini", .field = "max_tokens", .tokens = 16_384 },
+        .{ .model = "gpt-4-turbo", .field = "max_tokens", .tokens = 4_096 },
+        .{ .model = "gpt-4", .field = "max_tokens", .tokens = 4_096 },
+        .{ .model = "gpt-3.5-turbo", .field = "max_tokens", .tokens = 4_096 },
+    };
+    for (cases) |case| {
+        const body = try buildBody(arena, .{
+            .model = case.model,
+            .base_url = "https://api.openai.com/v1",
+            .api_key = "test",
+            .system = "",
+            .messages = &.{},
+            .cancel = undefined,
+        });
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{});
+        try std.testing.expectEqual(case.tokens, parsed.object.get(case.field).?.integer);
+    }
+}
+
+test "buildBody honors explicit max_output_tokens and omits unknown defaults" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const explicit = try buildBody(arena, .{
+        .model = "gpt-4o",
+        .base_url = "https://api.openai.com/v1",
+        .api_key = "test",
+        .system = "",
+        .messages = &.{},
+        .max_output_tokens = 12_345,
+        .cancel = undefined,
+    });
+    const explicit_parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, explicit, .{});
+    try std.testing.expectEqual(@as(i64, 12_345), explicit_parsed.object.get("max_tokens").?.integer);
+
+    const reasoning = try buildBody(arena, .{
+        .model = "gpt-5.1",
+        .base_url = "https://api.openai.com/v1",
+        .api_key = "test",
+        .system = "",
+        .messages = &.{},
+        .max_output_tokens = 12_345,
+        .cancel = undefined,
+    });
+    const reasoning_parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, reasoning, .{});
+    try std.testing.expectEqual(@as(i64, 12_345), reasoning_parsed.object.get("max_completion_tokens").?.integer);
+
+    const local = try buildBody(arena, .{
+        .model = "local-model",
+        .base_url = "http://localhost:11434/v1",
+        .api_key = "",
+        .system = "",
+        .messages = &.{},
+        .cancel = undefined,
+    });
+    const local_parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, local, .{});
+    try std.testing.expect(local_parsed.object.get("max_tokens") == null);
 }
 
 /// The OpenAI-compatible provider singleton.

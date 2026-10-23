@@ -8,6 +8,7 @@
 const std = @import("std");
 const provider = @import("provider.zig");
 const sse = @import("sse.zig");
+const models = @import("models.zig");
 
 const anthropic_version = "2023-06-01";
 const transfer_buffer_size: usize = 16 * 1024;
@@ -190,7 +191,7 @@ fn buildBody(arena: std.mem.Allocator, req: provider.ModelRequest) ![]u8 {
 
     try w.writeAll("{\"model\":");
     try std.json.Stringify.value(req.model, .{}, w);
-    try w.print(",\"max_tokens\":{d},\"stream\":true", .{req.max_output_tokens orelse 4096});
+    try w.print(",\"max_tokens\":{d},\"stream\":true", .{req.max_output_tokens orelse models.anthropicOutputTokens(req.model)});
 
     if (req.system.len > 0) {
         try w.writeAll(",\"system\":");
@@ -266,6 +267,59 @@ fn buildBody(arena: std.mem.Allocator, req: provider.ModelRequest) ![]u8 {
 fn strOrEmpty(v: ?std.json.Value) []const u8 {
     const val = v orelse return "";
     return if (val == .string) val.string else "";
+}
+
+test "buildBody uses per-model max_output_tokens defaults" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const cases = [_]struct { model: []const u8, tokens: i64 }{
+        .{ .model = "claude-opus-4-5", .tokens = 64_000 },
+        .{ .model = "claude-opus-4-1", .tokens = 32_000 },
+        .{ .model = "claude-opus-4", .tokens = 32_000 },
+        .{ .model = "claude-sonnet-4-6", .tokens = 64_000 },
+        .{ .model = "claude-haiku-4-5", .tokens = 64_000 },
+        .{ .model = "claude-3-7-sonnet", .tokens = 64_000 },
+        .{ .model = "claude-3-5-sonnet-20241022", .tokens = 8_192 },
+        .{ .model = "claude-3-5-haiku-20241022", .tokens = 8_192 },
+        .{ .model = "claude-3-opus-20240229", .tokens = 4_096 },
+        .{ .model = "claude-3-sonnet-20240229", .tokens = 4_096 },
+        .{ .model = "claude-3-haiku-20240307", .tokens = 4_096 },
+        .{ .model = "claude-2.1", .tokens = 4_096 },
+        .{ .model = "claude-instant-1.2", .tokens = 4_096 },
+        .{ .model = "claude-future", .tokens = 8_192 },
+    };
+    for (cases) |case| {
+        const body = try buildBody(arena, .{
+            .model = case.model,
+            .base_url = "https://api.anthropic.com",
+            .api_key = "test",
+            .system = "",
+            .messages = &.{},
+            .cancel = undefined,
+        });
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{});
+        try std.testing.expectEqual(case.tokens, parsed.object.get("max_tokens").?.integer);
+    }
+}
+
+test "buildBody honors explicit max_output_tokens" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const body = try buildBody(arena, .{
+        .model = "claude-sonnet-4-6",
+        .base_url = "https://api.anthropic.com",
+        .api_key = "test",
+        .system = "",
+        .messages = &.{},
+        .max_output_tokens = 12_345,
+        .cancel = undefined,
+    });
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{});
+    try std.testing.expectEqual(@as(i64, 12_345), parsed.object.get("max_tokens").?.integer);
 }
 
 pub var instance_context: u8 = 0;

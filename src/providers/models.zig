@@ -10,6 +10,89 @@ const std = @import("std");
 pub const max_models: usize = 200;
 pub const max_body_bytes: usize = 1024 * 1024;
 
+/// Wire protocol family for output-token defaults.
+const Wire = enum { anthropic, openai };
+
+const OutputLimit = struct {
+    tokens: u32,
+    /// Newer OpenAI reasoning models reject `max_tokens`; use
+    /// `max_completion_tokens` instead.
+    max_completion_tokens: bool = false,
+};
+
+/// Anthropic requires `max_tokens`; use this when the model is not in the
+/// table (new/self-hosted ids) instead of the old hard-coded 4096.
+const anthropic_fallback_output_tokens: u32 = 8192;
+
+const OutputLimitRow = struct {
+    /// Matched as a substring so vendor-prefixed ids
+    /// (e.g. `anthropic/claude-sonnet-4-6`) resolve too.
+    pattern: []const u8,
+    limit: OutputLimit,
+};
+
+// Ordered most-specific first. Values are each family's documented output
+// ceiling (Anthropic Messages API, OpenAI Chat Completions).
+const anthropic_output_limits = [_]OutputLimitRow{
+    .{ .pattern = "claude-opus-4-5", .limit = .{ .tokens = 64_000 } },
+    .{ .pattern = "claude-opus-4-1", .limit = .{ .tokens = 32_000 } },
+    .{ .pattern = "claude-opus-4", .limit = .{ .tokens = 32_000 } },
+    .{ .pattern = "claude-sonnet-4", .limit = .{ .tokens = 64_000 } },
+    .{ .pattern = "claude-haiku-4", .limit = .{ .tokens = 64_000 } },
+    .{ .pattern = "claude-3-7-sonnet", .limit = .{ .tokens = 64_000 } },
+    .{ .pattern = "claude-3-5-sonnet", .limit = .{ .tokens = 8_192 } },
+    .{ .pattern = "claude-3-5-haiku", .limit = .{ .tokens = 8_192 } },
+    .{ .pattern = "claude-3-opus", .limit = .{ .tokens = 4_096 } },
+    .{ .pattern = "claude-3-sonnet", .limit = .{ .tokens = 4_096 } },
+    .{ .pattern = "claude-3-haiku", .limit = .{ .tokens = 4_096 } },
+    .{ .pattern = "claude-2", .limit = .{ .tokens = 4_096 } },
+    .{ .pattern = "claude-instant", .limit = .{ .tokens = 4_096 } },
+};
+
+const openai_output_limits = [_]OutputLimitRow{
+    .{ .pattern = "gpt-5", .limit = .{ .tokens = 128_000, .max_completion_tokens = true } },
+    .{ .pattern = "o1", .limit = .{ .tokens = 100_000, .max_completion_tokens = true } },
+    .{ .pattern = "o3", .limit = .{ .tokens = 100_000, .max_completion_tokens = true } },
+    .{ .pattern = "o4", .limit = .{ .tokens = 100_000, .max_completion_tokens = true } },
+    .{ .pattern = "gpt-4.1", .limit = .{ .tokens = 32_768 } },
+    .{ .pattern = "gpt-4o", .limit = .{ .tokens = 16_384 } },
+    .{ .pattern = "gpt-4-turbo", .limit = .{ .tokens = 4_096 } },
+    .{ .pattern = "gpt-4", .limit = .{ .tokens = 4_096 } },
+    .{ .pattern = "gpt-3.5-turbo", .limit = .{ .tokens = 4_096 } },
+};
+
+/// Per-model output-token default. Null means "not in the table": for
+/// OpenAI-compatible endpoints the request simply omits the limit, which
+/// keeps local/self-hosted servers on their own default.
+fn defaultOutputLimit(wire: Wire, model: []const u8) ?OutputLimit {
+    const rows = switch (wire) {
+        .anthropic => &anthropic_output_limits,
+        .openai => &openai_output_limits,
+    };
+    for (rows) |row| {
+        if (std.mem.indexOf(u8, model, row.pattern) != null) return row.limit;
+    }
+    return null;
+}
+
+/// Exposed for the golden body tests: config overrides still use the
+/// model family's parameter name.
+pub fn usesMaxCompletionTokens(model: []const u8) bool {
+    const limit = defaultOutputLimit(.openai, model) orelse return false;
+    return limit.max_completion_tokens;
+}
+
+pub fn anthropicOutputTokens(model: []const u8) u32 {
+    const limit = defaultOutputLimit(.anthropic, model) orelse return anthropic_fallback_output_tokens;
+    return limit.tokens;
+}
+
+/// Null for unknown OpenAI-compatible models: leave the server default alone.
+pub fn openaiOutputTokens(model: []const u8) ?u32 {
+    const limit = defaultOutputLimit(.openai, model) orelse return null;
+    return limit.tokens;
+}
+
 pub const ModelEntry = struct {
     id: []const u8,
     /// Context window in tokens when the provider advertises it
@@ -155,4 +238,20 @@ test "model list url construction" {
     try std.testing.expectEqualStrings("https://openrouter.ai/api/v1/models", modelListUrl(a, "https://openrouter.ai/api/v1", false));
     try std.testing.expectEqualStrings("http://localhost:11434/v1/models", modelListUrl(a, "http://localhost:11434/v1/", false));
     try std.testing.expectEqualStrings("https://api.anthropic.com/v1/models?limit=100", modelListUrl(a, "https://api.anthropic.com", true));
+}
+
+test "per-model max_output_tokens defaults" {
+    try std.testing.expectEqual(@as(u32, 64_000), defaultOutputLimit(.anthropic, "claude-sonnet-4-6").?.tokens);
+    try std.testing.expectEqual(@as(u32, 64_000), defaultOutputLimit(.anthropic, "anthropic/claude-opus-4-5").?.tokens);
+    try std.testing.expectEqual(@as(u32, 32_000), defaultOutputLimit(.anthropic, "claude-opus-4-1").?.tokens);
+    try std.testing.expectEqual(@as(u32, 8_192), defaultOutputLimit(.anthropic, "claude-3-5-sonnet-20241022").?.tokens);
+    try std.testing.expectEqual(@as(u32, 4_096), defaultOutputLimit(.anthropic, "claude-3-haiku-20240307").?.tokens);
+    try std.testing.expect(defaultOutputLimit(.anthropic, "claude-new-family") == null);
+
+    try std.testing.expectEqual(@as(u32, 128_000), defaultOutputLimit(.openai, "gpt-5.1").?.tokens);
+    try std.testing.expect(usesMaxCompletionTokens("gpt-5.1"));
+    try std.testing.expectEqual(@as(u32, 32_768), defaultOutputLimit(.openai, "gpt-4.1").?.tokens);
+    try std.testing.expectEqual(@as(u32, 16_384), defaultOutputLimit(.openai, "gpt-4o-mini").?.tokens);
+    try std.testing.expect(!usesMaxCompletionTokens("gpt-4o"));
+    try std.testing.expect(defaultOutputLimit(.openai, "local-model") == null);
 }
