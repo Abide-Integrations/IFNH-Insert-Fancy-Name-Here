@@ -84,7 +84,7 @@ approval needed: run command
 | `/skills` | installed skills |
 | `/mcp` | MCP servers/tools |
 | `/exec` | background executions |
-| `/usage` | session token totals |
+| `/usage` | session tokens and estimated cost |
 | `/compact` | force context compaction |
 | `/lifecycle run <file.json> [--from <n>]` | run a lifecycle |
 | `/review override <reason>` | developer-only override of a blocked review (audited) |
@@ -135,7 +135,7 @@ The full annotated default lives in `src/core/config/config.zig`
     "env_allow": ["GITHUB_TOKEN"]  // env vars agents may see
   },
   "git": { "commits": "ask", "push": "never", "force_push": "never" },
-  "agents": { "max_depth": 1, "max_concurrent": 4 },
+  "agents": { "max_depth": 1, "max_concurrent": 4, "budget_usd": 5.0 },
   "ui": { "colors": true }
 }
 ```
@@ -236,7 +236,39 @@ Run with `/lifecycle run .ifnh/lifecycle/ship.json` (resume with
 ## 11. Observability
 
 - `ifnh doctor` — environment health.
-- `/usage` — session token totals; per-turn records in the session dir.
+- `/usage` — session token totals (input, output, cache read/write), plus an
+  estimated dollar cost when the model is in the price table; per-turn
+  records live in the session dir.
+- **Pricing** is a data file, not compiled-in policy. Rates are USD per
+  million tokens:
+
+  ```json
+  {
+    "models": {
+      "my-model": {
+        "input_per_mtok": 3,
+        "output_per_mtok": 15,
+        "cache_read_per_mtok": 0.3,
+        "cache_write_per_mtok": 3.75
+      }
+    },
+    "fallback": {
+      "input_per_mtok": 1,
+      "output_per_mtok": 2,
+      "cache_read_per_mtok": 0.1,
+      "cache_write_per_mtok": 0.2
+    }
+  }
+  ```
+
+  Resolution order: `$IFNH_PRICING_FILE`, then
+  `$XDG_CONFIG_HOME/ifnh/pricing.json`, then `.ifnh/pricing.json`, then the
+  table shipped with the binary. `fallback` is used for unknown models;
+  without it their cost is reported as unavailable, never as zero.
+- `agents.budget_usd` is a circuit breaker. Before each provider round the
+  current session's estimated spend is added to the turn's estimate; if it
+  exceeds the budget the turn stops with a clear message. Set it to `null`
+  (the default) for no limit. Costs are estimates; provider billing wins.
 - Logs: `--log-level err|info|debug|trace` (debug/trace redact secrets at
   write time).
 

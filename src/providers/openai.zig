@@ -136,9 +136,19 @@ pub fn streamFn(
         if (o.get("usage")) |usage_v| {
             if (usage_v == .object) {
                 const u = usage_v.object;
+                var cache_read_tokens: u64 = 0;
+                var cache_write_tokens: u64 = 0;
+                if (u.get("prompt_tokens_details")) |details| {
+                    if (details == .object) {
+                        cache_read_tokens = intOf(details.object.get("cached_tokens")) orelse 0;
+                        cache_write_tokens = intOf(details.object.get("cache_write_tokens")) orelse 0;
+                    }
+                }
                 sink.emit(.{ .usage = .{
                     .input_tokens = intOf(u.get("prompt_tokens")) orelse 0,
                     .output_tokens = intOf(u.get("completion_tokens")) orelse 0,
+                    .cache_read_tokens = cache_read_tokens,
+                    .cache_write_tokens = cache_write_tokens,
                 } });
             }
         }

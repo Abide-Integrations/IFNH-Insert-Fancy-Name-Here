@@ -97,6 +97,8 @@ pub fn streamFn(
     var tool_count: usize = 0;
     var input_tokens: u64 = 0;
     var output_tokens: u64 = 0;
+    var cache_read_tokens: u64 = 0;
+    var cache_write_tokens: u64 = 0;
 
     while (true) {
         const maybe_payload = parser.next(arena) catch |err| {
@@ -119,7 +121,11 @@ pub fn streamFn(
             if (o.get("message")) |m| {
                 if (m == .object) {
                     if (m.object.get("usage")) |u| {
-                        if (u == .object) input_tokens = intOf(u.object.get("input_tokens")) orelse 0;
+                        if (u == .object) {
+                            input_tokens = intOf(u.object.get("input_tokens")) orelse 0;
+                            cache_read_tokens = intOf(u.object.get("cache_read_input_tokens")) orelse 0;
+                            cache_write_tokens = intOf(u.object.get("cache_creation_input_tokens")) orelse 0;
+                        }
                     }
                 }
             }
@@ -176,8 +182,13 @@ pub fn streamFn(
         } });
     }
 
-    if (input_tokens != 0 or output_tokens != 0) {
-        sink.emit(.{ .usage = .{ .input_tokens = input_tokens, .output_tokens = output_tokens } });
+    if (input_tokens != 0 or output_tokens != 0 or cache_read_tokens != 0 or cache_write_tokens != 0) {
+        sink.emit(.{ .usage = .{
+            .input_tokens = input_tokens,
+            .output_tokens = output_tokens,
+            .cache_read_tokens = cache_read_tokens,
+            .cache_write_tokens = cache_write_tokens,
+        } });
     }
     sink.emit(.done);
 }

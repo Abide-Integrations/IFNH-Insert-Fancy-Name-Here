@@ -495,6 +495,7 @@ test {
     _ = @import("providers/anthropic.zig");
     _ = @import("core/instructions.zig");
     _ = @import("core/agent/engine.zig");
+    _ = @import("core/agent/pricing.zig");
     _ = @import("core/agent/testing.zig");
     _ = @import("core/agent/subagent.zig");
     _ = @import("core/git.zig");
