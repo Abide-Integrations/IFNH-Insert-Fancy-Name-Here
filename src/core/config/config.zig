@@ -476,6 +476,46 @@ pub fn load(
     return store;
 }
 
+/// Cheap fingerprint of the on-disk config layers (B-04). Used by the REPL to
+/// skip `load()` when no file has changed. Hashes names, sizes and mtimes;
+/// content is only read after the stamp moves.
+pub fn diskStamp(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    project_dir: ?std.Io.Dir,
+) u64 {
+    var h = std.hash.Wyhash.init(0);
+    const addStat = struct {
+        fn f(hasher: *std.hash.Wyhash, st: std.Io.File.Stat) void {
+            hasher.update(std.mem.asBytes(&st.size));
+            hasher.update(std.mem.asBytes(&st.mtime.nanoseconds));
+        }
+    }.f;
+
+    if (userConfigPath(arena, environ)) |path| {
+        h.update(path);
+        if (std.Io.Dir.cwd().statFile(io, path, .{})) |st| addStat(&h, st) else |_| {}
+    }
+    if (project_dir) |cwd| {
+        if (cwd.statFile(io, ".ifnh/config.json", .{})) |st| {
+            h.update(".ifnh/config.json");
+            addStat(&h, st);
+        } else |_| {}
+        if (cwd.openDir(io, ".ifnh/config.d", .{ .iterate = true })) |dir| {
+            var d = dir;
+            defer d.close(io);
+            var it = d.iterate();
+            while (it.next(io) catch null) |entry| {
+                if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".json")) continue;
+                h.update(entry.name);
+                if (d.statFile(io, entry.name, .{})) |st| addStat(&h, st) else |_| {}
+            }
+        } else |_| {}
+    }
+    return h.final();
+}
+
 pub const max_config_bytes: usize = 256 * 1024;
 
 /// Platform-appropriate user config file path, allocated in `arena`.
@@ -589,4 +629,26 @@ test "setPath creates intermediate objects" {
     defer store.deinit();
     try store.setPath("a.b.c", .{ .integer = 7 });
     try std.testing.expectEqual(@as(i64, 7), store.get("a.b.c").?.integer);
+}
+
+test "disk stamp moves when a project config file changes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const before = diskStamp(a, io, null, tmp.dir);
+    try tmp.dir.createDirPath(io, ".ifnh/config.d");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ifnh/config.json", .data = "{\"model\":{\"model\":\"a\"}}" });
+    const after_write = diskStamp(a, io, null, tmp.dir);
+    try std.testing.expect(before != after_write);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ifnh/config.d/10-x.json", .data = "{\"model\":{\"model\":\"b\"}}" });
+    const after_dir = diskStamp(a, io, null, tmp.dir);
+    try std.testing.expect(after_write != after_dir);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ifnh/config.json", .data = "{\"model\":{\"model\":\"longer-a\"}}" });
+    try std.testing.expect(after_dir != diskStamp(a, io, null, tmp.dir));
 }

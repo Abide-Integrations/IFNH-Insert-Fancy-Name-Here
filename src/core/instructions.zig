@@ -78,7 +78,19 @@ pub fn assemble(
         } else |_| {}
     }
 
-    // Nested AGENTS.md for focus directories (deepest path wins duplicates).
+    try appendFocus(workspace, io, arena, focus_dirs, &parts, &sources);
+
+    return .{ .text = parts.items, .sources = sources.items };
+}
+
+fn appendFocus(
+    workspace: std.Io.Dir,
+    io: std.Io,
+    arena: std.mem.Allocator,
+    focus_dirs: []const []const u8,
+    parts: *std.ArrayListUnmanaged(u8),
+    sources: *std.ArrayListUnmanaged(Source),
+) !void {
     var seen_dirs: std.ArrayListUnmanaged([]const u8) = .empty;
     for (focus_dirs) |dir| {
         if (dir.len == 0 or std.mem.eql(u8, dir, ".")) continue;
@@ -100,8 +112,49 @@ pub fn assemble(
             try sources.append(arena, .{ .path = agents_path, .layer = "nested" });
         } else |_| {}
     }
+}
 
+/// Focus-dir instructions only (B-04). The stable repo/project prefix is
+/// cached by the caller; this reads just the nested files for this turn.
+pub fn assembleFocus(
+    workspace: std.Io.Dir,
+    io: std.Io,
+    arena: std.mem.Allocator,
+    focus_dirs: []const []const u8,
+) !Assembled {
+    var parts: std.ArrayListUnmanaged(u8) = .empty;
+    var sources: std.ArrayListUnmanaged(Source) = .empty;
+    try appendFocus(workspace, io, arena, focus_dirs, &parts, &sources);
     return .{ .text = parts.items, .sources = sources.items };
+}
+
+/// Fingerprint the stable instruction inputs (repo AGENTS/CLAUDE and
+/// `.ifnh/instructions/*.md`). Names, sizes and mtimes only, so the cache
+/// check does not read contents (B-04).
+pub fn stableStamp(workspace: std.Io.Dir, io: std.Io) u64 {
+    var h = std.hash.Wyhash.init(0);
+    const addFile = struct {
+        fn f(dir: std.Io.Dir, io2: std.Io, hasher: *std.hash.Wyhash, path: []const u8) void {
+            const st = dir.statFile(io2, path, .{}) catch return;
+            hasher.update(path);
+            hasher.update(std.mem.asBytes(&st.size));
+            hasher.update(std.mem.asBytes(&st.mtime.nanoseconds));
+        }
+    }.f;
+
+    addFile(workspace, io, &h, "AGENTS.md");
+    addFile(workspace, io, &h, "CLAUDE.md");
+    if (workspace.openDir(io, ".ifnh/instructions", .{ .iterate = true })) |dir| {
+        var d = dir;
+        defer d.close(io);
+        var it = d.iterate();
+        while (it.next(io) catch null) |entry| {
+            if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".md")) {
+                addFile(d, io, &h, entry.name);
+            }
+        }
+    } else |_| {}
+    return h.final();
 }
 
 /// Extract the directories referenced by tool calls in the history
@@ -223,4 +276,19 @@ test "stable system prefix survives a simulated turn with focus dirs" {
     try std.testing.expectEqualStrings(sys1.text[0..sys1.stable_len], sys2.text[0..sys2.stable_len]);
     try std.testing.expect(std.mem.indexOf(u8, sys1.text[sys1.stable_len..], "src rules") != null);
     try std.testing.expect(std.mem.indexOf(u8, sys2.text[sys2.stable_len..], "test rules") != null);
+}
+
+test "stable instruction stamp moves only when inputs change" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = "one" });
+    const first = stableStamp(tmp.dir, io);
+    try std.testing.expectEqual(first, stableStamp(tmp.dir, io));
+    try tmp.dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = "one two" });
+    try std.testing.expect(first != stableStamp(tmp.dir, io));
+
+    try tmp.dir.createDirPath(io, ".ifnh/instructions");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ifnh/instructions/a.md", .data = "project" });
+    try std.testing.expect(stableStamp(tmp.dir, io) != first);
 }

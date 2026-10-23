@@ -60,6 +60,15 @@ const Session = struct {
     /// provider request in this session. Uses a thread-safe allocator because
     /// the connection pool may be touched from subagent threads.
     http_client: ?*std.http.Client = null,
+    /// Per-turn caches (B-04): stat fingerprints prevent re-reading unchanged
+    /// config/instructions, and the rendered skills catalog is reused.
+    config_stamp: u64 = 0,
+    config_stamp_valid: bool = false,
+    stable_instr: ?instructions_mod.Assembled = null,
+    stable_instr_stamp: u64 = 0,
+    skills_rendered: ?[]const u8 = null,
+    git: ?git_mod.Git = null,
+    git_checked: bool = false,
 };
 
 var global_user_keys: keys_mod.Keys = undefined;
@@ -156,6 +165,9 @@ pub fn run(
     }
     defer if (http_client) |c| c.deinit();
 
+    sess.config_stamp = config_mod.diskStamp(arena, io, environ, cwd);
+    sess.config_stamp_valid = true;
+
     defer {
         if (sess.executions) |reg| reg.deinit(); // kill background children (I125)
         if (sess.mcp_registry) |reg| reg.deinit();
@@ -170,6 +182,7 @@ pub fn run(
         const catalog = skills_mod.discover(cwd, io, arena, user_dir) catch break :blk null;
         break :blk catalog;
     };
+    if (sess.skills) |catalog| sess.skills_rendered = skills_mod.renderCatalog(arena, catalog) catch null;
     _ = trace.end(io, skills_span);
 
     // ---- background executions (I123-125) ----
@@ -259,23 +272,25 @@ pub fn run(
         _ = trace.end(io, reload_span);
         const assemble_span = trace.begin(io, "turn.instructions");
         // (a) Byte-stable prefix: base prompt + repo/project instructions.
-        // Assembly order is deterministic, so unchanged files produce
-        // identical bytes turn to turn (B-03).
-        const stable_instr = instructions_mod.assemble(cwd, io, arena, system_prompt.system_prompt, &.{}) catch instr;
+        // Reused until a stat fingerprint changes (B-03/B-04).
+        const instr_stamp = instructions_mod.stableStamp(cwd, io);
+        if (sess.stable_instr == null or sess.stable_instr_stamp != instr_stamp) {
+            sess.stable_instr = instructions_mod.assemble(cwd, io, arena, system_prompt.system_prompt, &.{}) catch instr;
+            sess.stable_instr_stamp = instr_stamp;
+        }
+        const stable_instr = sess.stable_instr.?;
         // (b) Volatile suffix: nested focus-dir instructions from recent tools.
         const focus = instructions_mod.focusDirsFromHistory(arena, sess.history.items, 8);
-        const turn_instr = instructions_mod.assemble(cwd, io, arena, system_prompt.system_prompt, focus) catch stable_instr;
+        const volatile_instr = blk: {
+            const focus_asm = instructions_mod.assembleFocus(cwd, io, arena, focus) catch break :blk "";
+            break :blk focus_asm.text;
+        };
         _ = trace.end(io, assemble_span);
-        const volatile_instr = if (std.mem.startsWith(u8, turn_instr.text, stable_instr.text))
-            turn_instr.text[stable_instr.text.len..]
-        else
-            turn_instr.text;
         const catalog_span = trace.begin(io, "turn.skills_catalog");
         defer _ = trace.end(io, catalog_span);
-        // Skills catalog appendix (budgeted, K148), also volatile.
+        // Skills catalog appendix (budgeted, K148), rendered once at startup.
         const volatile_full = blk: {
-            if (sess.skills) |catalog| {
-                const rendered = skills_mod.renderCatalog(arena, catalog) catch "";
+            if (sess.skills_rendered) |rendered| {
                 if (rendered.len > 0) {
                     break :blk std.fmt.allocPrint(arena, "{s}\n\nAvailable skills (load with the skill tool):\n{s}", .{ volatile_instr, rendered }) catch volatile_instr;
                 }
@@ -345,12 +360,17 @@ fn submitTurn(
         .max_output_tokens = cfg.getOptionalU32("model.max_output_tokens"),
         .cancel = &cancel,
         .git = blk: {
-            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-            const n = cwd.realPath(io, &path_buf) catch break :blk null;
-            const repo_path = arena.dupe(u8, path_buf[0..n]) catch break :blk null;
-            const g = git_mod.Git.init(io, repo_path);
-            if (!g.isRepo(arena)) break :blk null;
-            break :blk g;
+            if (!sess.git_checked) {
+                sess.git_checked = true;
+                var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+                if (cwd.realPath(io, &path_buf)) |n| {
+                    if (arena.dupe(u8, path_buf[0..n])) |repo_path| {
+                        const g = git_mod.Git.init(io, repo_path);
+                        if (g.isRepo(arena)) sess.git = g;
+                    } else |_| {}
+                } else |_| {}
+            }
+            break :blk sess.git;
         },
         .worktree_root = blk: {
             const home = environ.get("HOME") orelse break :blk null;
@@ -513,6 +533,17 @@ fn submitTurn(
     try sess.store.syncWatermark();
 }
 
+const policy_files = [_][]const u8{
+    ".ifnh/config.json",
+    ".ifnh/config.d",
+    ".ifnh/lifecycle",
+    ".ifnh/instructions",
+    ".ifnh/commands",
+    ".ifnh/skills",
+    "AGENTS.md",
+    "CLAUDE.md",
+};
+
 const Approver = struct {
     io: std.Io,
     engine: *engine_mod.Engine,
@@ -520,22 +551,17 @@ const Approver = struct {
     /// SHA-256 of policy-relevant files at session start (G99/M0-T30).
     policy_hash: [32]u8 = [_]u8{0} ** 32,
     policy_hashed: bool = false,
+    /// Stamp of the files at the last full content hash (B-04). Includes
+    /// mtime, ctime, size and inode, so a content change cannot hide by
+    /// preserving mtime+size (ctime cannot be set by userspace).
+    policy_stamp: u64 = 0,
+    policy_stamp_valid: bool = false,
 
     fn policyFingerprint(self: *Approver, arena: std.mem.Allocator) ?[32]u8 {
         const cwd = std.Io.Dir.cwd();
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-        const files = [_][]const u8{
-            ".ifnh/config.json",
-            ".ifnh/config.d",
-            ".ifnh/lifecycle",
-            ".ifnh/instructions",
-            ".ifnh/commands",
-            ".ifnh/skills",
-            "AGENTS.md",
-            "CLAUDE.md",
-        };
         var any = false;
-        for (files) |f| {
+        for (policy_files) |f| {
             const stat = cwd.statFile(self.io, f, .{}) catch continue;
             any = true;
             hasher.update(f);
@@ -561,18 +587,54 @@ const Approver = struct {
         return digest;
     }
 
+    fn policyStamp(self: *Approver) u64 {
+        const cwd = std.Io.Dir.cwd();
+        var h = std.hash.Wyhash.init(0);
+        const addStat = struct {
+            fn f(hasher: *std.hash.Wyhash, st: std.Io.File.Stat) void {
+                hasher.update(std.mem.asBytes(&st.size));
+                hasher.update(std.mem.asBytes(&st.mtime.nanoseconds));
+                hasher.update(std.mem.asBytes(&st.ctime.nanoseconds));
+                hasher.update(std.mem.asBytes(&st.inode));
+            }
+        }.f;
+        for (policy_files) |f| {
+            const st = cwd.statFile(self.io, f, .{}) catch continue;
+            h.update(f);
+            addStat(&h, st);
+            if (st.kind == .directory) {
+                var d = cwd.openDir(self.io, f, .{ .iterate = true }) catch continue;
+                defer d.close(self.io);
+                var it = d.iterate();
+                while (it.next(self.io) catch null) |entry| {
+                    h.update(entry.name);
+                    if (d.statFile(self.io, entry.name, .{})) |cs| addStat(&h, cs) else |_| {}
+                }
+            }
+        }
+        return h.final();
+    }
+
     /// Fail-closed on policy tampering between session start and now (G99).
     fn verifyPolicy(self: *Approver, arena: std.mem.Allocator) bool {
+        const stamp = self.policyStamp();
+        if (self.policy_hashed and self.policy_stamp_valid and stamp == self.policy_stamp) return true;
+
+        const current = self.policyFingerprint(arena) orelse [_]u8{0} ** 32;
         if (!self.policy_hashed) {
-            self.policy_hash = self.policyFingerprint(arena) orelse [_]u8{0} ** 32;
+            self.policy_hash = current;
             self.policy_hashed = true;
+            self.policy_stamp = stamp;
+            self.policy_stamp_valid = true;
             return true;
         }
-        const current = self.policyFingerprint(arena) orelse [_]u8{0} ** 32;
         if (!std.mem.eql(u8, &current, &self.policy_hash)) {
             out(self.io, "\nPOLICY CHANGE DETECTED: .ifnh policy files changed since session start.\nApproval denied (fail-closed). Restart the session to adopt the new policy.\n", .{}) catch {};
             return false;
         }
+        // Touched but unchanged: refresh the stamp so later approvals are cheap.
+        self.policy_stamp = stamp;
+        self.policy_stamp_valid = true;
         return true;
     }
 
@@ -638,6 +700,8 @@ fn reloadConfig(
     environ: *const std.process.Environ.Map,
     sess: *Session,
 ) ?config_mod.Store {
+    const stamp = config_mod.diskStamp(arena, io, environ, cwd);
+    if (sess.config_stamp_valid and sess.config_stamp == stamp) return null;
     var fresh = config_mod.load(arena, io, environ, cwd) catch return null;
     for (sess.overrides.items) |ov| {
         fresh.applyOverride(ov.path, ov.json, .{ .layer = .session, .origin = "session" }) catch {};
@@ -651,6 +715,8 @@ fn reloadConfig(
     var new_engine = engineFromConfig(arena, &fresh);
     new_engine.grants = sess.engine.grants;
     sess.engine = new_engine;
+    sess.config_stamp = stamp;
+    sess.config_stamp_valid = true;
     return fresh;
 }
 
