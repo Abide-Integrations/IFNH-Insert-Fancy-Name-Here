@@ -501,6 +501,7 @@ test {
     _ = @import("core/compaction.zig");
     _ = @import("core/lifecycle.zig");
     _ = @import("core/executions.zig");
+    _ = @import("core/interrupt.zig");
     _ = @import("ui/style.zig");
     _ = @import("ui/secret.zig");
     _ = @import("providers/models.zig");

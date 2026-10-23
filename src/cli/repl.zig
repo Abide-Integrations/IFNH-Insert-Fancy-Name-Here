@@ -278,6 +278,9 @@ fn submitTurn(
     }
 
     var cancel = std.atomic.Value(bool).init(false);
+    // Ctrl-C sets `cancel` while the turn runs; a second one exits (A-06).
+    @import("../core/interrupt.zig").install(&cancel);
+    defer @import("../core/interrupt.zig").uninstall();
     var approver = Approver{ .io = io, .engine = &sess.engine };
     var host = subagent_mod.Host{
         .io = io,

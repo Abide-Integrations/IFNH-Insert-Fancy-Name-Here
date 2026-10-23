@@ -176,6 +176,11 @@ pub fn runTurn(p: RunParams) !Outcome {
         last_reply = reply;
 
         if (collector.failure) |f| {
+            // An interrupted stream is a cancellation, not a provider error:
+            // the REPL prints "(interrupted)" and rolls the turn back.
+            if (f.kind == .cancelled) {
+                return .{ .status = .cancelled, .reply = last_reply, .tool_rounds = rounds, .tool_calls = total_calls, .usage = total_usage };
+            }
             return .{
                 .status = .failed,
                 .reply = last_reply,
@@ -450,6 +455,50 @@ test "runTurn surfaces provider failure" {
     });
     try std.testing.expectEqual(Status.failed, outcome.status);
     try std.testing.expectEqualStrings("bad key", outcome.error_message);
+}
+
+test "a cancelled stream reports cancelled, not failed" {
+    const io = std.testing.io;
+    // The fake checks `req.cancel` first, so a pre-set flag cancels the call.
+    var fake = testing.Fake{ .script = &.{
+        &.{.{ .text = "partial" }},
+    } };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var perm_engine = @import("../permissions/engine.zig").Engine.init(arena, .auto);
+    var tool_ctx: tool_mod.ToolContext = .{
+        .io = io,
+        .arena = arena,
+        .workspace = std.Io.Dir.cwd(),
+        .engine = &perm_engine,
+        .journal = null,
+        .max_file_read_bytes = 1024,
+        .approval_ctx = undefined,
+        .approval_fn = undefined,
+    };
+    var history: std.ArrayListUnmanaged(core_types.ChatMessage) = .empty;
+    var cancel = std.atomic.Value(bool).init(true);
+
+    const outcome = try runTurn(.{
+        .io = io,
+        .arena = arena,
+        .pcfg = .{ .provider = fake.provider(), .model = "fake", .base_url = "", .api_key = "" },
+        .system = "",
+        .history = &history,
+        .tool_ctx = &tool_ctx,
+        .callbacks = .{
+            .ctx = undefined,
+            .on_text = noopText,
+            .on_tool_start = noopStart,
+            .on_tool_result = noopResult,
+            .on_notice = noopNotice,
+        },
+        .cancel = &cancel,
+    });
+    try std.testing.expectEqual(Status.cancelled, outcome.status);
+    try std.testing.expectEqualStrings("", outcome.error_message);
 }
 
 fn isAgentCall(tc: core_types.ToolCall) bool {
