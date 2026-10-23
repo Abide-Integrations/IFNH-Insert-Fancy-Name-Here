@@ -12,6 +12,7 @@ const fsutil = @import("core/fsutil.zig");
 const repl = @import("cli/repl.zig");
 const session_mod = @import("core/session/store.zig");
 const config_mod = @import("core/config/config.zig");
+const trace = @import("core/trace.zig");
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -20,6 +21,10 @@ pub const std_options: std.Options = .{
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const arena = init.arena.allocator();
+
+    // Timing spans (ACTIVE_PLAN B-01): no-op unless IFNH_TRACE_STARTUP is set.
+    trace.init(io, init.environ_map);
+    trace.mark(io, "process.start");
 
     // Collect argv (skip argv[0]).
     var argv: std.ArrayList([]const u8) = .empty;
@@ -508,5 +513,6 @@ test {
     _ = @import("core/agent/system_prompt.zig");
     _ = @import("cli/repl.zig");
     _ = @import("core/redact.zig");
+    _ = @import("core/trace.zig");
     _ = @import("providers/testing.zig");
 }

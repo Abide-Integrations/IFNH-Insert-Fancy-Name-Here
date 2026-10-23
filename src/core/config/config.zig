@@ -445,6 +445,9 @@ pub fn load(
             if (!std.mem.startsWith(u8, key, "IFNH_")) continue;
             const rest = key["IFNH_".len..];
             if (rest.len == 0) continue;
+            // Diagnostics toggles are read directly, not through the config
+            // tree (ACTIVE_PLAN B-01): IFNH_TRACE_STARTUP is not a config key.
+            if (std.mem.eql(u8, rest, "TRACE_STARTUP")) continue;
             var parts: std.ArrayListUnmanaged([]const u8) = .empty;
             var sit = std.mem.splitSequence(u8, rest, "__");
             while (sit.next()) |part| {

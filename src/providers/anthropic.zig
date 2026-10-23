@@ -8,6 +8,8 @@
 const std = @import("std");
 const provider = @import("provider.zig");
 const sse = @import("sse.zig");
+const trace = @import("../core/trace.zig");
+const models = @import("models.zig");
 
 const anthropic_version = "2023-06-01";
 const transfer_buffer_size: usize = 16 * 1024;
@@ -24,9 +26,14 @@ pub fn streamFn(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    const stream_span = trace.begin(io, "provider.stream_total");
+    defer _ = trace.end(io, stream_span);
+
+    const build_span = trace.begin(io, "provider.request_build");
     const url = try std.fmt.allocPrint(arena, "{s}/v1/messages", .{trimSlash(req.base_url)});
     const uri = std.Uri.parse(url) catch return error.InvalidBaseUrl;
     const body = try buildBody(arena, req);
+    _ = trace.end(io, build_span);
 
     var client: std.http.Client = .{ .allocator = alloc, .io = io };
     defer client.deinit();
@@ -77,6 +84,7 @@ pub fn streamFn(
     var tool_count: usize = 0;
     var input_tokens: u64 = 0;
     var output_tokens: u64 = 0;
+    var ttft_span: ?trace.Span = trace.begin(io, "provider.ttft");
 
     while (try parser.next(arena)) |payload| {
         if (req.cancel.load(.acquire)) {
@@ -123,7 +131,13 @@ pub fn streamFn(
             if (dt != .string) continue;
             if (std.mem.eql(u8, dt.string, "text_delta")) {
                 if (d.get("text")) |t| {
-                    if (t == .string and t.string.len > 0) sink.emit(.{ .content_delta = t.string });
+                    if (t == .string and t.string.len > 0) {
+                        if (ttft_span) |span| {
+                            _ = trace.end(io, span);
+                            ttft_span = null;
+                        }
+                        sink.emit(.{ .content_delta = t.string });
+                    }
                 }
             } else if (std.mem.eql(u8, dt.string, "input_json_delta")) {
                 if (d.get("partial_json")) |pj| {
@@ -144,12 +158,17 @@ pub fn streamFn(
 
     for (tools[0..tool_count]) |*t| {
         if (t.name.len == 0) continue;
+        if (ttft_span) |span| {
+            _ = trace.end(io, span);
+            ttft_span = null;
+        }
         sink.emit(.{ .tool_call = .{
             .id = t.id,
             .name = t.name,
             .arguments_json = t.args.items,
         } });
     }
+    if (ttft_span) |span| _ = trace.end(io, span);
 
     if (input_tokens != 0 or output_tokens != 0) {
         sink.emit(.{ .usage = .{ .input_tokens = input_tokens, .output_tokens = output_tokens } });

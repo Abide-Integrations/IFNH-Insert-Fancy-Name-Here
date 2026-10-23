@@ -28,6 +28,7 @@ const secret_mod = @import("../ui/secret.zig");
 const models_mod = @import("../providers/models.zig");
 const tool_mod = @import("../tools/tool.zig");
 const core_types = @import("../core/types.zig");
+const trace = @import("../core/trace.zig");
 const openai = @import("../providers/openai.zig");
 const anthropic = @import("../providers/anthropic.zig");
 
@@ -101,7 +102,9 @@ pub fn run(
     const cwd = std.Io.Dir.cwd();
 
     // ---- configuration ----
+    const cfg_span = trace.begin(io, "startup.config");
     var cfg = try config_mod.load(arena, io, environ, cwd);
+    _ = trace.end(io, cfg_span);
     defer cfg.deinit();
     for (cfg.errors.items) |err| {
         try out(io, "config error [{s}]: {s}\n", .{ err.path, err.message });
@@ -145,11 +148,13 @@ pub fn run(
     }
 
     // ---- skills catalog (K148/149) ----
+    const skills_span = trace.begin(io, "startup.skills");
     sess.skills = blk: {
         const user_dir = std.fmt.allocPrint(arena, "{s}/.config/ifnh/skills", .{environ.get("HOME") orelse ""}) catch break :blk null;
         const catalog = skills_mod.discover(cwd, io, arena, user_dir) catch break :blk null;
         break :blk catalog;
     };
+    _ = trace.end(io, skills_span);
 
     // ---- background executions (I123-125) ----
     sess.executions = blk: {
@@ -170,10 +175,13 @@ pub fn run(
     const provider_name = cfg.getString("model.provider", "openai");
 
     // ---- instructions ----
+    const instr_span = trace.begin(io, "startup.instructions");
     const builtin_prompt = system_prompt.system_prompt;
     const instr = try instructions_mod.assemble(cwd, io, arena, builtin_prompt, &.{});
+    _ = trace.end(io, instr_span);
 
     // ---- welcome ----
+    trace.mark(io, "first_paint");
     {
         const provider_display = cfg.getOptionalString("model.provider_label") orelse provider_name;
         const key_note = if (pcfg.api_key.len == 0) blk: {
@@ -227,12 +235,18 @@ pub fn run(
 
         // ---- policy boundary (D029): re-read disk config, re-assemble
         // instructions with focus dirs from recent tool activity ----
+        const reload_span = trace.begin(io, "turn.config_reload");
         if (reloadConfig(io, arena, cwd, environ, &sess)) |fresh| {
             cfg.deinit();
             cfg = fresh;
         }
+        _ = trace.end(io, reload_span);
+        const assemble_span = trace.begin(io, "turn.instructions");
         const focus = instructions_mod.focusDirsFromHistory(arena, sess.history.items, 8);
         const turn_instr = instructions_mod.assemble(cwd, io, arena, system_prompt.system_prompt, focus) catch instr;
+        _ = trace.end(io, assemble_span);
+        const catalog_span = trace.begin(io, "turn.skills_catalog");
+        defer _ = trace.end(io, catalog_span);
         // Skills catalog appendix (budgeted, K148).
         const skill_prompt = blk: {
             if (sess.skills) |catalog| {
@@ -372,8 +386,10 @@ fn submitTurn(
     };
     var ui = TurnUi{ .io = io };
 
+    const hooks_span = trace.begin(io, "turn.hooks");
     var hook_engine = hooks_mod.Engine.init(io, cwd, try hooks_mod.Engine.fromConfig(arena, cfg.get("hooks")), arena);
     const pre = hook_engine.dispatch(.before_agent, "{}");
+    _ = trace.end(io, hooks_span);
     if (pre.blocked) {
         try out(io, "before_agent hook blocked the turn: {s}\n", .{pre.output});
         return;

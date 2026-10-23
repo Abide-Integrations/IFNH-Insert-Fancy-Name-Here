@@ -11,6 +11,7 @@ const core_types = @import("../types.zig");
 const provider_mod = @import("../../providers/provider.zig");
 const tool_mod = @import("../../tools/tool.zig");
 const redact_mod = @import("../redact.zig");
+const trace = @import("../trace.zig");
 
 pub const max_tool_rounds_default: usize = 25;
 
@@ -42,6 +43,8 @@ pub const Outcome = struct {
     tool_calls: usize = 0,
     usage: core_types.Usage = .{},
     error_message: []const u8 = "",
+    /// Wall time spent inside tool execution (0 unless tracing is on).
+    tool_time_ns: i96 = 0,
 };
 
 const Collector = struct {
@@ -151,11 +154,16 @@ pub fn runTurn(p: RunParams) !Outcome {
     var rounds: usize = 0;
     var total_calls: usize = 0;
     var last_reply: []const u8 = "";
+    var tool_ns: i96 = 0;
+    const turn_span = trace.begin(p.io, "turn.total");
+    defer _ = trace.end(p.io, turn_span);
 
     while (rounds < p.max_tool_rounds) : (rounds += 1) {
         if (p.cancel.load(.acquire)) {
-            return .{ .status = .cancelled, .reply = last_reply, .tool_rounds = rounds, .tool_calls = total_calls, .usage = total_usage };
+            return .{ .status = .cancelled, .reply = last_reply, .tool_rounds = rounds, .tool_calls = total_calls, .usage = total_usage, .tool_time_ns = tool_ns };
         }
+        const round_span = trace.begin(p.io, "turn.round");
+        defer _ = trace.end(p.io, round_span);
 
         var collector = Collector{ .arena = p.arena, .callbacks = p.callbacks };
         const tools_json = if (p.include_tools)
@@ -165,6 +173,7 @@ pub fn runTurn(p: RunParams) !Outcome {
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
             collector = Collector{ .arena = p.arena, .callbacks = p.callbacks };
+            const provider_span = trace.begin(p.io, "turn.provider_request");
             try p.pcfg.provider.stream(p.arena, p.io, .{
                 .model = p.pcfg.model,
                 .base_url = p.pcfg.base_url,
@@ -176,6 +185,7 @@ pub fn runTurn(p: RunParams) !Outcome {
                 .max_output_tokens = p.max_output_tokens,
                 .cancel = p.cancel,
             }, .{ .ctx = &collector, .emit_fn = sinkEmit });
+            _ = trace.end(p.io, provider_span);
             if (collector.failure) |f| {
                 if (core_types.isRetryable(f.kind) and attempt < p.max_retries and !p.cancel.load(.acquire)) {
                     const shift: u6 = @intCast(@min(attempt, 4));
@@ -198,6 +208,7 @@ pub fn runTurn(p: RunParams) !Outcome {
                 .tool_calls = total_calls,
                 .usage = total_usage,
                 .error_message = f.message,
+                .tool_time_ns = tool_ns,
             };
         }
 
@@ -206,7 +217,7 @@ pub fn runTurn(p: RunParams) !Outcome {
 
         if (collector.tool_calls.items.len == 0) {
             try p.history.append(p.arena, .{ .role = .assistant, .content = reply });
-            return .{ .status = .completed, .reply = reply, .tool_rounds = rounds + 1, .tool_calls = total_calls, .usage = total_usage };
+            return .{ .status = .completed, .reply = reply, .tool_rounds = rounds + 1, .tool_calls = total_calls, .usage = total_usage, .tool_time_ns = tool_ns };
         }
 
         // Assistant message with tool calls; remember calls for the wire.
@@ -234,6 +245,8 @@ pub fn runTurn(p: RunParams) !Outcome {
 
         // Execute tool calls; consecutive `agent` calls run in parallel
         // (E58), everything else sequentially, results appended in order.
+        const tools_span = trace.begin(p.io, "turn.tools");
+        defer tool_ns += trace.end(p.io, tools_span);
         const calls = collector.tool_calls.items;
         var i: usize = 0;
         while (i < calls.len) {
@@ -293,6 +306,7 @@ pub fn runTurn(p: RunParams) !Outcome {
         .tool_calls = total_calls,
         .usage = total_usage,
         .error_message = "stopped: tool round limit reached",
+        .tool_time_ns = tool_ns,
     };
 }
 
