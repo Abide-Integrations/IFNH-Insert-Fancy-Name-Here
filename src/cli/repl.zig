@@ -352,16 +352,19 @@ fn submitTurn(
 
     const TurnUi = struct {
         io: std.Io,
+        store: *session_mod.Session,
         fn onText(ctx: *anyopaque, text: []const u8) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             std.Io.File.stdout().writeStreamingAll(self.io, text) catch {};
         }
-        fn onToolStart(ctx: *anyopaque, name: []const u8, arguments_json: []const u8) void {
+        fn onToolStart(ctx: *anyopaque, call_id: []const u8, name: []const u8, arguments_json: []const u8) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = self.store.append(.{ .tool_call = .{ .id = call_id, .name = name, .arguments_json = arguments_json } }) catch {};
             out(self.io, "\n[tool] {s} {s}\n", .{ name, arguments_json }) catch {};
         }
-        fn onToolResult(ctx: *anyopaque, name: []const u8, status: tool_mod.Status, output: []const u8) void {
+        fn onToolResult(ctx: *anyopaque, call_id: []const u8, name: []const u8, status: tool_mod.Status, output: []const u8) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = self.store.append(.{ .tool_result = .{ .call_id = call_id, .status = @tagName(status), .output = output } }) catch {};
             _ = name;
             const max_show: usize = 400;
             const shown = if (output.len > max_show) output[0..max_show] else output;
@@ -379,8 +382,14 @@ fn submitTurn(
             const self: *@This() = @ptrCast(@alignCast(ctx));
             out(self.io, "! {s}\n", .{text}) catch {};
         }
+        /// Persist each completed assistant message (text and/or tool calls)
+        /// as it is produced, so a resumed session can replay tool rounds.
+        fn onAssistantMessage(ctx: *anyopaque, content: []const u8, tool_calls_json: ?[]const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = self.store.append(.{ .assistant = .{ .text = content, .tool_calls_json = tool_calls_json } }) catch {};
+        }
     };
-    var ui = TurnUi{ .io = io };
+    var ui = TurnUi{ .io = io, .store = &sess.store };
 
     var hook_engine = hooks_mod.Engine.init(io, cwd, try hooks_mod.Engine.fromConfig(arena, cfg.get("hooks")), arena);
     const pre = hook_engine.dispatch(.before_agent, "{}");
@@ -431,6 +440,7 @@ fn submitTurn(
             .on_tool_start = TurnUi.onToolStart,
             .on_tool_result = TurnUi.onToolResult,
             .on_notice = TurnUi.onNotice,
+            .on_assistant_message = TurnUi.onAssistantMessage,
         },
         .cancel = &cancel,
         .include_tools = cfg.getBool("model.tools_enabled", true),
@@ -446,9 +456,7 @@ fn submitTurn(
     _ = hook_engine.dispatch(.after_agent, "{}");
     try out(io, "\n", .{});
     switch (outcome.status) {
-        .completed => {
-            _ = try sess.store.append(.{ .assistant = .{ .text = outcome.reply } });
-        },
+        .completed => {},
         .failed => {
             rollbackTurn(sess, history_start);
             try out(io, "{s}provider error: {s}{s}\n", .{ palette.err("", arena), outcome.error_message, "\x1b[0m" });
@@ -579,7 +587,11 @@ const Approver = struct {
 // ---------------------------------------------------------------- history rebuild
 
 fn rebuildHistory(arena: std.mem.Allocator, sess: *Session) !void {
-    const events = try sess.store.readEvents(arena, 10_000);
+    const page = try sess.store.readEventPage(arena, 10_000);
+    if (page.truncated) {
+        try out(sess.io, "note: session has more than {d} events; resuming from the most recent {d}\n", .{ page.records.len, page.records.len });
+    }
+    const events = page.records;
     var turn_start: ?usize = null;
     var saw_assistant = false;
     for (events) |ev| {
@@ -1639,4 +1651,40 @@ test "default config denies git push and gates dotenv" {
     var e3 = engineFromConfig(std.testing.allocator, &cfg);
     defer e3.deinit();
     try std.testing.expectEqual(engine_mod.Decision.deny, e3.decideCommand("git push --force origin main"));
+}
+
+test "replay keeps assistant tool calls and tool results" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = Session{
+        .io = io,
+        .store = try session_mod.Session.create(tmp.dir, io, arena, "sessions", "/tmp/proj"),
+        .journal = try journal_mod.Journal.open(io, arena, tmp.dir),
+        .engine = engine_mod.Engine.init(arena, .ask),
+    };
+    defer s.store.close();
+
+    _ = try s.store.append(.{ .user = .{ .text = "read a" } });
+    _ = try s.store.append(.{ .assistant = .{ .text = "", .tool_calls_json = "[{\"id\":\"c1\",\"name\":\"read\",\"arguments_json\":\"{}\"}]" } });
+    _ = try s.store.append(.{ .tool_call = .{ .id = "c1", .name = "read", .arguments_json = "{}" } });
+    _ = try s.store.append(.{ .tool_result = .{ .call_id = "c1", .status = "failed", .output = "no such file" } });
+    _ = try s.store.append(.{ .assistant = .{ .text = "done" } });
+
+    try rebuildHistory(arena, &s);
+    try std.testing.expectEqual(@as(usize, 4), s.history.items.len);
+
+    try std.testing.expectEqual(core_types.ChatRole.user, s.history.items[0].role);
+    // The assistant tool-call message survives resume, so the tool result can
+    // still be paired on the wire.
+    try std.testing.expectEqual(core_types.ChatRole.assistant, s.history.items[1].role);
+    try std.testing.expect(s.history.items[1].tool_calls_json != null);
+    try std.testing.expectEqualStrings("c1", s.history.items[2].tool_call_id.?);
+    try std.testing.expectEqual(core_types.ChatRole.tool, s.history.items[2].role);
+    try std.testing.expect(s.history.items[2].is_error);
+    try std.testing.expectEqualStrings("done", s.history.items[3].content);
 }

@@ -373,8 +373,8 @@ fn writeReport(
 }
 
 fn noopText(_: *anyopaque, _: []const u8) void {}
-fn noopStart(_: *anyopaque, _: []const u8, _: []const u8) void {}
-fn noopResult(_: *anyopaque, _: []const u8, _: tool_mod.Status, _: []const u8) void {}
+fn noopStart(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) void {}
+fn noopResult(_: *anyopaque, _: []const u8, _: []const u8, _: tool_mod.Status, _: []const u8) void {}
 fn noopNotice(_: *anyopaque, _: []const u8) void {}
 
 /// Tool-level adapter (matches tool_mod.ToolContext.agent_spawn_fn).

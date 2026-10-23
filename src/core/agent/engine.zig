@@ -38,11 +38,14 @@ pub const Callbacks = struct {
     /// Streaming text delta.
     on_text: *const fn (ctx: *anyopaque, text: []const u8) void,
     /// A tool call is about to execute.
-    on_tool_start: *const fn (ctx: *anyopaque, name: []const u8, arguments_json: []const u8) void,
+    on_tool_start: *const fn (ctx: *anyopaque, call_id: []const u8, name: []const u8, arguments_json: []const u8) void,
     /// A tool call finished.
-    on_tool_result: *const fn (ctx: *anyopaque, name: []const u8, status: tool_mod.Status, output: []const u8) void,
+    on_tool_result: *const fn (ctx: *anyopaque, call_id: []const u8, name: []const u8, status: tool_mod.Status, output: []const u8) void,
     /// Non-fatal notice (permission denials, truncation...).
     on_notice: *const fn (ctx: *anyopaque, text: []const u8) void,
+    /// Optional: an assistant message (text plus any tool calls) was appended
+    /// to history. Persistent UIs record it here, not from `on_text`.
+    on_assistant_message: ?*const fn (ctx: *anyopaque, content: []const u8, tool_calls_json: ?[]const u8) void = null,
 };
 
 pub const Status = enum { completed, failed, cancelled };
@@ -185,6 +188,7 @@ pub fn runTurn(p: RunParams) !Outcome {
 
         if (collector.tool_calls.items.len == 0) {
             try p.history.append(p.arena, .{ .role = .assistant, .content = reply });
+            if (p.callbacks.on_assistant_message) |cb| cb(p.callbacks.ctx, reply, null);
             return .{ .status = .completed, .reply = reply, .tool_rounds = rounds + 1, .tool_calls = total_calls, .usage = total_usage };
         }
 
@@ -210,6 +214,7 @@ pub fn runTurn(p: RunParams) !Outcome {
             .content = reply,
             .tool_calls_json = tc_json,
         });
+        if (p.callbacks.on_assistant_message) |cb| cb(p.callbacks.ctx, reply, tc_json);
 
         // Execute tool calls; consecutive `agent` calls run in parallel
         // (E58), everything else sequentially, results appended in order.
@@ -232,8 +237,8 @@ pub fn runTurn(p: RunParams) !Outcome {
                     break :blk one;
                 };
                 for (batch, results) |tc, result| {
-                    p.callbacks.on_tool_start(p.callbacks.ctx, tc.name, tc.arguments_json);
-                    p.callbacks.on_tool_result(p.callbacks.ctx, tc.name, result.status, result.output);
+                    p.callbacks.on_tool_start(p.callbacks.ctx, tc.id, tc.name, tc.arguments_json);
+                    p.callbacks.on_tool_result(p.callbacks.ctx, tc.id, tc.name, result.status, result.output);
                     if (result.status == .denied) {
                         p.callbacks.on_notice(p.callbacks.ctx, result.output);
                     }
@@ -249,8 +254,8 @@ pub fn runTurn(p: RunParams) !Outcome {
             } else {
                 const result = executeOne(p, calls[i]);
                 total_calls += 1;
-                p.callbacks.on_tool_start(p.callbacks.ctx, calls[i].name, calls[i].arguments_json);
-                p.callbacks.on_tool_result(p.callbacks.ctx, calls[i].name, result.status, result.output);
+                p.callbacks.on_tool_start(p.callbacks.ctx, calls[i].id, calls[i].name, calls[i].arguments_json);
+                p.callbacks.on_tool_result(p.callbacks.ctx, calls[i].id, calls[i].name, result.status, result.output);
                 if (result.status == .denied) {
                     p.callbacks.on_notice(p.callbacks.ctx, result.output);
                 }
@@ -325,6 +330,8 @@ test "runTurn executes scripted tool call and feeds result back" {
         texts: std.ArrayListUnmanaged([]const u8) = .empty,
         tool_starts: std.ArrayListUnmanaged([]const u8) = .empty,
         tool_results: std.ArrayListUnmanaged(tool_mod.Status) = .empty,
+        tool_ids: std.ArrayListUnmanaged([]const u8) = .empty,
+        assistant_msgs: usize = 0,
         notices: usize = 0,
         arena: std.mem.Allocator,
     };
@@ -338,18 +345,28 @@ test "runTurn executes scripted tool call and feeds result back" {
             }
         }.f,
         .on_tool_start = struct {
-            fn f(ctx: *anyopaque, name: []const u8, args_json: []const u8) void {
+            fn f(ctx: *anyopaque, call_id: []const u8, name: []const u8, args_json: []const u8) void {
                 const l: *EventLog = @ptrCast(@alignCast(ctx));
                 l.tool_starts.append(l.arena, name) catch {};
+                l.tool_ids.append(l.arena, call_id) catch {};
                 _ = args_json;
             }
         }.f,
         .on_tool_result = struct {
-            fn f(ctx: *anyopaque, name: []const u8, status: tool_mod.Status, output: []const u8) void {
+            fn f(ctx: *anyopaque, call_id: []const u8, name: []const u8, status: tool_mod.Status, output: []const u8) void {
                 const l: *EventLog = @ptrCast(@alignCast(ctx));
                 l.tool_results.append(l.arena, status) catch {};
+                _ = call_id;
                 _ = name;
                 _ = output;
+            }
+        }.f,
+        .on_assistant_message = struct {
+            fn f(ctx: *anyopaque, content: []const u8, tool_calls_json: ?[]const u8) void {
+                const l: *EventLog = @ptrCast(@alignCast(ctx));
+                l.assistant_msgs += 1;
+                _ = content;
+                _ = tool_calls_json;
             }
         }.f,
         .on_notice = struct {
@@ -509,8 +526,8 @@ fn sleepSeconds(io: std.Io, seconds: u64) !void {
 }
 
 fn noopText(_: *anyopaque, _: []const u8) void {}
-fn noopStart(_: *anyopaque, _: []const u8, _: []const u8) void {}
-fn noopResult(_: *anyopaque, _: []const u8, _: tool_mod.Status, _: []const u8) void {}
+fn noopStart(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) void {}
+fn noopResult(_: *anyopaque, _: []const u8, _: []const u8, _: tool_mod.Status, _: []const u8) void {}
 fn noopNotice(_: *anyopaque, _: []const u8) void {}
 
 test "consecutive agent calls run in parallel and append in order" {
