@@ -13,7 +13,6 @@ const core_types = @import("../core/types.zig");
 const engine_mod = @import("../core/permissions/engine.zig");
 const journal_mod = @import("../core/journal.zig");
 const globm = @import("../core/permissions/glob.zig");
-const cmd_class = @import("../core/permissions/command_class.zig");
 
 pub const max_tool_output_bytes: usize = 64 * 1024;
 pub const max_file_size_bytes: usize = 1024 * 1024;
@@ -113,8 +112,8 @@ pub const specs = [_]Spec{
     .{ .name = "write", .description = "Create a file or overwrite it entirely. Prefer edit for existing files.", .parameters_json =
     \\{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}
     },
-    .{ .name = "bash", .description = "Run a shell command in the workspace. Read-only commands run freely; anything that changes state requires approval.", .parameters_json =
-    \\{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}
+    .{ .name = "bash", .description = "Run a shell command with the user's shell. Read-only commands run freely; anything that changes state requires approval. Use background for long-running commands and poll them with the exec tool.", .parameters_json =
+    \\{"type":"object","properties":{"command":{"type":"string"},"background":{"type":"boolean","description":"start detached and return an execution id"},"timeout_s":{"type":"integer","description":"wall-clock limit in seconds, capped by the session limit"}},"required":["command"]}
     },
     .{ .name = "skill", .description = "Load a named skill's full instructions from the installed skills catalog.", .parameters_json =
     \\{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}
@@ -208,7 +207,12 @@ pub fn execute(name: []const u8, args_json: []const u8, ctx: *ToolContext) ToolR
     } else if (std.mem.eql(u8, name, "bash")) {
         const command = a.str("command") orelse return errResult(ctx.arena, "bash: missing command", .{});
         const background = if (a.obj.get("background")) |b| (b == .bool and b.bool) else false;
-        return toolBash(command, background, ctx);
+        const timeout_s: u32 = blk: {
+            const v = a.obj.get("timeout_s") orelse break :blk 0;
+            if (v != .integer or v.integer <= 0 or v.integer > 86_400) break :blk 0;
+            break :blk @intCast(v.integer);
+        };
+        return toolBash(command, background, timeout_s, ctx);
     } else if (std.mem.eql(u8, name, "skill")) {
         const load_fn = ctx.skill_load_fn orelse
             return errResult(ctx.arena, "skill: skills not available", .{});
@@ -719,10 +723,10 @@ fn runCapturedWindows(ctx: *ToolContext, argv: []const []const u8, cwd: []const 
     return .{ .output = out.items, .status = if (failed) .failed else .ok };
 }
 
-fn toolBash(command: []const u8, background: bool, ctx: *ToolContext) ToolResult {
-    // Compound commands go through the user's shell; simple ones run directly
-    // (DECISIONS I120). Compound detection is the classifier's job anyway.
-    const effect = cmd_class.classify(command);
+fn toolBash(command: []const u8, background: bool, timeout_s: u32, ctx: *ToolContext) ToolResult {
+    // Permission classification always runs on the raw command string. The
+    // command itself always goes through the shell, so quoting, globs,
+    // redirection and pipes behave as the model wrote them (A-03).
     const decision = ctx.engine.decideCommand(command);
     switch (decision) {
         .allow => {},
@@ -749,26 +753,15 @@ fn toolBash(command: []const u8, background: bool, ctx: *ToolContext) ToolResult
         }
     }
 
-    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
-    if (std.mem.indexOfAny(u8, command, "|;&<>()`") != null) {
-        const shell = ctx.engine.alloc.dupe(u8, "/bin/sh") catch return errResult(ctx.arena, "oom", .{});
-        const flag = ctx.engine.alloc.dupe(u8, "-c") catch return errResult(ctx.arena, "oom", .{});
-        const cmd = ctx.engine.alloc.dupe(u8, command) catch return errResult(ctx.arena, "oom", .{});
-        argv.append(ctx.arena, shell) catch {};
-        argv.append(ctx.arena, flag) catch {};
-        argv.append(ctx.arena, cmd) catch {};
-    } else {
-        var it = std.mem.tokenizeAny(u8, command, " \t");
-        while (it.next()) |tok| {
-            argv.append(ctx.arena, tok) catch {};
-        }
-    }
-    if (argv.items.len == 0) return errResult(ctx.arena, "bash: empty command", .{});
+    if (std.mem.trim(u8, command, " \t\r\n").len == 0) return errResult(ctx.arena, "bash: empty command", .{});
 
-    const result = runCaptured(ctx, argv.items, "");
+    // A per-call timeout may only tighten the session ceiling.
+    var local = ctx.*;
+    if (timeout_s > 0) local.timeout_s = @min(timeout_s, if (ctx.timeout_s == 0) 120 else ctx.timeout_s);
+
+    const argv = [_][]const u8{ "/bin/sh", "-c", command };
     // Note: shell side effects are not journaled (M185); surfaced in audit log instead.
-    _ = effect;
-    return result;
+    return runCaptured(&local, &argv, "");
 }
 
 /// "git commit -m x" -> "git commit"; "ls" -> "ls".
@@ -1071,4 +1064,60 @@ test "unknown tool and bad args" {
     try std.testing.expectEqual(Status.failed, execute("frobnicate", "{}", &ctx).status);
     try std.testing.expectEqual(Status.failed, execute("read", "not json", &ctx).status);
     try std.testing.expectEqual(Status.failed, execute("read", "{\"other\":1}", &ctx).status);
+}
+
+test "bash passes the raw command through sh -c" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+
+    var e = engine_mod.Engine.init(std.testing.allocator, .auto);
+    defer e.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var ctx = testCtx(arena, io, tmp.dir, &e);
+
+    // Quoted arguments with spaces stay single argv entries.
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    try aw.writer.writeAll("{\"command\":");
+    try std.json.Stringify.value("printf '%s|' 'a b' \"c d\"", .{}, &aw.writer);
+    try aw.writer.writeByte('}');
+    const r = execute("bash", aw.written(), &ctx);
+    try std.testing.expectEqual(Status.ok, r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "a b|c d|") != null);
+
+    // Shell expansion is not tokenized away.
+    var aw2: std.Io.Writer.Allocating = .init(arena);
+    try aw2.writer.writeAll("{\"command\":");
+    try std.json.Stringify.value("printf '%s' $((1 + 2))", .{}, &aw2.writer);
+    try aw2.writer.writeByte('}');
+    const r2 = execute("bash", aw2.written(), &ctx);
+    try std.testing.expectEqual(Status.ok, r2.status);
+    try std.testing.expect(std.mem.indexOf(u8, r2.output, "\n3") != null);
+}
+
+test "bash per-call timeout only tightens the session ceiling" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+
+    var e = engine_mod.Engine.init(std.testing.allocator, .auto);
+    defer e.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var ctx = testCtx(arena, io, tmp.dir, &e);
+    ctx.timeout_s = 1; // session ceiling
+
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    try aw.writer.writeAll("{\"command\":\"sleep 30\",\"timeout_s\":60}");
+    const start = std.Io.Timestamp.now(io, .awake);
+    const r = execute("bash", aw.written(), &ctx);
+    const elapsed_ms = @divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds - start.nanoseconds, std.time.ns_per_ms);
+
+    try std.testing.expectEqual(Status.timeout, r.status);
+    // A 60 s request was clamped to the 1 s ceiling.
+    try std.testing.expect(elapsed_ms < 4000);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "timed out after 1s") != null);
 }
