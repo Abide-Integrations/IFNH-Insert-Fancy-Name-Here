@@ -337,12 +337,15 @@ pub const Registry = struct {
 fn writeFakeServer(dir: std.Io.Dir, io: std.Io, arena: std.mem.Allocator) ![]const u8 {
     const script =
         \\#!/bin/sh
+        \\# Answers by JSON-RPC method and echoes the request's own id.
         \\while IFS= read -r line; do
+        \\  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+        \\  [ -n "$id" ] || continue
         \\  case "$line" in
-        \\    *'"id":1'*) echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fake"}}}' ;;
-        \\    *'"id":2'*) echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"Echo back","inputSchema":{"type":"object"}}]}}' ;;
-        \\    *'"id":3'*) echo '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"echoed-ok"}]}}' ;;
-        \\    *) echo '{"jsonrpc":"2.0","id":99,"error":{"code":-32601,"message":"method not found"}}' ;;
+        \\    *'"method":"initialize"'*) echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"fake\"}}}" ;;
+        \\    *'"method":"tools/list"'*) echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"Echo back\",\"inputSchema\":{\"type\":\"object\"}}]}}" ;;
+        \\    *'"method":"tools/call"'*) echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"echoed-ok\"}]}}" ;;
+        \\    *) echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"error\":{\"code\":-32601,\"message\":\"method not found\"}}" ;;
         \\  esac
         \\done
         \\
