@@ -62,6 +62,10 @@ pub const ToolContext = struct {
     agent_depth: usize = 0,
     /// Display label for approval provenance ("parent", "research-1"...).
     agent_label: []const u8 = "",
+    /// External search binaries (B-07); empty/disabled uses the built-in walk.
+    external_tools: bool = true,
+    rg_bin: []const u8 = "rg",
+    fd_bin: []const u8 = "fd",
 
     pub fn requestApproval(self: *ToolContext, title: []const u8, detail: []const u8, grant: ApprovalRequest.Grant) bool {
         const resp = self.approval_fn(self.approval_ctx, .{ .title = title, .detail = detail, .grant = grant });
@@ -374,7 +378,60 @@ fn collectMatching(
     }
 }
 
+fn workspacePath(ctx: *ToolContext, buf: []u8) ?[]const u8 {
+    const n = ctx.workspace.realPath(ctx.io, buf) catch return null;
+    return buf[0..n];
+}
+
+fn tryExternalGrep(pattern: []const u8, root: []const u8, ctx: *ToolContext) ?ToolResult {
+    if (!ctx.external_tools or ctx.rg_bin.len == 0) return null;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = workspacePath(ctx, &path_buf) orelse return null;
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    argv.appendSlice(ctx.arena, &.{
+        ctx.rg_bin,    "--line-number", "--no-heading",   "--color", "never",
+        "--max-count", "10",            "--max-filesize", "1M",      "-e",
+        pattern,
+    }) catch return null;
+    if (root.len > 0) argv.append(ctx.arena, root) catch return null;
+    const r = std.process.run(ctx.arena, ctx.io, .{
+        .argv = argv.items,
+        .cwd = .{ .path = cwd },
+        .stdout_limit = .limited(256 * 1024),
+        .stderr_limit = .limited(16 * 1024),
+        .timeout = .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(30) } },
+    }) catch return null;
+    if (r.term != .exited) return null;
+    if (r.term.exited == 1) return .{ .output = "no matches", .status = .ok };
+    if (r.term.exited != 0) return null;
+    const text = std.mem.trimEnd(u8, r.stdout, "\n");
+    if (text.len == 0) return .{ .output = "no matches", .status = .ok };
+    return .{ .output = truncateUtf8(ctx.arena, text, "grep results") catch text, .status = .ok };
+}
+
+fn tryExternalGlob(pattern: []const u8, ctx: *ToolContext) ?ToolResult {
+    if (!ctx.external_tools or ctx.fd_bin.len == 0) return null;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = workspacePath(ctx, &path_buf) orelse return null;
+    const r = std.process.run(ctx.arena, ctx.io, .{
+        .argv = &.{
+            ctx.fd_bin,    "--type", "f",             "--color", "never",
+            "--max-depth", "16",     "--max-results", "500",     "--glob",
+            pattern,
+        },
+        .cwd = .{ .path = cwd },
+        .stdout_limit = .limited(256 * 1024),
+        .stderr_limit = .limited(16 * 1024),
+        .timeout = .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(30) } },
+    }) catch return null;
+    if (r.term != .exited or r.term.exited != 0) return null;
+    const text = std.mem.trimEnd(u8, r.stdout, "\n");
+    if (text.len == 0) return .{ .output = "no matches", .status = .ok };
+    return .{ .output = truncateUtf8(ctx.arena, text, "glob results") catch text, .status = .ok };
+}
+
 fn toolGlob(pattern: []const u8, ctx: *ToolContext) ToolResult {
+    if (tryExternalGlob(pattern, ctx)) |external| return external;
     var out: std.ArrayListUnmanaged([]const u8) = .empty;
     var limits = WalkLimits{};
     collectMatching(ctx, ctx.workspace, "", 0, &limits, &out, pattern);
@@ -390,6 +447,7 @@ fn toolGrep(pattern: []const u8, root: []const u8, ctx: *ToolContext) ToolResult
         .allow => {},
         else => return deniedResult(ctx.arena, "grep under '{s}'", .{root}),
     }
+    if (tryExternalGrep(pattern, root, ctx)) |external| return external;
     var out: std.ArrayListUnmanaged(u8) = .empty;
     var limits = WalkLimits{ .max_matches = 200 };
     grepDir(ctx, ctx.workspace, root, pattern, &limits, &out, 0);
@@ -720,6 +778,8 @@ fn testCtx(arena: std.mem.Allocator, io: std.Io, ws: std.Io.Dir, e: *engine_mod.
                 return .approved_once;
             }
         }.approve,
+        // Keep built-in walk tests deterministic regardless of host tools.
+        .external_tools = false,
     };
 }
 
@@ -876,4 +936,48 @@ test "unknown tool and bad args" {
     try std.testing.expectEqual(Status.failed, execute("frobnicate", "{}", &ctx).status);
     try std.testing.expectEqual(Status.failed, execute("read", "not json", &ctx).status);
     try std.testing.expectEqual(Status.failed, execute("read", "{\"other\":1}", &ctx).status);
+}
+
+test "external rg/fd are used when available, with built-in fallback" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "src.zig", .data = "const needle = 1;\n" });
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path_buf);
+    const rg_path = try std.fmt.allocPrint(a, "{s}/fake-rg", .{path_buf[0..n]});
+    const fd_path = try std.fmt.allocPrint(a, "{s}/fake-fd", .{path_buf[0..n]});
+    try tmp.dir.writeFile(io, .{ .sub_path = "fake-rg", .data = "#!/bin/sh\necho 'src.zig:1: needle'\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "fake-fd", .data = "#!/bin/sh\necho 'src.zig'\n" });
+    for ([_][]const u8{ rg_path, fd_path }) |path| {
+        const chmod = try std.process.run(a, io, .{ .argv = &.{ "chmod", "+x", path } });
+        try std.testing.expectEqual(@as(u8, 0), chmod.term.exited);
+    }
+
+    var e = engine_mod.Engine.init(std.testing.allocator, .ask);
+    defer e.deinit();
+    var ctx = testCtx(a, io, tmp.dir, &e);
+    ctx.external_tools = true;
+    ctx.rg_bin = rg_path;
+    ctx.fd_bin = fd_path;
+
+    const gr = execute("grep", "{\"pattern\":\"needle\"}", &ctx);
+    try std.testing.expectEqualStrings("src.zig:1: needle", gr.output);
+    const g = execute("glob", "{\"pattern\":\"**/*.zig\"}", &ctx);
+    try std.testing.expectEqualStrings("src.zig", g.output);
+
+    // Missing binary falls back to the built-in walk.
+    var fallback = testCtx(a, io, tmp.dir, &e);
+    fallback.external_tools = true;
+    fallback.rg_bin = "ifnh-no-such-rg";
+    fallback.fd_bin = "ifnh-no-such-fd";
+    const fr = execute("grep", "{\"pattern\":\"needle\"}", &fallback);
+    try std.testing.expect(std.mem.indexOf(u8, fr.output, "src.zig:1") != null);
+    const fg = execute("glob", "{\"pattern\":\"*.zig\"}", &fallback);
+    try std.testing.expect(std.mem.indexOf(u8, fg.output, "src.zig") != null);
 }
