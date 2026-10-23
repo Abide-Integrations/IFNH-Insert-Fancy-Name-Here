@@ -85,16 +85,16 @@ Wall-clock in an agent harness is dominated by model round-trips and per-round o
 
 | ID | Task | Status | Verify | Notes |
 |---|---|---|---|---|
-| B-01 | Timing spans: `IFNH_TRACE_STARTUP=1`, per-round spans | `[ ]` | run with env var, read spans | Makes every later claim a number |
-| B-02 | One long-lived HTTP client per session (keep-alive) | `[ ]` | before/after per-round latency via B-01 | Today: new `std.http.Client` per request (`anthropic.zig:31`, `openai.zig:36`); **[verify]** CA-bundle rescan cost |
-| B-03 | Prompt caching + byte-stable system prompt | `[ ]` | usage shows cache hits on turn 2+ | System prompt rebuilt per turn with volatile focus dirs (`repl.zig:234-245`); no `cache_control` |
-| B-04 | Cache per-turn overhead by mtime (config, instructions, git, skills, policy hash) | `[ ]` | B-01 spans per turn | |
-| B-05 | Scratch arenas per tool call/turn; streaming grep | `[ ]` | peak RSS on a large repo (`/usr/bin/time -l`) | One process-lifetime arena today; `grepFile` reads up to 1 MB x 20k files |
-| B-06 | Parallel read-only tool batches (`read`/`glob`/`grep`) | `[ ]` | engine test: ordered results; wall time | DESIGN §6 promises it |
-| B-07 | Use `rg`/`fd` when present; better built-in fallback (.gitignore-aware, small regex subset) | `[ ]` | grep tests both paths | |
-| B-08 | Early tool dispatch (emit `tool_call` as its block closes) | `[ ]` | adapter fixtures | |
-| B-09 | Bench: interactive cold start, per-round overhead, peak RSS, TTFT; budgets in CI | `[ ]` | CI job | Today's gate measures `config validate`, not the interactive path |
-| B-10 | Per-model `max_output_tokens` defaults | `[ ]` | golden body test | Anthropic hard-coded 4096 truncates edits |
+| B-01 | Timing spans: `IFNH_TRACE_STARTUP=1`, per-round spans | `[?]` | `IFNH_TRACE_STARTUP=1 ./zig-out/bin/ifnh` then `/quit`; expect `startup.*`, `first_paint` spans | Landed `src/core/trace.zig`; disabled path is one bool check |
+| B-02 | One long-lived HTTP client per session (keep-alive) | `[?]` | `zig build test -Dtest-filter="provider"`; manual turn with trace | Session client in `repl.zig` (page allocator, thread-safe pool); wizard shares one client; adapters fall back to a local client when none supplied |
+| B-03 | Prompt caching + byte-stable system prompt | `[?]` | `zig build test -Dtest-filter=cache`; Anthropic turn 2 usage | `system_prompt.Composed.stable_len` + `cache_control` breakpoint; stable prefix rebuilt only when `stableStamp` changes; OpenAI relies on automatic prefix cache |
+| B-04 | Cache per-turn overhead by mtime (config, instructions, git, skills, policy hash) | `[?]` | B-01 turn spans; `zig build test -Dtest-filter=stamp` | Config/stable instructions/skills/git cached; policy stamp includes ctime+inode so content changes cannot hide behind mtime+size |
+| B-05 | Scratch arenas per tool call/turn; streaming grep | `[?]` | B-09 peak RSS; `zig build test -Dtest-filter=grep` | Per-call arena in `engine.executeOne`; 64 KiB line streaming with bounded whole-file fallback |
+| B-06 | Parallel read-only tool batches (`read`/`glob`/`grep`) | `[?]` | `zig build test -Dtest-filter="read-only tool batch"` | Consecutive same-kind calls batch; results/callbacks preserved in order; agent and mutating tools stay serial |
+| B-07 | Use `rg`/`fd` when present; better built-in fallback (.gitignore-aware, small regex subset) | `[?]` | `zig build test -Dtest-filter=gitignore`; manual grep/glob | rg/fd used when present with built-in fallback; fallback now honors root `.gitignore` (paths, basenames, `!` negation). Fallback grep is still literal substring, not a regex subset |
+| B-08 | Early tool dispatch (emit `tool_call` as its block closes) | `[?]` | `zig build test -Dtest-filter="dispatches"` | Anthropic dispatches on `content_block_stop`; OpenAI flushes earlier indices when a higher index starts; final flush skips emitted calls |
+| B-09 | Bench: interactive cold start, per-round overhead, peak RSS, TTFT; budgets in CI | `[?]` | `./scripts/bench.sh`; `IFNH_BENCH_PROMPT='hi' ./scripts/bench.sh` | CI now gates interactive cold start <100 ms and RSS <32 MiB; round spans/TTFT print when `IFNH_BENCH_PROMPT` is set (needs a configured provider) |
+| B-10 | Per-model `max_output_tokens` defaults | `[?]` | `zig build test -Dtest-filter="max tokens"` | `models.defaultMaxOutputTokens` table + Anthropic/OpenAI wiring; unknown models still fall back to 4096 |
 
 ---
 
@@ -246,4 +246,5 @@ Why: W first so each owner verify cycle takes seconds; A removes defects that ma
 |---|---|
 | 2026-09-18 | Full static review of v0.1.7. Created this document. W-03 landed (AGENTS.md verification rule, MASTER_TRACKER pointer). No code changed; nothing built or run by the agent. |
 | 2026-09-18 | Landed (awaiting owner verification, not compiled by agent): W-01 `check` step and W-02 `-Dtest-filter` in `build.zig`; A-01 live text streaming in `src/core/agent/engine.zig` (+ new assertions in the existing `runTurn executes scripted tool call...` test). Only two `runTurn` callers exist (REPL prints, subagent no-ops), so no other output changes. |
+| 2026-09-20 | Phase B landed on `hs/phaseb-perf`: B-01..B-10 code/tests complete, all rows `[?]` awaiting owner verification. Benchmarks (local ReleaseSafe): binary 1.82 MiB, subcommand startup 5 ms mean, interactive cold start 10 ms mean, peak RSS 1.9 MiB. B-07 fallback is `.gitignore`-aware but still a literal substring grep. |
 | 2026-09-19 | First owner run reported: `zig fmt --check` flagged `src/tools/tool.zig`; `zig build check` and `-Dtest-filter` "not found"; `zig build test` gave 60 compile errors. Diagnosis: host runs **Zig 0.14** (`/usr/lib/zig0.14`) on a clone that predates the changes (error line numbers match the old `engine.zig`; commit `e88af60` carries them). All 60 errors are 0.16-only APIs in files not touched (`std.Io`, `std.testing.io`, `std.mem.trimEnd`, `ArrayList.print`, `ObjectMap.init` arity). Not a code defect; W-01/W-02/A-01 set to `[!]` pending W-06. The `tool.zig` fmt result is unreliable under 0.14 and must be re-checked with 0.16.0 (file untouched by the agent). Added W-06. |
