@@ -70,7 +70,8 @@ pub const default_config_json =
     \\    "max_retries": 3,
     \\    "max_tool_rounds": 25,
     \\    "timeout_tool_s": 120,
-    \\    "timeout_turn_s": 600
+    \\    "timeout_turn_s": 600,
+    \\    "budget_usd": null
     \\  },
     \\  "context": {
     \\    "auto_compact": true,
@@ -128,10 +129,11 @@ pub const wired_defaults = [_][]const u8{
     "git.push",                    "git.force_push",
     "agents.max_depth",            "agents.max_concurrent",
     "agents.max_retries",          "agents.max_tool_rounds",
-    "agents.timeout_tool_s",       "context.auto_compact",
-    "context.compact_at_fraction", "context.max_file_read_bytes",
-    "sessions.dir",                "sessions.keep",
-    "ui.colors",                   "debug.redact",
+    "agents.timeout_tool_s",       "agents.budget_usd",
+    "context.auto_compact",        "context.compact_at_fraction",
+    "context.max_file_read_bytes", "sessions.dir",
+    "sessions.keep",               "ui.colors",
+    "debug.redact",
 };
 
 /// Defaults leaves deliberately not read yet: each would need a feature that

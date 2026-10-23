@@ -11,6 +11,7 @@ const core_types = @import("../types.zig");
 const provider_mod = @import("../../providers/provider.zig");
 const tool_mod = @import("../../tools/tool.zig");
 const redact_mod = @import("../redact.zig");
+const pricing_mod = @import("pricing.zig");
 
 pub const max_tool_rounds_default: usize = 25;
 /// Upper bound on a server-provided `Retry-After` delay. Keeps a misbehaving
@@ -48,7 +49,7 @@ pub const Callbacks = struct {
     on_assistant_message: ?*const fn (ctx: *anyopaque, content: []const u8, tool_calls_json: ?[]const u8) void = null,
 };
 
-pub const Status = enum { completed, failed, cancelled };
+pub const Status = enum { completed, failed, cancelled, budget_exceeded };
 
 pub const Outcome = struct {
     status: Status,
@@ -56,6 +57,8 @@ pub const Outcome = struct {
     tool_rounds: usize = 0,
     tool_calls: usize = 0,
     usage: core_types.Usage = .{},
+    /// Estimated cost for this turn, or null when the model has no price.
+    cost_usd: ?f64 = null,
     error_message: []const u8 = "",
 };
 
@@ -91,6 +94,8 @@ const Collector = struct {
             .usage => |u| {
                 self.usage.input_tokens += u.input_tokens;
                 self.usage.output_tokens += u.output_tokens;
+                self.usage.cache_read_tokens += u.cache_read_tokens;
+                self.usage.cache_write_tokens += u.cache_write_tokens;
             },
             .done => {},
             .failure => |f| {
@@ -126,16 +131,27 @@ pub const RunParams = struct {
     redactions: []const []const u8 = &.{},
     temperature: ?f64 = null,
     max_output_tokens: ?u32 = null,
+    /// Price table for cost tracking and the budget breaker.
+    pricing: ?*const pricing_mod.Table = null,
+    /// Session spend ceiling from `agents.budget_usd` (null = no limit).
+    budget_usd: ?f64 = null,
+    /// Estimated session spend before this turn. The engine adds this turn's
+    /// cost before checking the limit.
+    spent_usd: f64 = 0,
 };
 
 /// Run one agent turn. Appends assistant/tool messages to `history`.
 pub fn runTurn(p: RunParams) !Outcome {
     var total_usage = core_types.Usage{};
+    var total_cost: ?f64 = null;
     var rounds: usize = 0;
     var total_calls: usize = 0;
     var last_reply: []const u8 = "";
 
     while (rounds < p.max_tool_rounds) : (rounds += 1) {
+        if (overBudget(p, total_cost)) {
+            return budgetOutcome(p, last_reply, rounds, total_calls, total_usage, total_cost);
+        }
         if (p.cancel.load(.acquire)) {
             return .{ .status = .cancelled, .reply = last_reply, .tool_rounds = rounds, .tool_calls = total_calls, .usage = total_usage };
         }
@@ -169,6 +185,9 @@ pub fn runTurn(p: RunParams) !Outcome {
 
         total_usage.input_tokens += collector.usage.input_tokens;
         total_usage.output_tokens += collector.usage.output_tokens;
+        total_usage.cache_read_tokens += collector.usage.cache_read_tokens;
+        total_usage.cache_write_tokens += collector.usage.cache_write_tokens;
+        if (p.pricing) |table| total_cost = table.estimateUsd(p.pcfg.model, total_usage);
 
         // Keep the text streamed before a failure so the caller can show (and
         // roll back) a partial reply instead of losing it.
@@ -187,14 +206,19 @@ pub fn runTurn(p: RunParams) !Outcome {
                 .tool_rounds = rounds,
                 .tool_calls = total_calls,
                 .usage = total_usage,
+                .cost_usd = total_cost,
                 .error_message = f.message,
             };
+        }
+
+        if (overBudget(p, total_cost)) {
+            return budgetOutcome(p, last_reply, rounds, total_calls, total_usage, total_cost);
         }
 
         if (collector.tool_calls.items.len == 0) {
             try p.history.append(p.arena, .{ .role = .assistant, .content = reply });
             if (p.callbacks.on_assistant_message) |cb| cb(p.callbacks.ctx, reply, null);
-            return .{ .status = .completed, .reply = reply, .tool_rounds = rounds + 1, .tool_calls = total_calls, .usage = total_usage };
+            return .{ .status = .completed, .reply = reply, .tool_rounds = rounds + 1, .tool_calls = total_calls, .usage = total_usage, .cost_usd = total_cost };
         }
 
         // Assistant message with tool calls; remember calls for the wire.
@@ -282,7 +306,40 @@ pub fn runTurn(p: RunParams) !Outcome {
         .tool_rounds = rounds,
         .tool_calls = total_calls,
         .usage = total_usage,
+        .cost_usd = total_cost,
         .error_message = "stopped: tool round limit reached",
+    };
+}
+
+fn overBudget(p: RunParams, total_cost: ?f64) bool {
+    const budget = p.budget_usd orelse return false;
+    const cost = total_cost orelse return false;
+    return p.spent_usd + cost > budget;
+}
+
+fn budgetOutcome(
+    p: RunParams,
+    reply: []const u8,
+    rounds: usize,
+    total_calls: usize,
+    usage: core_types.Usage,
+    cost: ?f64,
+) Outcome {
+    const spent = p.spent_usd + (cost orelse 0);
+    const limit = p.budget_usd orelse 0;
+    const message = std.fmt.allocPrint(
+        p.arena,
+        "budget exceeded: ~${d:.4} spent this session (agents.budget_usd = ${d:.4}); turn stopped",
+        .{ spent, limit },
+    ) catch "budget exceeded: turn stopped";
+    return .{
+        .status = .budget_exceeded,
+        .reply = reply,
+        .tool_rounds = rounds,
+        .tool_calls = total_calls,
+        .usage = usage,
+        .cost_usd = cost,
+        .error_message = message,
     };
 }
 
@@ -499,6 +556,65 @@ test "a cancelled stream reports cancelled, not failed" {
     });
     try std.testing.expectEqual(Status.cancelled, outcome.status);
     try std.testing.expectEqualStrings("", outcome.error_message);
+}
+
+test "budget breaker stops the turn and reports estimated spend" {
+    const io = std.testing.io;
+    var fake = testing.Fake{ .script = &.{
+        &.{
+            .{ .text = "expensive reply" },
+            .{ .usage = .{ .input_tokens = 1_000_000 } },
+        },
+    } };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const table = try pricing_mod.Table.parse(arena,
+        \\{ "models": { "priced": { "input_per_mtok": 1, "output_per_mtok": 0 } } }
+    );
+
+    var perm_engine = @import("../permissions/engine.zig").Engine.init(arena, .auto);
+    var tool_ctx: tool_mod.ToolContext = .{
+        .io = io,
+        .arena = arena,
+        .workspace = std.Io.Dir.cwd(),
+        .engine = &perm_engine,
+        .journal = null,
+        .max_file_read_bytes = 1024,
+        .approval_ctx = undefined,
+        .approval_fn = undefined,
+    };
+    var history: std.ArrayListUnmanaged(core_types.ChatMessage) = .empty;
+    try history.append(arena, .{ .role = .user, .content = "go" });
+    var cancel = std.atomic.Value(bool).init(false);
+
+    const outcome = try runTurn(.{
+        .io = io,
+        .arena = arena,
+        .pcfg = .{ .provider = fake.provider(), .model = "priced", .base_url = "", .api_key = "" },
+        .system = "",
+        .history = &history,
+        .tool_ctx = &tool_ctx,
+        .callbacks = .{
+            .ctx = undefined,
+            .on_text = noopText,
+            .on_tool_start = noopStart,
+            .on_tool_result = noopResult,
+            .on_notice = noopNotice,
+        },
+        .cancel = &cancel,
+        .pricing = &table,
+        .budget_usd = 0.5,
+    });
+
+    try std.testing.expectEqual(Status.budget_exceeded, outcome.status);
+    try std.testing.expect(outcome.cost_usd.? == 1.0);
+    try std.testing.expect(std.mem.indexOf(u8, outcome.error_message, "budget exceeded") != null);
+    try std.testing.expect(std.mem.indexOf(u8, outcome.error_message, "agents.budget_usd") != null);
+    // Nothing from the over-budget round was committed to history.
+    try std.testing.expectEqual(@as(usize, 1), history.items.len);
+    try std.testing.expectEqualStrings("go", history.items[0].content);
 }
 
 fn isAgentCall(tc: core_types.ToolCall) bool {

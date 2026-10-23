@@ -495,6 +495,7 @@ test {
     _ = @import("providers/anthropic.zig");
     _ = @import("core/instructions.zig");
     _ = @import("core/agent/engine.zig");
+    _ = @import("core/agent/pricing.zig");
     _ = @import("core/agent/testing.zig");
     _ = @import("core/agent/subagent.zig");
     _ = @import("core/git.zig");
@@ -506,6 +507,7 @@ test {
     _ = @import("core/executions.zig");
     _ = @import("core/interrupt.zig");
     _ = @import("ui/style.zig");
+    _ = @import("ui/render.zig");
     _ = @import("ui/secret.zig");
     _ = @import("providers/models.zig");
     _ = @import("providers/probe.zig");

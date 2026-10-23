@@ -15,6 +15,7 @@ const engine_mod = @import("../core/permissions/engine.zig");
 const instructions_mod = @import("../core/instructions.zig");
 const system_prompt = @import("../core/agent/system_prompt.zig");
 const agent_engine = @import("../core/agent/engine.zig");
+const pricing_mod = @import("../core/agent/pricing.zig");
 const subagent_mod = @import("../core/agent/subagent.zig");
 const git_mod = @import("../core/git.zig");
 const mcp_mod = @import("../core/mcp.zig");
@@ -24,6 +25,7 @@ const compaction_mod = @import("../core/compaction.zig");
 const lifecycle_mod = @import("../core/lifecycle.zig");
 const executions_mod = @import("../core/executions.zig");
 const style_mod = @import("../ui/style.zig");
+const render_mod = @import("../ui/render.zig");
 const secret_mod = @import("../ui/secret.zig");
 const models_mod = @import("../providers/models.zig");
 const tool_mod = @import("../tools/tool.zig");
@@ -257,6 +259,75 @@ fn rollbackTurn(sess: *Session, history_start: usize) void {
     _ = sess.store.append(.interrupted) catch {};
 }
 
+const UsageTotals = struct {
+    turns: usize = 0,
+    input_tokens: u64 = 0,
+    output_tokens: u64 = 0,
+    cache_read_tokens: u64 = 0,
+    cache_write_tokens: u64 = 0,
+    cost_usd: f64 = 0,
+    priced_turns: usize = 0,
+    unpriced_turns: usize = 0,
+};
+
+fn readUsageTotals(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    sess: *Session,
+    table: *const pricing_mod.Table,
+) UsageTotals {
+    var totals = UsageTotals{};
+    const raw = fsutil.readSmallFile(sess.store.dir, io, arena, "usage.jsonl", 1024 * 1024) catch return totals;
+    var it = std.mem.splitScalar(u8, raw, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        const v = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch continue;
+        if (v != .object) continue;
+        const usage = core_types.Usage{
+            .input_tokens = jsonU64(v.object.get("input_tokens")),
+            .output_tokens = jsonU64(v.object.get("output_tokens")),
+            .cache_read_tokens = jsonU64(v.object.get("cache_read_tokens")),
+            .cache_write_tokens = jsonU64(v.object.get("cache_write_tokens")),
+        };
+        totals.turns += 1;
+        totals.input_tokens += usage.input_tokens;
+        totals.output_tokens += usage.output_tokens;
+        totals.cache_read_tokens += usage.cache_read_tokens;
+        totals.cache_write_tokens += usage.cache_write_tokens;
+        const model = if (v.object.get("model")) |m| switch (m) {
+            .string => |s| s,
+            else => null,
+        } else null;
+        if (model) |name| {
+            if (table.estimateUsd(name, usage)) |cost| {
+                totals.cost_usd += cost;
+                totals.priced_turns += 1;
+            } else {
+                totals.unpriced_turns += 1;
+            }
+        } else {
+            totals.unpriced_turns += 1;
+        }
+    }
+    return totals;
+}
+
+fn jsonU64(value: ?std.json.Value) u64 {
+    const v = value orelse return 0;
+    return switch (v) {
+        .integer => |i| if (i > 0) @intCast(i) else 0,
+        .float => |f| if (f > 0) @intFromFloat(f) else 0,
+        else => 0,
+    };
+}
+
+fn loadPricing(io: std.Io, arena: std.mem.Allocator, environ: *const std.process.Environ.Map, cwd: std.Io.Dir) pricing_mod.Table {
+    return pricing_mod.Table.loadForWorkspace(arena, io, environ, cwd) catch |err| {
+        out(io, "pricing: {s}; using the built-in table\n", .{@errorName(err)}) catch {};
+        return pricing_mod.Table.loadDefault(arena) catch pricing_mod.Table{};
+    };
+}
+
 fn submitTurn(
     io: std.Io,
     arena: std.mem.Allocator,
@@ -276,6 +347,11 @@ fn submitTurn(
         const key_env = cfg.getOptionalString("model.api_key_env") orelse "OPENAI_API_KEY";
         try out(io, "note: no api key — run /provider key {s} <value> (or export it) before sending a message\n", .{key_env});
     }
+
+    const pricing_table = loadPricing(io, arena, environ, cwd);
+    const spent_before = readUsageTotals(io, arena, sess, &pricing_table);
+    const budget_setting = cfg.getOptionalF64("agents.budget_usd");
+    const budget_usd: ?f64 = if (budget_setting) |b| (if (b >= 0) b else null) else null;
 
     var cancel = std.atomic.Value(bool).init(false);
     // Ctrl-C sets `cancel` while the turn runs; a second one exits (A-06).
@@ -354,12 +430,15 @@ fn submitTurn(
     tool_ctx.approval_ctx = &approver;
     tool_ctx.approval_fn = Approver.approve;
 
+    var renderer = render_mod.Renderer.init(io, std.Io.File.stdout(), arena, palette);
+
     const TurnUi = struct {
         io: std.Io,
         store: *session_mod.Session,
+        renderer: *render_mod.Renderer,
         fn onText(ctx: *anyopaque, text: []const u8) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
-            std.Io.File.stdout().writeStreamingAll(self.io, text) catch {};
+            self.renderer.feed(text, render_mod.terminalWidth(self.io) orelse 0);
         }
         fn onToolStart(ctx: *anyopaque, call_id: []const u8, name: []const u8, arguments_json: []const u8) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
@@ -390,10 +469,11 @@ fn submitTurn(
         /// as it is produced, so a resumed session can replay tool rounds.
         fn onAssistantMessage(ctx: *anyopaque, content: []const u8, tool_calls_json: ?[]const u8) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.renderer.finish(render_mod.terminalWidth(self.io) orelse 0);
             _ = self.store.append(.{ .assistant = .{ .text = content, .tool_calls_json = tool_calls_json } }) catch {};
         }
     };
-    var ui = TurnUi{ .io = io, .store = &sess.store };
+    var ui = TurnUi{ .io = io, .store = &sess.store, .renderer = &renderer };
 
     var hook_engine = hooks_mod.Engine.init(io, cwd, try hooks_mod.Engine.fromConfig(arena, cfg.get("hooks")), arena);
     const pre = hook_engine.dispatch(.before_agent, "{}");
@@ -454,13 +534,18 @@ fn submitTurn(
         .max_retries = cfg.getU32("agents.max_retries", 3),
         .max_tool_rounds = cfg.getU32("agents.max_tool_rounds", 25),
         .redactions = redactionsFor(arena, cfg.getBool("debug.redact", true), pcfg.api_key),
+        .pricing = &pricing_table,
+        .budget_usd = budget_usd,
+        .spent_usd = spent_before.cost_usd,
     }) catch |err| {
+        renderer.finish(render_mod.terminalWidth(io) orelse 0);
         rollbackTurn(sess, history_start);
         try out(io, "\nturn failed: {s}\n", .{@errorName(err)});
         return;
     };
 
     _ = hook_engine.dispatch(.after_agent, "{}");
+    renderer.finish(render_mod.terminalWidth(io) orelse 0);
     try out(io, "\n", .{});
     switch (outcome.status) {
         .completed => {},
@@ -476,18 +561,43 @@ fn submitTurn(
             rollbackTurn(sess, history_start);
             try out(io, "(interrupted)\n", .{});
         },
+        .budget_exceeded => {
+            rollbackTurn(sess, history_start);
+            try out(io, "{s}{s}{s}\n", .{ palette.warn("", arena), outcome.error_message, "\x1b[0m" });
+            _ = try sess.store.append(.{ .note = .{ .text = outcome.error_message } });
+        },
     }
-    if (outcome.usage.input_tokens > 0 or outcome.usage.output_tokens > 0) {
-        try out(io, "[tokens: {d} in / {d} out, {d} tool calls]\n", .{ outcome.usage.input_tokens, outcome.usage.output_tokens, outcome.tool_calls });
-        // Session usage log (S254-258).
-        const usage_line = try std.fmt.allocPrint(arena, "{{\"ts_ms\":{d},\"input_tokens\":{d},\"output_tokens\":{d},\"tool_calls\":{d}}}\n", .{
-            @as(i64, @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms))),
+    if (outcome.usage.input_tokens > 0 or outcome.usage.output_tokens > 0 or
+        outcome.usage.cache_read_tokens > 0 or outcome.usage.cache_write_tokens > 0)
+    {
+        try out(io, "[tokens: {d} in / {d} out, {d} cache read / {d} cache write, {d} tool calls]\n", .{
             outcome.usage.input_tokens,
             outcome.usage.output_tokens,
+            outcome.usage.cache_read_tokens,
+            outcome.usage.cache_write_tokens,
             outcome.tool_calls,
         });
-        var usage_buf: [256]u8 = undefined;
-        @memcpy(usage_buf[0..usage_line.len], usage_line);
+        if (outcome.cost_usd) |cost| {
+            try out(io, "[cost: ~${d:.4} this turn, ~${d:.4} this session (estimated)]\n", .{
+                cost,
+                spent_before.cost_usd + cost,
+            });
+        }
+        // Session usage log (S254-258).
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        try w.print("{{\"ts_ms\":{d},\"model\":", .{
+            @as(i64, @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms))),
+        });
+        try std.json.Stringify.value(pcfg.model, .{}, w);
+        try w.print(",\"input_tokens\":{d},\"output_tokens\":{d},\"cache_read_tokens\":{d},\"cache_write_tokens\":{d},\"tool_calls\":{d}}}\n", .{
+            outcome.usage.input_tokens,
+            outcome.usage.output_tokens,
+            outcome.usage.cache_read_tokens,
+            outcome.usage.cache_write_tokens,
+            outcome.tool_calls,
+        });
+        const usage_line = aw.written();
         const f = sess.store.dir.createFile(io, "usage.jsonl", .{ .truncate = false }) catch null;
         if (f) |file| {
             defer file.close(io);
@@ -1485,24 +1595,24 @@ fn handleCommand(
         }
         return .{ .submit = payload.items };
     } else if (std.mem.eql(u8, cmd, "usage")) {
-        var total_in: u64 = 0;
-        var total_out: u64 = 0;
-        var turns: usize = 0;
-        const raw = fsutil.readSmallFile(sess.store.dir, io, arena, "usage.jsonl", 1024 * 1024) catch "";
-        var it = std.mem.splitScalar(u8, raw, '\n');
-        while (it.next()) |line| {
-            if (line.len == 0) continue;
-            const v = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch continue;
-            if (v != .object) continue;
-            if (v.object.get("input_tokens")) |ti| {
-                if (ti == .integer) total_in += @intCast(ti.integer);
+        const table = loadPricing(io, arena, environ, cwd);
+        const totals = readUsageTotals(io, arena, sess, &table);
+        out(io, "session usage: {d} turns, {d} tokens in, {d} out, {d} cache read, {d} cache write\n", .{
+            totals.turns,
+            totals.input_tokens,
+            totals.output_tokens,
+            totals.cache_read_tokens,
+            totals.cache_write_tokens,
+        }) catch {};
+        if (totals.priced_turns > 0) {
+            out(io, "estimated cost: ~${d:.4}", .{totals.cost_usd}) catch {};
+            if (totals.unpriced_turns > 0) {
+                out(io, " ({d} turns unpriced: model not in the price table)", .{totals.unpriced_turns}) catch {};
             }
-            if (v.object.get("output_tokens")) |to| {
-                if (to == .integer) total_out += @intCast(to.integer);
-            }
-            turns += 1;
+            out(io, "\n", .{}) catch {};
+        } else {
+            out(io, "estimated cost: n/a ({d} turns unpriced: model not in the price table)\n", .{totals.unpriced_turns}) catch {};
         }
-        out(io, "session usage: {d} turns, {d} tokens in, {d} tokens out\n", .{ turns, total_in, total_out }) catch {};
     } else if (std.mem.eql(u8, cmd, "compact")) {
         const pcfg2 = buildProviderConfig(cfg, environ);
         out(io, "[compacting context...]\n", .{}) catch {};

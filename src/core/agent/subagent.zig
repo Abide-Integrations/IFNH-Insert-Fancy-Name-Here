@@ -314,7 +314,7 @@ fn runChild(
     return .{
         .status = switch (outcome.status) {
             .completed => .completed,
-            .failed, .cancelled => .failed,
+            .failed, .cancelled, .budget_exceeded => .failed,
         },
         .summary = envelope,
         .report_path = report_path,
