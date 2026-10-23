@@ -20,6 +20,9 @@ pub const ProviderConfig = struct {
     model: []const u8,
     base_url: []const u8,
     api_key: []const u8,
+    /// Session-scoped HTTP client shared by provider requests (B-02). The
+    /// REPL owns it; null falls back to one client per request.
+    client: ?*std.http.Client = null,
 };
 
 pub const Callbacks = struct {
@@ -196,6 +199,7 @@ fn runRounds(p: RunParams, tool_ms: *f64) !Outcome {
                 .max_output_tokens = p.max_output_tokens,
                 .cancel = p.cancel,
                 .trace = p.trace,
+                .client = p.pcfg.client,
             }, .{ .ctx = &collector, .emit_fn = sinkEmit });
             if (collector.failure) |f| {
                 if (core_types.isRetryable(f.kind) and attempt < p.max_retries and !p.cancel.load(.acquire)) {

@@ -196,3 +196,49 @@ test "openai adapter accumulates tool calls from stream" {
     try std.testing.expectEqualStrings("read", tc.name);
     try std.testing.expectEqualStrings("{\"path\":\"x\"}", tc.arguments_json);
 }
+
+// ------------------------------------------------- B-02 shared client
+
+const anthropic_adapter = @import("anthropic.zig");
+
+fn sharedClientIsReused(comptime adapter: anytype, comptime body: []const u8) !void {
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // One session client, two requests against two servers: the adapter must
+    // take the supplied client (never own or close it) and hand each
+    // connection back to the pool, so shutdown can deinit it safely.
+    var client: std.http.Client = .{ .allocator = arena, .io = io };
+    var cancel = std.atomic.Value(bool).init(false);
+
+    for (0..2) |_| {
+        const srv = try FakeServer.start(io, arena, body);
+        defer srv.stop();
+        var collector = Collector{ .arena = arena };
+        const base = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}", .{srv.port});
+        try adapter.streamFn(undefined, arena, io, .{
+            .model = "test-model",
+            .base_url = base,
+            .api_key = "test-key-1234567890",
+            .system = "",
+            .messages = &.{},
+            .cancel = &cancel,
+            .client = &client,
+        }, .{ .ctx = &collector, .emit_fn = Collector.emit });
+        srv.wait();
+        try std.testing.expect(collector.done);
+        // No live request left behind: deinit would assert otherwise.
+        try std.testing.expect(client.connection_pool.used.first == null);
+    }
+    client.deinit();
+}
+
+test "openai adapter uses the session client and leaves the pool clean (B-02)" {
+    try sharedClientIsReused(openai_adapter, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" ++ "data: [DONE]\n\n");
+}
+
+test "anthropic adapter uses the session client and leaves the pool clean (B-02)" {
+    try sharedClientIsReused(anthropic_adapter, "event: content_block_delta\n" ++ "data: {\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n" ++ "event: message_stop\n" ++ "data: {}\n\n");
+}

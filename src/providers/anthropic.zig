@@ -36,8 +36,15 @@ pub fn streamFn(
         break :blk try buildBody(arena, req);
     };
 
-    var client: std.http.Client = .{ .allocator = alloc, .io = io };
-    defer client.deinit();
+    // Session-scoped client (B-02): the REPL opens one `std.http.Client` for
+    // the whole session so TLS sessions and keep-alive connections are reused
+    // across requests. Callers without one (one-shot probes, tests) fall back
+    // to a per-request client; `std.http.Client.deinit` asserts the pool has
+    // no live requests, so the fallback must outlive `creq`, which the defers
+    // here guarantee.
+    var local_client: std.http.Client = .{ .allocator = alloc, .io = io };
+    defer if (req.client == null) local_client.deinit();
+    const client: *std.http.Client = req.client orelse &local_client;
 
     var extra = [_]std.http.Header{
         .{ .name = "x-api-key", .value = req.api_key },

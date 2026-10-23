@@ -61,6 +61,10 @@ const Session = struct {
     user_keys: ?*keys_mod.Keys = null,
     /// Timing spans for this session (B-01).
     trace: ?*trace_mod.Trace = null,
+    /// One HTTP client for the whole session (B-02): provider requests share
+    /// its connection pool, so keep-alive and TLS sessions survive across
+    /// turns instead of being rebuilt per request.
+    http: std.http.Client,
 };
 
 var global_user_keys: keys_mod.Keys = undefined;
@@ -136,24 +140,30 @@ pub fn run(
     ensureIfnh(io, cwd) catch {};
     const sessions_dir_name = ".ifnh/sessions";
 
+    // One client for the session (B-02); closed with the session below.
+    // `std.http.Client.deinit` asserts the pool has no live requests, so
+    // nothing may still be streaming when the defer runs.
+    const http: std.http.Client = .{ .allocator = arena, .io = io };
+
     var sess: Session = blk: {
         if (opts.resume_id) |id| {
             const store = try session_mod.Session.open(cwd, io, arena, sessions_dir_name, id);
             const j = try journal_mod.Journal.open(io, arena, store.dir);
-            var s = Session{ .io = io, .store = store, .journal = j, .engine = engineFromConfig(arena, &cfg) };
+            var s = Session{ .io = io, .store = store, .journal = j, .engine = engineFromConfig(arena, &cfg), .http = http };
             try rebuildHistory(arena, &s);
             break :blk s;
         } else {
             const cwd_copy: []const u8 = if (environ.get("PWD")) |pwd| pwd else ".";
             const store = try session_mod.Session.create(cwd, io, arena, sessions_dir_name, cwd_copy);
             const j = try journal_mod.Journal.open(io, arena, store.dir);
-            break :blk Session{ .io = io, .store = store, .journal = j, .engine = engineFromConfig(arena, &cfg) };
+            break :blk Session{ .io = io, .store = store, .journal = j, .engine = engineFromConfig(arena, &cfg), .http = http };
         }
     };
     sess.user_keys = &global_user_keys;
     defer {
         if (sess.executions) |reg| reg.deinit(); // kill background children (I125)
         if (sess.mcp_registry) |reg| reg.deinit();
+        sess.http.deinit();
         sess.store.close();
         sess.journal.close();
     }
@@ -347,6 +357,9 @@ fn submitTurn(
             break :blk root;
         },
         .session_hint = sess.store.manifest.id,
+        // Child turns share the session client: the pool opens connections
+        // thread-safely, so parallel subagents reuse TLS sessions too (B-02).
+        .client = &sess.http,
     };
     var tool_ctx = tool_mod.ToolContext{
         .io = io,
@@ -437,10 +450,14 @@ fn submitTurn(
         }
     }
 
+    // Provider requests share the session's client (B-02).
+    var pcfg_shared = pcfg;
+    pcfg_shared.client = &sess.http;
+
     const outcome = agent_engine.runTurn(.{
         .io = io,
         .arena = arena,
-        .pcfg = pcfg,
+        .pcfg = pcfg_shared,
         .trace = sess.trace,
         .system = system,
         .history = &sess.history,

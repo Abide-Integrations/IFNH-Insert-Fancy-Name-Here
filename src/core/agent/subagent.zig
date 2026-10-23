@@ -67,6 +67,9 @@ pub const Host = struct {
     worktree_root: ?[]const u8 = null,
     /// Session hint used in worktree/branch names.
     session_hint: []const u8 = "s",
+    /// Session-scoped HTTP client shared by child requests (B-02). Null in
+    /// tests, which open one client per request.
+    client: ?*std.http.Client = null,
 };
 
 fn rolePreamble(arena: std.mem.Allocator, role: Role, label: []const u8) ![]const u8 {
@@ -242,6 +245,7 @@ fn runChild(
             .model = model orelse host.default_model,
             .base_url = host.base_url,
             .api_key = host.api_key,
+            .client = host.client,
         },
         .system = system,
         .history = &history,

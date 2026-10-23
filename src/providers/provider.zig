@@ -40,6 +40,10 @@ pub const ModelRequest = struct {
     /// Timing spans for request build, time-to-first-token and stream
     /// completion (B-01). Null when tracing is off.
     trace: ?*trace_mod.Trace = null,
+    /// Session-scoped HTTP client owned by the REPL (B-02): one pool for the
+    /// whole session, so TLS sessions and connections are reused. Adapters
+    /// fall back to a per-request client when this is null.
+    client: ?*std.http.Client = null,
 };
 
 pub const Capabilities = struct {
