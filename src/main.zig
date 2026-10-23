@@ -488,6 +488,7 @@ test {
     _ = @import("providers/provider.zig");
     _ = @import("providers/sse.zig");
     _ = @import("providers/openai.zig");
+    _ = @import("providers/openai_responses.zig");
     _ = @import("providers/anthropic.zig");
     _ = @import("core/instructions.zig");
     _ = @import("core/agent/engine.zig");

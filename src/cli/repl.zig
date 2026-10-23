@@ -29,6 +29,7 @@ const models_mod = @import("../providers/models.zig");
 const tool_mod = @import("../tools/tool.zig");
 const core_types = @import("../core/types.zig");
 const openai = @import("../providers/openai.zig");
+const openai_responses = @import("../providers/openai_responses.zig");
 const anthropic = @import("../providers/anthropic.zig");
 
 const max_output_bytes: usize = 256 * 1024;
@@ -262,7 +263,7 @@ fn submitTurn(
     cwd: std.Io.Dir,
 ) !void {
     if (pcfg.model.len == 0) {
-        try out(io, "no model configured — run /provider set <openai|anthropic> <model> [base_url] [key_env]\n", .{});
+        try out(io, "no model configured — run /provider set <openai|openai-responses|anthropic> <model> [base_url] [key_env]\n", .{});
         return;
     }
     if (pcfg.api_key.len == 0) {
@@ -760,6 +761,7 @@ pub const presets = [_]ProviderPreset{
     .{ .id = "openai", .label = "OpenRouter", .base_url = "https://openrouter.ai/api/v1", .key_env = "OPENROUTER_API_KEY", .default_model = "openrouter/auto", .needs_key = true },
     .{ .id = "anthropic", .label = "Anthropic", .base_url = "https://api.anthropic.com", .key_env = "ANTHROPIC_API_KEY", .default_model = "claude-sonnet-4-6", .needs_key = true },
     .{ .id = "openai", .label = "OpenAI", .base_url = "https://api.openai.com/v1", .key_env = "OPENAI_API_KEY", .default_model = "gpt-5.1", .needs_key = true },
+    .{ .id = "openai-responses", .label = "OpenAI Responses API", .base_url = "https://api.openai.com/v1", .key_env = "OPENAI_API_KEY", .default_model = "gpt-5.1", .needs_key = true },
     .{ .id = "openai", .label = "xAI (Grok)", .base_url = "https://api.x.ai/v1", .key_env = "XAI_API_KEY", .default_model = "grok-4", .needs_key = true },
     .{ .id = "openai", .label = "Groq", .base_url = "https://api.groq.com/openai/v1", .key_env = "GROQ_API_KEY", .default_model = "llama-3.3-70b-versatile", .needs_key = true },
     .{ .id = "openai", .label = "DeepSeek", .base_url = "https://api.deepseek.com/v1", .key_env = "DEEPSEEK_API_KEY", .default_model = "deepseek-chat", .needs_key = true },
@@ -901,7 +903,13 @@ fn runFirstRunSetup(
     var context_window: ?u64 = null;
     {
         try out(io, "testing tool support ({s})... ", .{model_name});
-        const probe = @import("../providers/probe.zig").probeToolSupport(arena, io, if (std.mem.eql(u8, preset.id, "anthropic")) anthropic.instance else openai.instance, base_url, key_value, model_name);
+        const probe_provider = if (std.mem.eql(u8, preset.id, "anthropic"))
+            anthropic.instance
+        else if (std.mem.eql(u8, preset.id, "openai-responses"))
+            openai_responses.instance
+        else
+            openai.instance;
+        const probe = @import("../providers/probe.zig").probeToolSupport(arena, io, probe_provider, base_url, key_value, model_name);
         switch (probe) {
             .supported => {
                 try out(io, "{s}ok — tool calling works{s}\n", .{ palette.success("", arena), "\x1b[0m" });
@@ -1005,6 +1013,7 @@ fn runFirstRunSetup(
 fn buildProviderConfig(cfg: *config_mod.Store, environ: *const std.process.Environ.Map) agent_engine.ProviderConfig {
     const provider_name = cfg.getString("model.provider", "openai");
     const is_anthropic = std.mem.eql(u8, provider_name, "anthropic");
+    const is_responses = std.mem.eql(u8, provider_name, "openai-responses");
     const base_url = cfg.getOptionalString("model.base_url") orelse
         (if (is_anthropic) "https://api.anthropic.com" else "https://api.openai.com/v1");
     const model = cfg.getString("model.model", "");
@@ -1019,7 +1028,12 @@ fn buildProviderConfig(cfg: *config_mod.Store, environ: *const std.process.Envir
         break :blk2 (environ.get(api_key_env) orelse "");
     };
     return .{
-        .provider = if (is_anthropic) anthropic.instance else openai.instance,
+        .provider = if (is_anthropic)
+            anthropic.instance
+        else if (is_responses)
+            openai_responses.instance
+        else
+            openai.instance,
         .model = model,
         .base_url = base_url,
         .api_key = api_key,

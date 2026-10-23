@@ -8,6 +8,7 @@
 const std = @import("std");
 const provider = @import("provider.zig");
 const sse = @import("sse.zig");
+const core_types = @import("../core/types.zig");
 
 const anthropic_version = "2023-06-01";
 const transfer_buffer_size: usize = 16 * 1024;
@@ -113,6 +114,12 @@ pub fn streamFn(
                             if (nv == .string) tools[index].name = try arena.dupe(u8, nv.string);
                         }
                     }
+                } else if (t == .string and std.mem.eql(u8, t.string, "thinking")) {
+                    if (cb.object.get("thinking")) |th| {
+                        if (th == .string and th.string.len > 0) {
+                            sink.emit(.{ .reasoning_delta = th.string });
+                        }
+                    }
                 }
             }
         } else if (std.mem.eql(u8, ev, "content_block_delta")) {
@@ -124,6 +131,12 @@ pub fn streamFn(
             if (std.mem.eql(u8, dt.string, "text_delta")) {
                 if (d.get("text")) |t| {
                     if (t == .string and t.string.len > 0) sink.emit(.{ .content_delta = t.string });
+                }
+            } else if (std.mem.eql(u8, dt.string, "thinking_delta")) {
+                if (d.get("thinking")) |th| {
+                    if (th == .string and th.string.len > 0) {
+                        sink.emit(.{ .reasoning_delta = th.string });
+                    }
                 }
             } else if (std.mem.eql(u8, dt.string, "input_json_delta")) {
                 if (d.get("partial_json")) |pj| {
@@ -216,7 +229,9 @@ fn buildBody(arena: std.mem.Allocator, req: provider.ModelRequest) ![]u8 {
             .assistant => {
                 try w.writeAll("{\"role\":\"assistant\",\"content\":[");
                 var inner_first = true;
-                if (msg.content.len > 0) {
+                if (msg.blocks.len > 0) {
+                    try writeAnthropicBlocks(w, msg.blocks, &inner_first);
+                } else if (msg.content.len > 0) {
                     try w.writeAll("{\"type\":\"text\",\"text\":");
                     try std.json.Stringify.value(msg.content, .{}, w);
                     try w.writeByte('}');
@@ -245,7 +260,14 @@ fn buildBody(arena: std.mem.Allocator, req: provider.ModelRequest) ![]u8 {
             },
             else => {
                 try w.writeAll("{\"role\":\"user\",\"content\":");
-                try std.json.Stringify.value(msg.content, .{}, w);
+                if (msg.blocks.len > 0) {
+                    try w.writeByte('[');
+                    var inner_first = true;
+                    try writeAnthropicBlocks(w, msg.blocks, &inner_first);
+                    try w.writeByte(']');
+                } else {
+                    try std.json.Stringify.value(msg.content, .{}, w);
+                }
                 try w.writeByte('}');
             },
         }
@@ -263,6 +285,37 @@ fn buildBody(arena: std.mem.Allocator, req: provider.ModelRequest) ![]u8 {
     return aw.written();
 }
 
+fn writeAnthropicBlocks(
+    w: *std.Io.Writer,
+    blocks: []const core_types.ContentBlock,
+    first: *bool,
+) !void {
+    for (blocks) |block| {
+        if (!first.*) try w.writeByte(',');
+        first.* = false;
+        switch (block) {
+            .text => |text| {
+                try w.writeAll("{\"type\":\"text\",\"text\":");
+                try std.json.Stringify.value(text, .{}, w);
+                try w.writeByte('}');
+            },
+            .image => |img| {
+                try w.writeAll("{\"type\":\"image\",\"source\":{");
+                if (img.url) |url| {
+                    try w.writeAll("\"type\":\"url\",\"url\":");
+                    try std.json.Stringify.value(url, .{}, w);
+                } else {
+                    try w.writeAll("\"type\":\"base64\",\"media_type\":");
+                    try std.json.Stringify.value(img.media_type, .{}, w);
+                    try w.writeAll(",\"data\":");
+                    try std.json.Stringify.value(img.data orelse "", .{}, w);
+                }
+                try w.writeAll("}}");
+            },
+        }
+    }
+}
+
 fn strOrEmpty(v: ?std.json.Value) []const u8 {
     const val = v orelse return "";
     return if (val == .string) val.string else "";
@@ -278,4 +331,36 @@ pub const instance = provider.Provider{
 
 fn capabilities() provider.Capabilities {
     return .{ .streaming = true, .tool_use = true, .reasoning = true };
+}
+
+test "anthropic buildBody renders text and image blocks" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var messages = [_]core_types.ChatMessage{
+        .{
+            .role = .user,
+            .content = "describe this",
+            .blocks = &.{
+                .{ .text = "describe this" },
+                .{ .image = .{ .media_type = "image/jpeg", .data = "aW1n" } },
+            },
+        },
+    };
+
+    const body = try buildBody(arena, .{
+        .model = "claude-test",
+        .base_url = "https://example.test",
+        .api_key = "",
+        .system = "",
+        .messages = &messages,
+        .cancel = &cancel,
+    });
+
+    try std.testing.expectEqualStrings(
+        "{\"model\":\"claude-test\",\"max_tokens\":4096,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"describe this\"},{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/jpeg\",\"data\":\"aW1n\"}}]}]}",
+        body,
+    );
 }

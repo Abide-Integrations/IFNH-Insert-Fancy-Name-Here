@@ -183,6 +183,39 @@ pub fn streamFn(
     sink.emit(.done);
 }
 
+fn writeChatContent(
+    arena: std.mem.Allocator,
+    w: *std.Io.Writer,
+    msg: core_types.ChatMessage,
+) !void {
+    if (msg.blocks.len == 0) {
+        try std.json.Stringify.value(msg.content, .{}, w);
+        return;
+    }
+    try w.writeByte('[');
+    for (msg.blocks, 0..) |block, i| {
+        if (i > 0) try w.writeByte(',');
+        switch (block) {
+            .text => |text| {
+                try w.writeAll("{\"type\":\"text\",\"text\":");
+                try std.json.Stringify.value(text, .{}, w);
+                try w.writeByte('}');
+            },
+            .image => |img| {
+                try w.writeAll("{\"type\":\"image_url\",\"image_url\":{\"url\":");
+                const url = if (img.url) |u| u else try std.fmt.allocPrint(
+                    arena,
+                    "data:{s};base64,{s}",
+                    .{ img.media_type, img.data orelse "" },
+                );
+                try std.json.Stringify.value(url, .{}, w);
+                try w.writeAll("}}");
+            },
+        }
+    }
+    try w.writeByte(']');
+}
+
 fn trimSlash(s: []const u8) []const u8 {
     return if (std.mem.endsWith(u8, s, "/")) s[0 .. s.len - 1] else s;
 }
@@ -234,7 +267,7 @@ fn buildBody(arena: std.mem.Allocator, req: provider.ModelRequest) ![]u8 {
                 try w.writeAll("{\"role\":");
                 try std.json.Stringify.value(@tagName(msg.role), .{}, w);
                 try w.writeAll(",\"content\":");
-                try std.json.Stringify.value(msg.content, .{}, w);
+                try writeChatContent(arena, w, msg);
                 try w.writeByte('}');
             },
             .tool => {
@@ -277,4 +310,36 @@ pub const instance = provider.Provider{
 
 fn capabilities() provider.Capabilities {
     return .{ .streaming = true, .tool_use = true, .reasoning = false };
+}
+
+test "openai buildBody renders text and image blocks" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var messages = [_]core_types.ChatMessage{
+        .{
+            .role = .user,
+            .content = "describe this",
+            .blocks = &.{
+                .{ .text = "describe this" },
+                .{ .image = .{ .media_type = "image/png", .data = "aW1n" } },
+            },
+        },
+    };
+
+    const body = try buildBody(arena, .{
+        .model = "gpt-test",
+        .base_url = "https://example.test/v1",
+        .api_key = "",
+        .system = "",
+        .messages = &messages,
+        .cancel = &cancel,
+    });
+
+    try std.testing.expectEqualStrings(
+        "{\"model\":\"gpt-test\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"describe this\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,aW1n\"}}]}]}",
+        body,
+    );
 }

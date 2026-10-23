@@ -325,8 +325,11 @@ pub const Store = struct {
             try self.addError("permissions.default_mode", "must be \"ask\" or \"auto\", got \"{s}\"", .{mode});
         }
         const provider = self.getString("model.provider", "openai");
-        if (!std.mem.eql(u8, provider, "openai") and !std.mem.eql(u8, provider, "anthropic")) {
-            try self.addError("model.provider", "must be \"openai\" or \"anthropic\", got \"{s}\"", .{provider});
+        if (!std.mem.eql(u8, provider, "openai") and
+            !std.mem.eql(u8, provider, "anthropic") and
+            !std.mem.eql(u8, provider, "openai-responses"))
+        {
+            try self.addError("model.provider", "must be \"openai\", \"anthropic\", or \"openai-responses\", got \"{s}\"", .{provider});
         }
     }
 };

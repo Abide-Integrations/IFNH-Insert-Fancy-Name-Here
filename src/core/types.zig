@@ -5,6 +5,22 @@ const std = @import("std");
 
 pub const ChatRole = enum { system, user, assistant, tool };
 
+/// A neutral multimodal content part. Adapters translate this into their
+/// wire format; the core never assumes a provider-specific shape.
+pub const ImageSource = struct {
+    /// MIME type, e.g. "image/png".
+    media_type: []const u8 = "image/png",
+    /// Base64-encoded image bytes, or null when `url` is set.
+    data: ?[]const u8 = null,
+    /// Remote image URL, or null when `data` is set.
+    url: ?[]const u8 = null,
+};
+
+pub const ContentBlock = union(enum) {
+    text: []const u8,
+    image: ImageSource,
+};
+
 pub const ChatMessage = struct {
     role: ChatRole,
     content: []const u8,
@@ -12,6 +28,10 @@ pub const ChatMessage = struct {
     tool_name: ?[]const u8 = null,
     /// JSON array of {id, name, arguments_json} for assistant tool calls.
     tool_calls_json: ?[]const u8 = null,
+    /// Optional multimodal parts. When non-empty, adapters serialize these
+    /// instead of the plain `content` string (which stays populated for
+    /// text-only consumers such as session replay and compaction).
+    blocks: []const ContentBlock = &.{},
 };
 
 pub const ToolCall = struct {
