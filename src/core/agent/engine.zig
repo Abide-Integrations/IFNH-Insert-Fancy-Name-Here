@@ -13,6 +13,18 @@ const tool_mod = @import("../../tools/tool.zig");
 const redact_mod = @import("../redact.zig");
 
 pub const max_tool_rounds_default: usize = 25;
+/// Upper bound on a server-provided `Retry-After` delay. Keeps a misbehaving
+/// or hostile endpoint from stalling a turn indefinitely.
+pub const max_retry_after_s: u64 = 60;
+
+/// Delay before the next provider attempt. `Retry-After` wins over the
+/// exponential backoff and is capped; otherwise backoff doubles from 1 s and
+/// caps at 16 s.
+pub fn retryDelaySeconds(attempt: usize, retry_after_s: ?u32) u64 {
+    if (retry_after_s) |seconds| return @min(@as(u64, seconds), max_retry_after_s);
+    const shift: u6 = @intCast(@min(attempt, 4));
+    return @min(@as(u64, 1) << shift, 16);
+}
 
 pub const ProviderConfig = struct {
     provider: provider_mod.Provider,
@@ -26,11 +38,14 @@ pub const Callbacks = struct {
     /// Streaming text delta.
     on_text: *const fn (ctx: *anyopaque, text: []const u8) void,
     /// A tool call is about to execute.
-    on_tool_start: *const fn (ctx: *anyopaque, name: []const u8, arguments_json: []const u8) void,
+    on_tool_start: *const fn (ctx: *anyopaque, call_id: []const u8, name: []const u8, arguments_json: []const u8) void,
     /// A tool call finished.
-    on_tool_result: *const fn (ctx: *anyopaque, name: []const u8, status: tool_mod.Status, output: []const u8) void,
+    on_tool_result: *const fn (ctx: *anyopaque, call_id: []const u8, name: []const u8, status: tool_mod.Status, output: []const u8) void,
     /// Non-fatal notice (permission denials, truncation...).
     on_notice: *const fn (ctx: *anyopaque, text: []const u8) void,
+    /// Optional: an assistant message (text plus any tool calls) was appended
+    /// to history. Persistent UIs record it here, not from `on_text`.
+    on_assistant_message: ?*const fn (ctx: *anyopaque, content: []const u8, tool_calls_json: ?[]const u8) void = null,
 };
 
 pub const Status = enum { completed, failed, cancelled };
@@ -93,38 +108,6 @@ fn sinkEmit(ctx: *anyopaque, ev: core_types.StreamEvent) void {
     Collector.emit(ctx, ev);
 }
 
-/// Render tool specs (name/description/parameters) as a JSON array for the
-/// provider request.
-pub fn renderToolsJson(arena: std.mem.Allocator, names: ?[]const []const u8) ![]const u8 {
-    var aw: std.Io.Writer.Allocating = .init(arena);
-    const w = &aw.writer;
-    try w.writeByte('[');
-    var first = true;
-    for (tool_mod.specs) |spec| {
-        if (names) |allowed| {
-            var ok = false;
-            for (allowed) |n| {
-                if (std.mem.eql(u8, n, spec.name)) {
-                    ok = true;
-                    break;
-                }
-            }
-            if (!ok) continue;
-        }
-        if (!first) try w.writeByte(',');
-        first = false;
-        try w.writeAll("{\"type\":\"function\",\"function\":{\"name\":");
-        try std.json.Stringify.value(spec.name, .{}, w);
-        try w.writeAll(",\"description\":");
-        try std.json.Stringify.value(spec.description, .{}, w);
-        try w.writeAll(",\"parameters\":");
-        try w.writeAll(spec.parameters_json);
-        try w.writeAll("}}");
-    }
-    try w.writeByte(']');
-    return aw.written();
-}
-
 pub const RunParams = struct {
     io: std.Io,
     arena: std.mem.Allocator,
@@ -158,10 +141,7 @@ pub fn runTurn(p: RunParams) !Outcome {
         }
 
         var collector = Collector{ .arena = p.arena, .callbacks = p.callbacks };
-        const tools_json = if (p.include_tools)
-            try renderToolsJson(p.arena, null)
-        else
-            "[]";
+        const tools: []const core_types.ToolSpec = if (p.include_tools) &tool_mod.specs else &.{};
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
             collector = Collector{ .arena = p.arena, .callbacks = p.callbacks };
@@ -171,16 +151,16 @@ pub fn runTurn(p: RunParams) !Outcome {
                 .api_key = p.pcfg.api_key,
                 .system = p.system,
                 .messages = p.history.items,
-                .tools_json = tools_json,
+                .tools = tools,
                 .temperature = p.temperature,
                 .max_output_tokens = p.max_output_tokens,
                 .cancel = p.cancel,
             }, .{ .ctx = &collector, .emit_fn = sinkEmit });
             if (collector.failure) |f| {
-                if (core_types.isRetryable(f.kind) and attempt < p.max_retries and !p.cancel.load(.acquire)) {
-                    const shift: u6 = @intCast(@min(attempt, 4));
-                    const delay_s: u64 = @min(@as(u64, 1) << shift, 16);
-                    sleepSeconds(p.io, delay_s) catch break;
+                if (core_types.isRetryable(f.kind) and attempt < p.max_retries and
+                    collector.text.items.len == 0 and !p.cancel.load(.acquire))
+                {
+                    sleepSeconds(p.io, retryDelaySeconds(attempt, f.retry_after_s)) catch break;
                     continue;
                 }
             }
@@ -190,7 +170,17 @@ pub fn runTurn(p: RunParams) !Outcome {
         total_usage.input_tokens += collector.usage.input_tokens;
         total_usage.output_tokens += collector.usage.output_tokens;
 
+        // Keep the text streamed before a failure so the caller can show (and
+        // roll back) a partial reply instead of losing it.
+        const reply = collector.text.items;
+        last_reply = reply;
+
         if (collector.failure) |f| {
+            // An interrupted stream is a cancellation, not a provider error:
+            // the REPL prints "(interrupted)" and rolls the turn back.
+            if (f.kind == .cancelled) {
+                return .{ .status = .cancelled, .reply = last_reply, .tool_rounds = rounds, .tool_calls = total_calls, .usage = total_usage };
+            }
             return .{
                 .status = .failed,
                 .reply = last_reply,
@@ -201,11 +191,9 @@ pub fn runTurn(p: RunParams) !Outcome {
             };
         }
 
-        const reply = collector.text.items;
-        last_reply = reply;
-
         if (collector.tool_calls.items.len == 0) {
             try p.history.append(p.arena, .{ .role = .assistant, .content = reply });
+            if (p.callbacks.on_assistant_message) |cb| cb(p.callbacks.ctx, reply, null);
             return .{ .status = .completed, .reply = reply, .tool_rounds = rounds + 1, .tool_calls = total_calls, .usage = total_usage };
         }
 
@@ -231,6 +219,7 @@ pub fn runTurn(p: RunParams) !Outcome {
             .content = reply,
             .tool_calls_json = tc_json,
         });
+        if (p.callbacks.on_assistant_message) |cb| cb(p.callbacks.ctx, reply, tc_json);
 
         // Execute tool calls; consecutive `agent` calls run in parallel
         // (E58), everything else sequentially, results appended in order.
@@ -253,8 +242,8 @@ pub fn runTurn(p: RunParams) !Outcome {
                     break :blk one;
                 };
                 for (batch, results) |tc, result| {
-                    p.callbacks.on_tool_start(p.callbacks.ctx, tc.name, tc.arguments_json);
-                    p.callbacks.on_tool_result(p.callbacks.ctx, tc.name, result.status, result.output);
+                    p.callbacks.on_tool_start(p.callbacks.ctx, tc.id, tc.name, tc.arguments_json);
+                    p.callbacks.on_tool_result(p.callbacks.ctx, tc.id, tc.name, result.status, result.output);
                     if (result.status == .denied) {
                         p.callbacks.on_notice(p.callbacks.ctx, result.output);
                     }
@@ -270,8 +259,8 @@ pub fn runTurn(p: RunParams) !Outcome {
             } else {
                 const result = executeOne(p, calls[i]);
                 total_calls += 1;
-                p.callbacks.on_tool_start(p.callbacks.ctx, calls[i].name, calls[i].arguments_json);
-                p.callbacks.on_tool_result(p.callbacks.ctx, calls[i].name, result.status, result.output);
+                p.callbacks.on_tool_start(p.callbacks.ctx, calls[i].id, calls[i].name, calls[i].arguments_json);
+                p.callbacks.on_tool_result(p.callbacks.ctx, calls[i].id, calls[i].name, result.status, result.output);
                 if (result.status == .denied) {
                     p.callbacks.on_notice(p.callbacks.ctx, result.output);
                 }
@@ -280,6 +269,7 @@ pub fn runTurn(p: RunParams) !Outcome {
                     .content = result.output,
                     .tool_call_id = calls[i].id,
                     .tool_name = calls[i].name,
+                    .is_error = result.status != .ok,
                 });
                 i += 1;
             }
@@ -345,6 +335,8 @@ test "runTurn executes scripted tool call and feeds result back" {
         texts: std.ArrayListUnmanaged([]const u8) = .empty,
         tool_starts: std.ArrayListUnmanaged([]const u8) = .empty,
         tool_results: std.ArrayListUnmanaged(tool_mod.Status) = .empty,
+        tool_ids: std.ArrayListUnmanaged([]const u8) = .empty,
+        assistant_msgs: usize = 0,
         notices: usize = 0,
         arena: std.mem.Allocator,
     };
@@ -358,18 +350,28 @@ test "runTurn executes scripted tool call and feeds result back" {
             }
         }.f,
         .on_tool_start = struct {
-            fn f(ctx: *anyopaque, name: []const u8, args_json: []const u8) void {
+            fn f(ctx: *anyopaque, call_id: []const u8, name: []const u8, args_json: []const u8) void {
                 const l: *EventLog = @ptrCast(@alignCast(ctx));
                 l.tool_starts.append(l.arena, name) catch {};
+                l.tool_ids.append(l.arena, call_id) catch {};
                 _ = args_json;
             }
         }.f,
         .on_tool_result = struct {
-            fn f(ctx: *anyopaque, name: []const u8, status: tool_mod.Status, output: []const u8) void {
+            fn f(ctx: *anyopaque, call_id: []const u8, name: []const u8, status: tool_mod.Status, output: []const u8) void {
                 const l: *EventLog = @ptrCast(@alignCast(ctx));
                 l.tool_results.append(l.arena, status) catch {};
+                _ = call_id;
                 _ = name;
                 _ = output;
+            }
+        }.f,
+        .on_assistant_message = struct {
+            fn f(ctx: *anyopaque, content: []const u8, tool_calls_json: ?[]const u8) void {
+                const l: *EventLog = @ptrCast(@alignCast(ctx));
+                l.assistant_msgs += 1;
+                _ = content;
+                _ = tool_calls_json;
             }
         }.f,
         .on_notice = struct {
@@ -455,12 +457,58 @@ test "runTurn surfaces provider failure" {
     try std.testing.expectEqualStrings("bad key", outcome.error_message);
 }
 
+test "a cancelled stream reports cancelled, not failed" {
+    const io = std.testing.io;
+    // The fake checks `req.cancel` first, so a pre-set flag cancels the call.
+    var fake = testing.Fake{ .script = &.{
+        &.{.{ .text = "partial" }},
+    } };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var perm_engine = @import("../permissions/engine.zig").Engine.init(arena, .auto);
+    var tool_ctx: tool_mod.ToolContext = .{
+        .io = io,
+        .arena = arena,
+        .workspace = std.Io.Dir.cwd(),
+        .engine = &perm_engine,
+        .journal = null,
+        .max_file_read_bytes = 1024,
+        .approval_ctx = undefined,
+        .approval_fn = undefined,
+    };
+    var history: std.ArrayListUnmanaged(core_types.ChatMessage) = .empty;
+    var cancel = std.atomic.Value(bool).init(true);
+
+    const outcome = try runTurn(.{
+        .io = io,
+        .arena = arena,
+        .pcfg = .{ .provider = fake.provider(), .model = "fake", .base_url = "", .api_key = "" },
+        .system = "",
+        .history = &history,
+        .tool_ctx = &tool_ctx,
+        .callbacks = .{
+            .ctx = undefined,
+            .on_text = noopText,
+            .on_tool_start = noopStart,
+            .on_tool_result = noopResult,
+            .on_notice = noopNotice,
+        },
+        .cancel = &cancel,
+    });
+    try std.testing.expectEqual(Status.cancelled, outcome.status);
+    try std.testing.expectEqualStrings("", outcome.error_message);
+}
+
 fn isAgentCall(tc: core_types.ToolCall) bool {
     return std.mem.eql(u8, tc.name, "agent");
 }
 
 fn executeOne(p: RunParams, tc: core_types.ToolCall) tool_mod.ToolResult {
-    const raw = tool_mod.execute(tc.name, tc.arguments_json, p.tool_ctx);
+    var ctx = p.tool_ctx.*;
+    ctx.cancel = p.cancel;
+    const raw = tool_mod.execute(tc.name, tc.arguments_json, &ctx);
     return .{
         .output = redact_mod.redact(p.arena, raw.output, p.redactions),
         .status = raw.status,
@@ -484,6 +532,7 @@ fn runAgentBatch(p: RunParams, calls: []const core_types.ToolCall) ![]tool_mod.T
             var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             var ctx = params.tool_ctx.*;
             ctx.arena = arena_state.allocator();
+            ctx.cancel = params.cancel;
             const raw = tool_mod.execute(tc.name, tc.arguments_json, &ctx);
             slot.result = raw;
             slot.arena_state = arena_state; // handed back for ordered copy
@@ -526,8 +575,8 @@ fn sleepSeconds(io: std.Io, seconds: u64) !void {
 }
 
 fn noopText(_: *anyopaque, _: []const u8) void {}
-fn noopStart(_: *anyopaque, _: []const u8, _: []const u8) void {}
-fn noopResult(_: *anyopaque, _: []const u8, _: tool_mod.Status, _: []const u8) void {}
+fn noopStart(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) void {}
+fn noopResult(_: *anyopaque, _: []const u8, _: []const u8, _: tool_mod.Status, _: []const u8) void {}
 fn noopNotice(_: *anyopaque, _: []const u8) void {}
 
 test "consecutive agent calls run in parallel and append in order" {
@@ -621,4 +670,68 @@ test "consecutive agent calls run in parallel and append in order" {
     const r2 = history.items[3].content;
     try std.testing.expect(std.mem.indexOf(u8, r1, "child-one") != null);
     try std.testing.expect(std.mem.indexOf(u8, r2, "child-two") != null);
+}
+
+test "retry delay honors Retry-After and caps backoff" {
+    try std.testing.expectEqual(@as(u64, 5), retryDelaySeconds(0, 5));
+    try std.testing.expectEqual(@as(u64, 60), retryDelaySeconds(3, 600));
+    try std.testing.expectEqual(@as(u64, 1), retryDelaySeconds(0, null));
+    try std.testing.expectEqual(@as(u64, 8), retryDelaySeconds(3, null));
+    try std.testing.expectEqual(@as(u64, 16), retryDelaySeconds(9, null));
+}
+
+test "partial stream failure is not retried" {
+    var fake = testing.Fake{ .script = &.{
+        &.{
+            .{ .text = "partial" },
+            .{ .failure = .{ .kind = .network, .message = "connection dropped" } },
+        },
+        &.{.{ .text = "must not run" }},
+    } };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var history: std.ArrayListUnmanaged(core_types.ChatMessage) = .empty;
+    try history.append(arena, .{ .role = .user, .content = "hi" });
+    var cancel = std.atomic.Value(bool).init(false);
+
+    // The scripted stream fails before any tool call, so the context is only
+    // needed to satisfy `RunParams`; the approval hook denies by default.
+    var perm_engine = @import("../permissions/engine.zig").Engine.init(arena, .auto);
+    var tool_ctx: tool_mod.ToolContext = .{
+        .io = std.testing.io,
+        .arena = arena,
+        .workspace = std.Io.Dir.cwd(),
+        .engine = &perm_engine,
+        .journal = null,
+        .max_file_read_bytes = 64 * 1024,
+        .approval_ctx = undefined,
+        .approval_fn = struct {
+            fn approve(_: *anyopaque, _: tool_mod.ApprovalRequest) tool_mod.ApprovalResponse {
+                return .denied;
+            }
+        }.approve,
+    };
+
+    const outcome = try runTurn(.{
+        .arena = arena,
+        .io = std.testing.io,
+        .pcfg = .{ .provider = fake.provider(), .model = "fake", .base_url = "", .api_key = "" },
+        .system = "",
+        .history = &history,
+        .tool_ctx = &tool_ctx,
+        .cancel = &cancel,
+        .callbacks = .{
+            .ctx = undefined,
+            .on_text = noopText,
+            .on_tool_start = noopStart,
+            .on_tool_result = noopResult,
+            .on_notice = noopNotice,
+        },
+    });
+
+    try std.testing.expectEqual(Status.failed, outcome.status);
+    try std.testing.expectEqualStrings("partial", outcome.reply);
+    try std.testing.expectEqual(@as(usize, 1), fake.call_index);
 }

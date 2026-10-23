@@ -446,28 +446,49 @@ pub const Session = struct {
     /// Read all complete events (bounded by max_events). Records and their
     /// strings are allocated in `arena`; the caller frees the arena, not
     /// the returned slice.
-    pub fn readEvents(self: *Session, arena: std.mem.Allocator, max_events: usize) ![]Record {
+    pub const EventPage = struct {
+        records: []Record,
+        /// True when older events were dropped to fit `max_events`.
+        truncated: bool,
+    };
+
+    /// Newest `max_events` records, oldest first. Replaying from the tail is
+    /// what resume needs: truncating from the head would replay a stale prefix
+    /// and drop the most recent turn.
+    pub fn readEventPage(self: *Session, arena: std.mem.Allocator, max_events: usize) !EventPage {
         const f = try self.dir.openFile(self.io, "events.jsonl", .{});
         defer f.close(self.io);
         const stat = try f.stat(self.io);
         const size: usize = @intCast(stat.size);
-        if (size == 0) return &.{};
+        if (size == 0 or max_events == 0) return .{ .records = &.{}, .truncated = false };
         if (size > max_log_bytes) return error.LogTooLarge;
 
         const buf = try arena.alloc(u8, size);
         _ = try f.readPositionalAll(self.io, buf, 0);
 
         var out: std.ArrayListUnmanaged(Record) = .empty;
+        var oldest: usize = 0; // ring index once the page wraps
+        var dropped = false;
         var line_start: usize = 0;
         while (std.mem.indexOfScalarPos(u8, buf[0..size], line_start, '\n')) |nl| {
             const line = buf[line_start..nl];
             line_start = nl + 1;
-            if (out.items.len >= max_events) break;
             if (line.len == 0 or line.len > max_event_bytes) continue;
             const rec = parseRecord(arena, line) catch continue;
-            try out.append(arena, rec);
+            if (out.items.len < max_events) {
+                try out.append(arena, rec);
+            } else {
+                out.items[oldest] = rec;
+                oldest = (oldest + 1) % max_events;
+                dropped = true;
+            }
         }
-        return out.items;
+        if (dropped and oldest != 0) std.mem.rotate(Record, out.items, oldest);
+        return .{ .records = out.items, .truncated = dropped };
+    }
+
+    pub fn readEvents(self: *Session, arena: std.mem.Allocator, max_events: usize) ![]Record {
+        return (try self.readEventPage(arena, max_events)).records;
     }
 
     fn parseRecord(arena: std.mem.Allocator, line: []const u8) !Record {
@@ -729,4 +750,40 @@ test "fork inherits events and records parent" {
     const events = try child.readEvents(arena, 100);
     try std.testing.expectEqual(@as(usize, 2), events.len);
     try std.testing.expectEqualStrings("before fork", events[0].event.user.text);
+}
+
+test "readEventPage returns the newest events and flags truncation" {
+    const io = std.testing.io;
+    var ts = try testingSession();
+    defer ts.tmp.cleanup();
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Session.create(ts.parent, io, arena, "sessions", "/tmp/proj");
+    defer s.close();
+    _ = try s.append(.{ .user = .{ .text = "one" } });
+    _ = try s.append(.{ .assistant = .{ .text = "two" } });
+    _ = try s.append(.{ .user = .{ .text = "three" } });
+    _ = try s.append(.{ .assistant = .{ .text = "four" } });
+    _ = try s.append(.{ .user = .{ .text = "five" } });
+
+    const full = try s.readEventPage(arena, 100);
+    try std.testing.expectEqual(@as(usize, 5), full.records.len);
+    try std.testing.expect(!full.truncated);
+
+    // Tail, not head: the last three events, oldest first.
+    const page = try s.readEventPage(arena, 3);
+    try std.testing.expect(page.truncated);
+    try std.testing.expectEqual(@as(usize, 3), page.records.len);
+    try std.testing.expectEqualStrings("three", page.records[0].event.user.text);
+    try std.testing.expectEqualStrings("four", page.records[1].event.assistant.text);
+    try std.testing.expectEqualStrings("five", page.records[2].event.user.text);
+
+    // readEvents keeps its shape (and now returns the tail too).
+    const legacy = try s.readEvents(arena, 2);
+    try std.testing.expectEqual(@as(usize, 2), legacy.len);
+    try std.testing.expectEqualStrings("four", legacy[0].event.assistant.text);
+    try std.testing.expectEqualStrings("five", legacy[1].event.user.text);
 }

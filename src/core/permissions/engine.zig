@@ -13,6 +13,11 @@ pub const Decision = enum { allow, ask, deny };
 pub const Mode = enum { ask, auto };
 pub const Access = enum { read, write };
 
+/// Config ceiling for a git action (A-T07): `never` denies outright (no
+/// approval can bypass it), `ask` uses the normal approval flow, `auto`
+/// allows without prompting.
+pub const GitPolicy = enum { never, ask, auto };
+
 pub const Request = union(enum) {
     path: struct { access: Access, path: []const u8 },
     command: struct { command: []const u8 },
@@ -52,6 +57,13 @@ pub const Engine = struct {
     env_allow: []const []const u8 = &.{},
     mcp_allow: []const []const u8 = &.{},
     mcp_deny: []const []const u8 = &.{},
+    /// `git.*` ceilings (A-T07). Defaults mirror the defaults table: commits
+    /// go through approval, push and force-push are never allowed.
+    git_commits: GitPolicy = .ask,
+    git_push: GitPolicy = .never,
+    git_force_push: GitPolicy = .never,
+    /// `permissions.read_dotenv`: allow read/grep to touch `.env` files.
+    read_dotenv: bool = false,
     /// Session grants accumulated from approvals. `alloc` is the engine's
     /// arena (Grant patterns are duped into it).
     grants: std.ArrayListUnmanaged(Grant) = .empty,
@@ -112,6 +124,14 @@ pub const Engine = struct {
         for (self.command_deny) |d| {
             if (prefixMatch(d, trimmed)) return .deny;
         }
+        // git ceilings outrank the allow list but never the deny list.
+        if (cmd_class.gitAction(trimmed)) |action| {
+            switch (self.gitPolicy(action)) {
+                .never => return .deny,
+                .auto => return .allow,
+                .ask => {},
+            }
+        }
         const effect = cmd_class.classify(trimmed);
         switch (effect) {
             .read_only => return .allow,
@@ -124,6 +144,14 @@ pub const Engine = struct {
                 return .ask;
             },
         }
+    }
+
+    pub fn gitPolicy(self: *const Engine, action: cmd_class.GitAction) GitPolicy {
+        return switch (action) {
+            .commit => self.git_commits,
+            .push => self.git_push,
+            .force_push => self.git_force_push,
+        };
     }
 
     pub fn decideEnv(self: *Engine, name: []const u8) Decision {
@@ -252,7 +280,7 @@ test "command decisions by effect" {
     try t.expectEqual(Decision.allow, e.decideCommand("git status"));
     try t.expectEqual(Decision.ask, e.decideCommand("mkdir build"));
     try t.expectEqual(Decision.ask, e.decideCommand("rm -rf build")); // destructive always asks
-    try t.expectEqual(Decision.ask, e.decideCommand("git push --force origin main")); // destructive asks; git ceiling enforced at tool layer
+    try t.expectEqual(Decision.deny, e.decideCommand("git push --force origin main")); // git.force_push = never
 
     e.command_deny = &.{"cargo"};
     try t.expectEqual(Decision.deny, e.decideCommand("cargo build"));
@@ -260,6 +288,27 @@ test "command decisions by effect" {
     e.command_allow = &.{"zig build"};
     try t.expectEqual(Decision.allow, e.decideCommand("zig build test"));
     try t.expectEqual(Decision.ask, e.decideCommand("zig buildx")); // word boundary respected
+}
+
+test "git ceilings gate push and force-push by default" {
+    var e = Engine.init(t.allocator, .ask);
+    defer e.deinit();
+    try t.expectEqual(Decision.deny, e.decideCommand("git push origin main"));
+    try t.expectEqual(Decision.deny, e.decideCommand("git -C sub push origin main"));
+    try t.expectEqual(Decision.deny, e.decideCommand("git push --force-with-lease origin main"));
+    try t.expectEqual(Decision.deny, e.decideCommand("git push origin +main"));
+    try t.expectEqual(Decision.deny, e.decideCommand("ls && git push origin main"));
+    // Commits still use the normal approval path.
+    try t.expectEqual(Decision.ask, e.decideCommand("git commit -m x"));
+
+    // Lowered ceilings still decide: ask defers, auto allows.
+    e.git_push = .ask;
+    try t.expectEqual(Decision.ask, e.decideCommand("git push origin main"));
+    e.git_force_push = .auto;
+    try t.expectEqual(Decision.allow, e.decideCommand("git push --force origin main"));
+    // The deny list still wins over an auto ceiling.
+    e.command_deny = &.{"git push"};
+    try t.expectEqual(Decision.deny, e.decideCommand("git push --force origin main"));
 }
 
 test "grants: session scope persists, once is consumed" {

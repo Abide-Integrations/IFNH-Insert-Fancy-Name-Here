@@ -23,22 +23,79 @@ pub const Plan = struct {
     should_compact: bool,
 };
 
-/// Decide whether to compact: history text over `threshold_tokens` and
-/// enough messages to be worth it. The last 2 messages are always kept.
-pub fn planCompaction(history: []const core_types.ChatMessage, threshold_tokens: usize, compact_fraction: f64) Plan {
+/// Assumed context budget when neither an explicit override nor a model
+/// window is known.
+pub const default_threshold_tokens: usize = 96_000;
+
+/// Messages always preserved after the summarized prefix. A cut may keep
+/// more so the tail begins on a turn boundary.
+const keep_tail = 2;
+
+/// Compaction trigger: an explicit `context.max_context_tokens` budget wins;
+/// otherwise derive 3/4 of an advertised model window; otherwise fall back
+/// to the historical 96k default.
+pub fn thresholdTokens(configured: ?u32, advertised_window: ?u64) usize {
+    if (configured) |v| {
+        if (v > 0) return v;
+    }
+    if (advertised_window) |w| {
+        if (w > 0) return @intCast(@max(w / 4 * 3, 4096));
+    }
+    return default_threshold_tokens;
+}
+
+fn estimateHistoryTokens(history: []const core_types.ChatMessage) usize {
     var total: usize = 0;
     for (history) |m| {
         total += estimateTokens(m.content);
         if (m.tool_calls_json) |t| total += estimateTokens(t);
     }
+    return total;
+}
+
+/// A turn boundary starts a user/system message and does not fall inside an
+/// assistant tool round. A round is one unit: the assistant message carrying
+/// `tool_calls` plus the consecutive tool messages answering it.
+fn isTurnBoundary(history: []const core_types.ChatMessage, index: usize) bool {
+    if (index >= history.len) return false;
+    switch (history[index].role) {
+        .user, .system => {},
+        else => return false,
+    }
+    for (history[0..index], 0..) |m, j| {
+        if (m.role != .assistant or m.tool_calls_json == null) continue;
+        var k = j + 1;
+        while (k < history.len and history[k].role == .tool) : (k += 1) {
+            if (k >= index) return false; // round straddles the cut
+        }
+    }
+    return true;
+}
+
+/// Largest valid cut that preserves at least `keep_tail` messages; 0 when
+/// no boundary exists (whole history is one turn, or nothing to summarize).
+fn boundaryCut(history: []const core_types.ChatMessage) usize {
+    if (history.len <= keep_tail) return 0;
+    var cut = history.len - keep_tail;
+    while (cut > 0) : (cut -= 1) {
+        if (isTurnBoundary(history, cut)) return cut;
+    }
+    return 0;
+}
+
+/// Decide whether to compact: history text over `threshold_tokens` and
+/// enough messages to be worth it. The tail starts on a turn boundary.
+pub fn planCompaction(history: []const core_types.ChatMessage, threshold_tokens: usize, compact_fraction: f64) Plan {
+    const total = estimateHistoryTokens(history);
     const trigger = @max(threshold_tokens, 1);
     const at = total >= trigger;
-    const summarize = if (history.len > 4) history.len - 2 else 0;
+    const summarize = boundaryCut(history);
     const worth = total >= trigger * 2 or @as(f64, @floatFromInt(total)) >= @as(f64, @floatFromInt(trigger)) * (1.0 + compact_fraction);
+    const ok = at and worth and summarize > 0;
     return .{
-        .summarize_count = if (at and worth) summarize else 0,
+        .summarize_count = if (ok) summarize else 0,
         .estimated_tokens = total,
-        .should_compact = at and worth and summarize > 0,
+        .should_compact = ok,
     };
 }
 
@@ -74,12 +131,15 @@ pub fn compact(
     history: *std.ArrayListUnmanaged(core_types.ChatMessage),
     redactions: []const []const u8,
 ) compact_error!Result {
-    const plan = planCompaction(history.items, 1, 1.0); // force
-    if (plan.summarize_count == 0) return error.NothingToCompact;
+    // Forced compaction (`/compact`) uses the same boundary rule as the
+    // automatic path, so it cannot leave an orphaned tool tail either.
+    const summarize_count = boundaryCut(history.items);
+    if (summarize_count == 0) return error.NothingToCompact;
+    const tokens_before = estimateHistoryTokens(history.items);
 
     // Build the summarization transcript from the leading portion.
     var transcript: std.ArrayListUnmanaged(u8) = .empty;
-    for (history.items[0..plan.summarize_count]) |m| {
+    for (history.items[0..summarize_count]) |m| {
         switch (m.role) {
             .user => try transcript.print(arena, "USER: {s}\n", .{m.content}),
             .assistant => try transcript.print(arena, "ASSISTANT: {s}\n", .{m.content}),
@@ -129,7 +189,7 @@ pub fn compact(
         .role = .user,
         .content = std.fmt.allocPrint(arena, "[context compaction handoff]\n{s}", .{handoff}) catch handoff,
     });
-    for (history.items[plan.summarize_count..]) |m| {
+    for (history.items[summarize_count..]) |m| {
         try new_history.append(arena, m);
     }
 
@@ -139,7 +199,7 @@ pub fn compact(
     return .{
         .handoff = handoff,
         .history = new_history.items,
-        .tokens_before = plan.estimated_tokens,
+        .tokens_before = tokens_before,
         .tokens_after = tokens_after,
     };
 }
@@ -164,6 +224,58 @@ test "token estimate and plan thresholds" {
 
     const small = planCompaction(history.items[0..2], 1000, 0.8);
     try std.testing.expect(!small.should_compact); // nothing left after tail
+}
+
+test "compaction backs the cut up to the preceding user turn" {
+    const history = [_]core_types.ChatMessage{
+        .{ .role = .user, .content = "first" },
+        .{ .role = .assistant, .content = "", .tool_calls_json = "[{\"id\":\"t1\",\"name\":\"read\"}]" },
+        .{ .role = .tool, .content = "r1", .tool_call_id = "t1" },
+        .{ .role = .user, .content = "second" },
+        .{ .role = .assistant, .content = "", .tool_calls_json = "[{\"id\":\"t2\",\"name\":\"read\"}]" },
+        .{ .role = .tool, .content = "r2", .tool_call_id = "t2" },
+    };
+    const plan = planCompaction(&history, 1, 0.8);
+    try std.testing.expect(plan.should_compact);
+    // len - 2 lands on the last assistant; back up to "second".
+    try std.testing.expectEqual(@as(usize, 3), plan.summarize_count);
+    try std.testing.expectEqual(core_types.ChatRole.user, history[plan.summarize_count].role);
+}
+
+test "compaction never splits an assistant tool round" {
+    const history = [_]core_types.ChatMessage{
+        .{ .role = .user, .content = "u1" },
+        .{ .role = .assistant, .content = "", .tool_calls_json = "[{\"id\":\"t1\",\"name\":\"read\"}]" },
+        .{ .role = .tool, .content = "r1", .tool_call_id = "t1" },
+        .{ .role = .user, .content = "u2" },
+        .{ .role = .assistant, .content = "", .tool_calls_json = "[{\"id\":\"t2\",\"name\":\"read\"}]" },
+        .{ .role = .tool, .content = "r2", .tool_call_id = "t2" },
+    };
+    const plan = planCompaction(&history, 1, 0.8);
+    try std.testing.expect(plan.should_compact);
+    // The assistant(t2) + tool(t2) pair stays together in the tail.
+    try std.testing.expect(history[plan.summarize_count].role != .tool);
+    try std.testing.expect(history[plan.summarize_count - 1].role != .assistant);
+    try std.testing.expectEqualStrings("t2", history[plan.summarize_count + 2].tool_call_id.?);
+}
+
+test "compaction refuses when the only turn is the last one" {
+    const history = [_]core_types.ChatMessage{
+        .{ .role = .user, .content = "u" ** 4000 },
+        .{ .role = .assistant, .content = "", .tool_calls_json = "[{\"id\":\"t1\",\"name\":\"read\"}]" },
+        .{ .role = .tool, .content = "r" ** 4000, .tool_call_id = "t1" },
+    };
+    const plan = planCompaction(&history, 100, 0.8);
+    try std.testing.expect(!plan.should_compact);
+    try std.testing.expectEqual(@as(usize, 0), plan.summarize_count);
+}
+
+test "compaction threshold follows the configured window" {
+    try std.testing.expectEqual(default_threshold_tokens, thresholdTokens(null, null));
+    try std.testing.expectEqual(@as(usize, 32_000), thresholdTokens(32_000, null));
+    try std.testing.expectEqual(@as(usize, 150_000), thresholdTokens(null, 200_000));
+    try std.testing.expectEqual(@as(usize, 4096), thresholdTokens(null, 1000));
+    try std.testing.expectEqual(@as(usize, 32_000), thresholdTokens(32_000, 200_000));
 }
 
 test "compaction fails cleanly when provider fails" {

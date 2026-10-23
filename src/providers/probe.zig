@@ -10,9 +10,15 @@ const provider_mod = @import("provider.zig");
 
 pub const max_probe_tokens: u32 = 64;
 
-const probe_tools_json =
-    \\[{"type":"function","function":{"name":"ping","description":"A no-op test tool. Call it when asked.","parameters":{"type":"object","properties":{}}}}]
-;
+/// The probe advertises one no-op tool in the neutral shape; the adapter
+/// under test serializes it for its own wire format.
+const probe_tools = [_]core_types.ToolSpec{
+    .{
+        .name = "ping",
+        .description = "A no-op test tool. Call it when asked.",
+        .parameters_json = "{\"type\":\"object\",\"properties\":{}}",
+    },
+};
 
 const probe_system = "You are a tool-use test harness.";
 const probe_user = "Call the ping tool now. Do not reply with text.";
@@ -73,7 +79,7 @@ pub fn probeToolSupport(
         .api_key = api_key,
         .system = probe_system,
         .messages = msgs[0..],
-        .tools_json = probe_tools_json,
+        .tools = &probe_tools,
         .max_output_tokens = max_probe_tokens,
         .cancel = &cancel,
     }, .{ .ctx = &collector, .emit_fn = sinkCollect }) catch |err| {
@@ -111,4 +117,8 @@ test "probe classification from scripted events" {
     try std.testing.expect(!looksLikeToolRejection("rate limited"));
     try std.testing.expect(!looksLikeToolRejection(""));
     _ = a;
+
+    // One advertised tool so the round-trip has something to call.
+    try std.testing.expectEqual(@as(usize, 1), probe_tools.len);
+    try std.testing.expectEqualStrings("ping", probe_tools[0].name);
 }

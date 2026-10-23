@@ -49,6 +49,14 @@ pub const Host = struct {
     command_allow: []const []const u8,
     command_deny: []const []const u8,
     env_allow: []const []const u8,
+    /// `git.*` / `permissions.read_dotenv` ceilings inherited from the parent
+    /// config (A-T07). Defaults are the fail-closed ones.
+    git_commits: engine_mod.GitPolicy = .ask,
+    git_push: engine_mod.GitPolicy = .never,
+    git_force_push: engine_mod.GitPolicy = .never,
+    read_dotenv: bool = false,
+    /// `agents.timeout_tool_s` for the child's captured commands.
+    timeout_tool_s: u32 = 120,
     journal: ?*journal_mod.Journal,
     approval_ctx: *anyopaque,
     approval_fn: *const fn (ctx: *anyopaque, req: tool_mod.ApprovalRequest) tool_mod.ApprovalResponse,
@@ -203,6 +211,10 @@ fn runChild(
     child_engine.command_allow = host.command_allow;
     child_engine.command_deny = host.command_deny;
     child_engine.env_allow = host.env_allow;
+    child_engine.git_commits = host.git_commits;
+    child_engine.git_push = host.git_push;
+    child_engine.git_force_push = host.git_force_push;
+    child_engine.read_dotenv = host.read_dotenv;
     child_engine.write_globs = switch (role) {
         .implement => host.write_globs,
         .research, .review => &.{},
@@ -215,6 +227,7 @@ fn runChild(
         .engine = &child_engine,
         .journal = host.journal,
         .max_file_read_bytes = 256 * 1024,
+        .timeout_s = host.timeout_tool_s,
         .approval_ctx = host.approval_ctx,
         .approval_fn = host.approval_fn,
         .agent_spawn_fn = spawnHookFn,
@@ -360,8 +373,8 @@ fn writeReport(
 }
 
 fn noopText(_: *anyopaque, _: []const u8) void {}
-fn noopStart(_: *anyopaque, _: []const u8, _: []const u8) void {}
-fn noopResult(_: *anyopaque, _: []const u8, _: tool_mod.Status, _: []const u8) void {}
+fn noopStart(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) void {}
+fn noopResult(_: *anyopaque, _: []const u8, _: []const u8, _: tool_mod.Status, _: []const u8) void {}
 fn noopNotice(_: *anyopaque, _: []const u8) void {}
 
 /// Tool-level adapter (matches tool_mod.ToolContext.agent_spawn_fn).

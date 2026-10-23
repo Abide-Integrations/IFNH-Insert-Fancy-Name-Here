@@ -6,6 +6,7 @@
 //! atomically with 0600 permissions.
 
 const std = @import("std");
+const config = @import("config.zig");
 const fsutil = @import("../fsutil.zig");
 
 pub const Keys = struct {
@@ -17,9 +18,7 @@ pub const Keys = struct {
 
     /// Locate the user env file; allocated in `arena` (null if no HOME).
     pub fn path(arena: std.mem.Allocator, environ: ?*const std.process.Environ.Map) ?[]const u8 {
-        const home = if (environ) |e| e.get("HOME") else null;
-        if (home == null) return null;
-        return std.fmt.allocPrint(arena, "{s}/.config/ifnh/env", .{home.?}) catch null;
+        return config.userEnvPath(arena, environ);
     }
 
     /// Parse KEY=VALUE lines (values may contain '='; trimmed).

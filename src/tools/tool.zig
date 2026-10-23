@@ -8,10 +8,11 @@
 //! Every tool result is model-facing text, UTF-8-safe, and capped.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const core_types = @import("../core/types.zig");
 const engine_mod = @import("../core/permissions/engine.zig");
 const journal_mod = @import("../core/journal.zig");
 const globm = @import("../core/permissions/glob.zig");
-const cmd_class = @import("../core/permissions/command_class.zig");
 
 pub const max_tool_output_bytes: usize = 64 * 1024;
 pub const max_file_size_bytes: usize = 1024 * 1024;
@@ -57,7 +58,13 @@ pub const ToolContext = struct {
     /// MCP registry hooks (wired by the host; null disables MCP).
     mcp_list_fn: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator) []const u8 = null,
     mcp_call_fn: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, server: []const u8, tool: []const u8, arguments_json: []const u8) []const u8 = null,
+    mcp_describe_fn: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, server: []const u8, tool: []const u8) []const u8 = null,
     mcp_ctx: ?*anyopaque = null,
+    /// Turn cancel flag (A-T06). `runCaptured` kills the child process group
+    /// when it flips; null when nothing can cancel.
+    cancel: ?*std.atomic.Value(bool) = null,
+    /// Wall-clock limit for one captured command (`agents.timeout_tool_s`).
+    timeout_s: u32 = 120,
     /// Delegation depth of the agent owning this context (0 = parent).
     agent_depth: usize = 0,
     /// Display label for approval provenance ("parent", "research-1"...).
@@ -87,11 +94,7 @@ pub const AgentSpawnResult = struct {
     tool_calls: usize = 0,
 };
 
-pub const Spec = struct {
-    name: []const u8,
-    description: []const u8,
-    parameters_json: []const u8,
-};
+pub const Spec = core_types.ToolSpec;
 
 /// Tool specs advertised to the model (order = advertisement order).
 pub const specs = [_]Spec{
@@ -110,14 +113,17 @@ pub const specs = [_]Spec{
     .{ .name = "write", .description = "Create a file or overwrite it entirely. Prefer edit for existing files.", .parameters_json =
     \\{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}
     },
-    .{ .name = "bash", .description = "Run a shell command in the workspace. Read-only commands run freely; anything that changes state requires approval.", .parameters_json =
-    \\{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}
+    .{ .name = "bash", .description = "Run a shell command with the user's shell. Read-only commands run freely; anything that changes state requires approval. Use background for long-running commands and poll them with the exec tool.", .parameters_json =
+    \\{"type":"object","properties":{"command":{"type":"string"},"background":{"type":"boolean","description":"start detached and return an execution id"},"timeout_s":{"type":"integer","description":"wall-clock limit in seconds, capped by the session limit"}},"required":["command"]}
     },
     .{ .name = "skill", .description = "Load a named skill's full instructions from the installed skills catalog.", .parameters_json =
     \\{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}
     },
     .{ .name = "mcp_list", .description = "List configured MCP servers and their tools.", .parameters_json =
     \\{"type":"object","properties":{}}
+    },
+    .{ .name = "mcp_describe", .description = "Show an MCP tool's description and input schema. Use it before mcp_call when the arguments are unclear.", .parameters_json =
+    \\{"type":"object","properties":{"server":{"type":"string"},"tool":{"type":"string"}},"required":["server","tool"]}
     },
     .{ .name = "mcp_call", .description = "Call an MCP server tool. Server/tool must be permitted; calls require approval unless allowlisted.", .parameters_json =
     \\{"type":"object","properties":{"server":{"type":"string"},"tool":{"type":"string"},"arguments":{"type":"object"}},"required":["server","tool"]}
@@ -205,7 +211,12 @@ pub fn execute(name: []const u8, args_json: []const u8, ctx: *ToolContext) ToolR
     } else if (std.mem.eql(u8, name, "bash")) {
         const command = a.str("command") orelse return errResult(ctx.arena, "bash: missing command", .{});
         const background = if (a.obj.get("background")) |b| (b == .bool and b.bool) else false;
-        return toolBash(command, background, ctx);
+        const timeout_s: u32 = blk: {
+            const v = a.obj.get("timeout_s") orelse break :blk 0;
+            if (v != .integer or v.integer <= 0 or v.integer > 86_400) break :blk 0;
+            break :blk @intCast(v.integer);
+        };
+        return toolBash(command, background, timeout_s, ctx);
     } else if (std.mem.eql(u8, name, "skill")) {
         const load_fn = ctx.skill_load_fn orelse
             return errResult(ctx.arena, "skill: skills not available", .{});
@@ -234,6 +245,13 @@ pub fn execute(name: []const u8, args_json: []const u8, ctx: *ToolContext) ToolR
         const list_fn = ctx.mcp_list_fn orelse
             return errResult(ctx.arena, "mcp_list: MCP not configured", .{});
         return .{ .output = list_fn(ctx.mcp_ctx orelse ctx.approval_ctx, ctx.arena), .status = .ok };
+    } else if (std.mem.eql(u8, name, "mcp_describe")) {
+        const describe_fn = ctx.mcp_describe_fn orelse
+            return errResult(ctx.arena, "mcp_describe: MCP not configured", .{});
+        const server = a.str("server") orelse return errResult(ctx.arena, "mcp_describe: missing server", .{});
+        const mcp_tool = a.str("tool") orelse return errResult(ctx.arena, "mcp_describe: missing tool", .{});
+        const out = describe_fn(ctx.mcp_ctx orelse ctx.approval_ctx, ctx.arena, server, mcp_tool);
+        return .{ .output = out, .status = if (std.mem.startsWith(u8, out, "error:")) .failed else .ok };
     } else if (std.mem.eql(u8, name, "mcp_call")) {
         const call_fn = ctx.mcp_call_fn orelse
             return errResult(ctx.arena, "mcp_call: MCP not configured", .{});
@@ -280,11 +298,21 @@ pub fn execute(name: []const u8, args_json: []const u8, ctx: *ToolContext) ToolR
 
 // ---------------------------------------------------------------- read
 
+/// `.env` / `.env.*` hold credentials; reads are gated by
+/// `permissions.read_dotenv` (A-T07).
+fn isDotenvPath(path: []const u8) bool {
+    const base = std.fs.path.basename(path);
+    return std.mem.eql(u8, base, ".env") or std.mem.startsWith(u8, base, ".env.");
+}
+
 fn toolRead(path: []const u8, offset: ?usize, limit: ?usize, ctx: *ToolContext) ToolResult {
     switch (ctx.engine.decidePath(.read, path)) {
         .allow => {},
         .ask => return deniedResult(ctx.arena, "read '{s}' not covered by read policy", .{path}),
         .deny => return deniedResult(ctx.arena, "read '{s}'", .{path}),
+    }
+    if (!ctx.engine.read_dotenv and isDotenvPath(path)) {
+        return deniedResult(ctx.arena, "read '{s}' (permissions.read_dotenv is false)", .{path});
     }
     const stat = ctx.workspace.statFile(ctx.io, path, .{}) catch
         return errResult(ctx.arena, "read: cannot stat '{s}'", .{path});
@@ -427,6 +455,7 @@ fn grepDir(
 }
 
 fn grepFile(ctx: *ToolContext, rel: []const u8, pattern: []const u8, limits: *WalkLimits, out: *std.ArrayListUnmanaged(u8)) void {
+    if (!ctx.engine.read_dotenv and isDotenvPath(rel)) return;
     const data = ctx.workspace.readFileAlloc(ctx.io, rel, ctx.arena, .limited(max_file_size_bytes)) catch return;
     if (!std.unicode.utf8ValidateSlice(data)) return; // skip binary
     var lines = std.mem.splitScalar(u8, data, '\n');
@@ -561,28 +590,92 @@ fn toolReadResult(id: []const u8, offset: ?usize, limit: ?usize, ctx: *ToolConte
 // ---------------------------------------------------------------- bash / git
 
 fn runCaptured(ctx: *ToolContext, argv: []const []const u8, cwd: []const u8) ToolResult {
-    const run = std.process.run(ctx.arena, ctx.io, .{
+    // Windows has no POSIX process groups; keep the std helper there.
+    if (builtin.os.tag == .windows) return runCapturedWindows(ctx, argv, cwd);
+
+    const limit_s: u32 = if (ctx.timeout_s == 0) 120 else ctx.timeout_s;
+    // Own process group (pgid = 0) so a cancel or timeout signals the whole
+    // tree, not just the direct child (A-T06).
+    var child = std.process.spawn(ctx.io, .{
         .argv = argv,
         .cwd = if (cwd.len > 0) .{ .path = cwd } else .inherit,
-        .stdout_limit = .limited(max_tool_output_bytes),
-        .stderr_limit = .limited(32 * 1024),
-        .timeout = .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(120) } },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .pgid = 0,
     }) catch |err| switch (err) {
-        error.Timeout => return .{ .output = "error: command timed out after 120s", .status = .timeout },
         error.FileNotFound => return errResult(ctx.arena, "command not found: {s}", .{argv[0]}),
         else => return errResult(ctx.arena, "spawn failed: {s}", .{@errorName(err)}),
     };
 
+    const deadline = std.Io.Clock.Timestamp.fromNow(ctx.io, .{
+        .raw = .fromSeconds(@intCast(limit_s)),
+        .clock = .awake,
+    });
+
+    var stdout: std.ArrayListUnmanaged(u8) = .empty;
+    var stderr: std.ArrayListUnmanaged(u8) = .empty;
+    var fds = [_]std.posix.pollfd{
+        .{ .fd = child.stdout.?.handle, .events = std.posix.POLL.IN, .revents = 0 },
+        .{ .fd = child.stderr.?.handle, .events = std.posix.POLL.IN, .revents = 0 },
+    };
+    var open = [2]bool{ true, true };
+    var cancelled = false;
+    var timed_out = false;
+    var overflow = false;
+    var buf: [8192]u8 = undefined;
+
+    read_loop: while (open[0] or open[1]) {
+        if (ctx.cancel) |cancel| {
+            if (cancel.load(.acquire)) {
+                cancelled = true;
+                break :read_loop;
+            }
+        }
+        const remaining_ns = deadline.durationFromNow(ctx.io).raw.nanoseconds;
+        if (remaining_ns <= 0) {
+            timed_out = true;
+            break :read_loop;
+        }
+        // Short slices keep the cancel flag responsive during long commands.
+        const wait_ms: i32 = @intCast(@min(@divTrunc(remaining_ns, std.time.ns_per_ms), 100));
+        const ready = std.posix.poll(&fds, wait_ms) catch break :read_loop;
+        if (ready == 0) continue;
+        for (0..2) |i| {
+            if (!open[i]) continue;
+            const revents = fds[i].revents;
+            if (revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL) == 0) continue;
+            const got = std.posix.read(fds[i].fd, &buf) catch 0;
+            if (got == 0) {
+                open[i] = false;
+                continue;
+            }
+            if (stdout.items.len + stderr.items.len + got > max_tool_output_bytes) {
+                overflow = true;
+                break :read_loop;
+            }
+            const sink = if (i == 0) &stdout else &stderr;
+            sink.appendSlice(ctx.arena, buf[0..got]) catch break :read_loop;
+            fds[i].revents = 0;
+        }
+    }
+
+    if (cancelled or timed_out or overflow) killProcessGroup(ctx, &child);
+    const term: std.process.Child.Term = child.wait(ctx.io) catch .{ .unknown = 0 };
+    if (cancelled) {
+        // Give the caller a chance to journal `.interrupted`; no output is
+        // promised for a killed command.
+        return .{ .output = "cancelled: command and its process group were terminated", .status = .failed };
+    }
+
     var out: std.ArrayListUnmanaged(u8) = .empty;
-    if (run.stdout.len > 0) {
-        out.print(ctx.arena, "<stdout>\n{s}\n</stdout>\n", .{run.stdout}) catch {};
-    }
-    if (run.stderr.len > 0) {
-        out.print(ctx.arena, "<stderr>\n{s}\n</stderr>\n", .{run.stderr}) catch {};
-    }
-    switch (run.term) {
+    if (stdout.items.len > 0) out.print(ctx.arena, "<stdout>\n{s}\n</stdout>\n", .{stdout.items}) catch {};
+    if (stderr.items.len > 0) out.print(ctx.arena, "<stderr>\n{s}\n</stderr>\n", .{stderr.items}) catch {};
+    if (timed_out) out.print(ctx.arena, "error: command timed out after {d}s (process group terminated)\n", .{limit_s}) catch {};
+    if (overflow) out.print(ctx.arena, "error: output exceeded {d} bytes; command terminated\n", .{max_tool_output_bytes}) catch {};
+    switch (term) {
         .exited => |code| {
-            if (code != 0) out.print(ctx.arena, "exit code: {d}\n", .{code}) catch {};
+            if (code != 0 and !timed_out and !overflow) out.print(ctx.arena, "exit code: {d}\n", .{code}) catch {};
         },
         .signal => |sig| out.print(ctx.arena, "terminated by signal {d}\n", .{sig}) catch {},
         .stopped => |sig| out.print(ctx.arena, "stopped by signal {d}\n", .{sig}) catch {},
@@ -593,17 +686,58 @@ fn runCaptured(ctx: *ToolContext, argv: []const []const u8, cwd: []const u8) Too
         const handle = storeArtifact(ctx, out.items);
         body = std.fmt.allocPrint(ctx.arena, "{s}\n{s}", .{ body, handle }) catch body;
     }
+    if (timed_out) return .{ .output = body, .status = .timeout };
+    const failed = switch (term) {
+        .exited => |code| code != 0,
+        else => true,
+    };
+    return .{ .output = body, .status = if (failed or overflow) .failed else .ok };
+}
+
+/// Terminate a captured command's process group: TERM first so it can clean
+/// up, then KILL to guarantee no grandchild survives a cancel or timeout.
+fn killProcessGroup(ctx: *ToolContext, child: *std.process.Child) void {
+    const pid = child.id orelse return;
+    _ = std.posix.kill(-pid, .TERM) catch {};
+    std.Io.sleep(ctx.io, std.Io.Duration.fromMilliseconds(50), .awake) catch {};
+    _ = std.posix.kill(-pid, .KILL) catch {};
+}
+
+fn runCapturedWindows(ctx: *ToolContext, argv: []const []const u8, cwd: []const u8) ToolResult {
+    const run = std.process.run(ctx.arena, ctx.io, .{
+        .argv = argv,
+        .cwd = if (cwd.len > 0) .{ .path = cwd } else .inherit,
+        .stdout_limit = .limited(max_tool_output_bytes),
+        .stderr_limit = .limited(32 * 1024),
+        .timeout = .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(if (ctx.timeout_s == 0) 120 else ctx.timeout_s) } },
+    }) catch |err| switch (err) {
+        error.Timeout => return .{ .output = "error: command timed out", .status = .timeout },
+        error.FileNotFound => return errResult(ctx.arena, "command not found: {s}", .{argv[0]}),
+        else => return errResult(ctx.arena, "spawn failed: {s}", .{@errorName(err)}),
+    };
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    if (run.stdout.len > 0) out.print(ctx.arena, "<stdout>\n{s}\n</stdout>\n", .{run.stdout}) catch {};
+    if (run.stderr.len > 0) out.print(ctx.arena, "<stderr>\n{s}\n</stderr>\n", .{run.stderr}) catch {};
+    switch (run.term) {
+        .exited => |code| {
+            if (code != 0) out.print(ctx.arena, "exit code: {d}\n", .{code}) catch {};
+        },
+        .signal => |sig| out.print(ctx.arena, "terminated by signal {d}\n", .{sig}) catch {},
+        .stopped => |sig| out.print(ctx.arena, "stopped by signal {d}\n", .{sig}) catch {},
+        .unknown => |code| out.print(ctx.arena, "exit status: {d}\n", .{code}) catch {},
+    }
     const failed = switch (run.term) {
         .exited => |code| code != 0,
         else => true,
     };
-    return .{ .output = body, .status = if (failed) .failed else .ok };
+    return .{ .output = out.items, .status = if (failed) .failed else .ok };
 }
 
-fn toolBash(command: []const u8, background: bool, ctx: *ToolContext) ToolResult {
-    // Compound commands go through the user's shell; simple ones run directly
-    // (DECISIONS I120). Compound detection is the classifier's job anyway.
-    const effect = cmd_class.classify(command);
+fn toolBash(command: []const u8, background: bool, timeout_s: u32, ctx: *ToolContext) ToolResult {
+    // Permission classification always runs on the raw command string. The
+    // command itself always goes through the shell, so quoting, globs,
+    // redirection and pipes behave as the model wrote them (A-03).
     const decision = ctx.engine.decideCommand(command);
     switch (decision) {
         .allow => {},
@@ -630,26 +764,15 @@ fn toolBash(command: []const u8, background: bool, ctx: *ToolContext) ToolResult
         }
     }
 
-    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
-    if (std.mem.indexOfAny(u8, command, "|;&<>()`") != null) {
-        const shell = ctx.engine.alloc.dupe(u8, "/bin/sh") catch return errResult(ctx.arena, "oom", .{});
-        const flag = ctx.engine.alloc.dupe(u8, "-c") catch return errResult(ctx.arena, "oom", .{});
-        const cmd = ctx.engine.alloc.dupe(u8, command) catch return errResult(ctx.arena, "oom", .{});
-        argv.append(ctx.arena, shell) catch {};
-        argv.append(ctx.arena, flag) catch {};
-        argv.append(ctx.arena, cmd) catch {};
-    } else {
-        var it = std.mem.tokenizeAny(u8, command, " \t");
-        while (it.next()) |tok| {
-            argv.append(ctx.arena, tok) catch {};
-        }
-    }
-    if (argv.items.len == 0) return errResult(ctx.arena, "bash: empty command", .{});
+    if (std.mem.trim(u8, command, " \t\r\n").len == 0) return errResult(ctx.arena, "bash: empty command", .{});
 
-    const result = runCaptured(ctx, argv.items, "");
+    // A per-call timeout may only tighten the session ceiling.
+    var local = ctx.*;
+    if (timeout_s > 0) local.timeout_s = @min(timeout_s, if (ctx.timeout_s == 0) 120 else ctx.timeout_s);
+
+    const argv = [_][]const u8{ "/bin/sh", "-c", command };
     // Note: shell side effects are not journaled (M185); surfaced in audit log instead.
-    _ = effect;
-    return result;
+    return runCaptured(&local, &argv, "");
 }
 
 /// "git commit -m x" -> "git commit"; "ls" -> "ls".
@@ -835,6 +958,110 @@ test "bash tool asks for write commands and honors denial" {
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "newdir", .{}));
 }
 
+test "read_dotenv gates .env reads" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = ".env", .data = "SECRET=1\n" });
+    try tmp.dir.createDirPath(io, "config");
+    try tmp.dir.writeFile(io, .{ .sub_path = "config/.env.local", .data = "SECRET=2\n" });
+
+    var e = engine_mod.Engine.init(std.testing.allocator, .ask);
+    defer e.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ctx = testCtx(arena_state.allocator(), io, tmp.dir, &e);
+
+    // Default: denied, with the policy key named in the reason.
+    const denied = execute("read", "{\"path\":\".env\"}", &ctx);
+    try std.testing.expectEqual(Status.denied, denied.status);
+    try std.testing.expect(std.mem.indexOf(u8, denied.output, "read_dotenv") != null);
+    try std.testing.expectEqual(Status.denied, execute("read", "{\"path\":\"config/.env.local\"}", &ctx).status);
+    // Ordinary dotfiles are unaffected.
+    try std.testing.expectEqualStrings("failed", @tagName(execute("read", "{\"path\":\".gitignore\"}", &ctx).status));
+
+    // Opted in: reads succeed.
+    e.read_dotenv = true;
+    const allowed = execute("read", "{\"path\":\".env\"}", &ctx);
+    try std.testing.expectEqualStrings("ok", @tagName(allowed.status));
+    try std.testing.expect(std.mem.indexOf(u8, allowed.output, "SECRET=1") != null);
+    const grep_res = execute("grep", "{\"pattern\":\"SECRET\"}", &ctx);
+    try std.testing.expectEqualStrings("ok", @tagName(grep_res.status));
+    try std.testing.expect(std.mem.indexOf(u8, grep_res.output, ".env:1") != null);
+}
+
+test "grep skips dotenv files by default" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = ".env", .data = "SECRET=1\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "ok.txt", .data = "SECRET=1\n" });
+
+    var e = engine_mod.Engine.init(std.testing.allocator, .ask);
+    defer e.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ctx = testCtx(arena_state.allocator(), io, tmp.dir, &e);
+
+    const r = execute("grep", "{\"pattern\":\"SECRET\"}", &ctx);
+    try std.testing.expectEqual(Status.ok, r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "ok.txt:1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, ".env:1") == null);
+}
+
+test "git push is denied under the default ceilings" {
+    var e = engine_mod.Engine.init(std.testing.allocator, .ask);
+    defer e.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ctx = testCtx(arena_state.allocator(), std.testing.io, std.Io.Dir.cwd(), &e);
+
+    const r = execute("git", "{\"args\":[\"push\",\"origin\",\"main\"]}", &ctx);
+    try std.testing.expectEqual(Status.denied, r.status);
+    const forced = execute("git", "{\"args\":[\"push\",\"--force\",\"origin\",\"main\"]}", &ctx);
+    try std.testing.expectEqual(Status.denied, forced.status);
+}
+
+test "bash timeout kills the whole process group" {
+    // Probe via raw kill(2) with signal 0; the std SIG enum has no zero tag.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &path_buf);
+    const dir_path = path_buf[0..dir_len];
+    const pid_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/pid", .{dir_path});
+    defer std.testing.allocator.free(pid_path);
+
+    var e = engine_mod.Engine.init(std.testing.allocator, .auto);
+    defer e.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ctx = testCtx(arena_state.allocator(), io, tmp.dir, &e);
+    ctx.timeout_s = 1;
+
+    const script = try std.fmt.allocPrint(arena_state.allocator(), "sleep 30 & echo $! > {s}; wait", .{pid_path});
+    const r = runCaptured(&ctx, &.{ "/bin/sh", "-c", script }, "");
+    try std.testing.expectEqual(Status.timeout, r.status);
+
+    // The grandchild printed its pid; it must not survive the group kill.
+    const text = try tmp.dir.readFileAlloc(io, "pid", arena_state.allocator(), .limited(64));
+    const pid = try std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, text, " \n"), 10);
+    var gone = false;
+    var tries: usize = 0;
+    while (tries < 100) : (tries += 1) {
+        // Signal 0 only probes for existence.
+        const rc = std.os.linux.syscall2(.kill, @intCast(pid), 0);
+        if (std.os.linux.errno(rc) == .SRCH) {
+            gone = true;
+            break;
+        }
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(20), .awake) catch {};
+    }
+    try std.testing.expect(gone);
+}
+
 test "unknown tool and bad args" {
     const io = std.testing.io;
     var tmp = try makeTmp();
@@ -848,4 +1075,60 @@ test "unknown tool and bad args" {
     try std.testing.expectEqual(Status.failed, execute("frobnicate", "{}", &ctx).status);
     try std.testing.expectEqual(Status.failed, execute("read", "not json", &ctx).status);
     try std.testing.expectEqual(Status.failed, execute("read", "{\"other\":1}", &ctx).status);
+}
+
+test "bash passes the raw command through sh -c" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+
+    var e = engine_mod.Engine.init(std.testing.allocator, .auto);
+    defer e.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var ctx = testCtx(arena, io, tmp.dir, &e);
+
+    // Quoted arguments with spaces stay single argv entries.
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    try aw.writer.writeAll("{\"command\":");
+    try std.json.Stringify.value("printf '%s|' 'a b' \"c d\"", .{}, &aw.writer);
+    try aw.writer.writeByte('}');
+    const r = execute("bash", aw.written(), &ctx);
+    try std.testing.expectEqual(Status.ok, r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "a b|c d|") != null);
+
+    // Shell expansion is not tokenized away.
+    var aw2: std.Io.Writer.Allocating = .init(arena);
+    try aw2.writer.writeAll("{\"command\":");
+    try std.json.Stringify.value("printf '%s' $((1 + 2))", .{}, &aw2.writer);
+    try aw2.writer.writeByte('}');
+    const r2 = execute("bash", aw2.written(), &ctx);
+    try std.testing.expectEqual(Status.ok, r2.status);
+    try std.testing.expect(std.mem.indexOf(u8, r2.output, "\n3") != null);
+}
+
+test "bash per-call timeout only tightens the session ceiling" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+
+    var e = engine_mod.Engine.init(std.testing.allocator, .auto);
+    defer e.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var ctx = testCtx(arena, io, tmp.dir, &e);
+    ctx.timeout_s = 1; // session ceiling
+
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    try aw.writer.writeAll("{\"command\":\"sleep 30\",\"timeout_s\":60}");
+    const start = std.Io.Timestamp.now(io, .awake);
+    const r = execute("bash", aw.written(), &ctx);
+    const elapsed_ms = @divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds - start.nanoseconds, std.time.ns_per_ms);
+
+    try std.testing.expectEqual(Status.timeout, r.status);
+    // A 60 s request was clamped to the 1 s ceiling.
+    try std.testing.expect(elapsed_ms < 4000);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "timed out after 1s") != null);
 }

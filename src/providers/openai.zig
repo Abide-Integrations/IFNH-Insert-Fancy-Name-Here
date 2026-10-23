@@ -8,6 +8,7 @@
 const std = @import("std");
 const provider = @import("provider.zig");
 const sse = @import("sse.zig");
+const transport = @import("transport.zig");
 const core_types = @import("../core/types.zig");
 
 pub const default_context: Context = .{};
@@ -39,32 +40,58 @@ pub fn streamFn(
     var extra = [_]std.http.Header{
         .{ .name = "accept", .value = "text/event-stream" },
     };
+    const auth_header = if (req.api_key.len > 0)
+        try std.fmt.allocPrint(arena, "Bearer {s}", .{req.api_key})
+    else
+        "";
 
-    var creq = try client.request(.POST, uri, .{
+    const connection = transport.openConnection(&client, uri, transport.default_limits) catch |err| {
+        sink.emit(.{ .failure = transport.failureFor(err, null) });
+        return;
+    };
+    var creq = client.request(.POST, uri, .{
         .headers = .{
             .authorization = if (req.api_key.len > 0)
-                .{ .override = try std.fmt.allocPrint(arena, "Bearer {s}", .{req.api_key}) }
+                .{ .override = auth_header }
             else
                 .omit,
             .content_type = .{ .override = "application/json" },
         },
         .extra_headers = &extra,
         .redirect_behavior = .unhandled,
-    });
+        .connection = connection,
+    }) catch |err| {
+        const failure = transport.failureFor(err, connection);
+        client.connection_pool.release(connection, io);
+        sink.emit(.{ .failure = failure });
+        return;
+    };
     defer creq.deinit();
 
-    try creq.sendBodyComplete(@constCast(body));
+    creq.sendBodyComplete(@constCast(body)) catch |err| {
+        sink.emit(.{ .failure = transport.failureFor(err, creq.connection) });
+        return;
+    };
 
     var redirect_buf: [8192]u8 = undefined;
-    var response = try creq.receiveHead(&redirect_buf);
+    var response = creq.receiveHead(&redirect_buf) catch |err| {
+        sink.emit(.{ .failure = transport.failureFor(err, creq.connection) });
+        return;
+    };
 
     if (response.head.status.class() != .success) {
+        // Read the headers before the body: `head.bytes` borrows the
+        // connection read buffer that the body reader refills.
+        const now_s: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_s));
+        const retry_after_s = transport.retryAfterFromHead(response.head, now_s);
+        const kind = provider.failureKindForStatus(@intFromEnum(response.head.status));
         var err_body: [16 * 1024]u8 = undefined;
         const r = response.reader(&err_body);
         const text = r.allocRemaining(arena, .limited(16 * 1024)) catch "";
         sink.emit(.{ .failure = .{
-            .kind = provider.failureKindForStatus(@intFromEnum(response.head.status)),
+            .kind = kind,
             .message = extractErrorMessage(arena, text) catch text,
+            .retry_after_s = retry_after_s,
         } });
         return;
     }
@@ -82,7 +109,12 @@ pub fn streamFn(
     var tools: [16]ToolAcc = undefined;
     var tool_count: usize = 0;
 
-    while (try parser.next(arena)) |payload| {
+    while (true) {
+        const maybe_payload = parser.next(arena) catch |err| {
+            sink.emit(.{ .failure = transport.failureFor(err, creq.connection) });
+            return;
+        };
+        const payload = maybe_payload orelse break;
         if (req.cancel.load(.acquire)) {
             sink.emit(.{ .failure = .{ .kind = .cancelled, .message = "cancelled" } });
             return;
@@ -211,6 +243,28 @@ fn extractErrorMessage(arena: std.mem.Allocator, body: []const u8) ![]const u8 {
     return error.NotFound;
 }
 
+fn strOrEmpty(v: ?std.json.Value) []const u8 {
+    const val = v orelse return "";
+    return if (val == .string) val.string else "";
+}
+
+fn indexOfStr(items: []const []const u8, needle: []const u8) ?usize {
+    for (items, 0..) |item, idx| {
+        if (std.mem.eql(u8, item, needle)) return idx;
+    }
+    return null;
+}
+
+/// `arguments` is a JSON *string* on the OpenAI wire. Malformed or non-object
+/// arguments degrade to "{}" so one bad call does not break the request.
+fn toolArguments(arena: std.mem.Allocator, args: ?std.json.Value) []const u8 {
+    const raw = args orelse return "{}";
+    if (raw != .string or raw.string.len == 0) return "{}";
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, raw.string, .{}) catch return "{}";
+    if (parsed != .object) return "{}";
+    return raw.string;
+}
+
 fn buildBody(arena: std.mem.Allocator, req: provider.ModelRequest) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
@@ -226,20 +280,71 @@ fn buildBody(arena: std.mem.Allocator, req: provider.ModelRequest) ![]u8 {
         try w.writeByte('}');
         first = false;
     }
+    // tool_call ids from the most recent assistant message; a tool result
+    // without one would make the request invalid, so it is dropped.
+    var issued: std.ArrayListUnmanaged([]const u8) = .empty;
     for (req.messages) |msg| {
-        if (!first) try w.writeByte(',');
-        first = false;
         switch (msg.role) {
-            .system, .user, .assistant => {
+            .system, .user => {
+                if (!first) try w.writeByte(',');
+                first = false;
                 try w.writeAll("{\"role\":");
                 try std.json.Stringify.value(@tagName(msg.role), .{}, w);
                 try w.writeAll(",\"content\":");
                 try std.json.Stringify.value(msg.content, .{}, w);
                 try w.writeByte('}');
             },
+            .assistant => {
+                issued = .empty;
+                var msg_buf: std.Io.Writer.Allocating = .init(arena);
+                const mw = &msg_buf.writer;
+                try mw.writeAll("{\"role\":\"assistant\",\"content\":");
+                if (msg.content.len > 0) {
+                    try std.json.Stringify.value(msg.content, .{}, mw);
+                } else {
+                    try mw.writeAll("null");
+                }
+                var call_count: usize = 0;
+                if (msg.tool_calls_json) |tcj| {
+                    if (std.json.parseFromSliceLeaky(std.json.Value, arena, tcj, .{})) |tcv| {
+                        if (tcv == .array) {
+                            for (tcv.array.items) |item| {
+                                if (item != .object) continue;
+                                const id = strOrEmpty(item.object.get("id"));
+                                const name = strOrEmpty(item.object.get("name"));
+                                if (id.len == 0 or name.len == 0) continue;
+                                try mw.writeAll(if (call_count == 0) ",\"tool_calls\":[" else ",");
+                                try mw.writeAll("{\"id\":");
+                                try std.json.Stringify.value(id, .{}, mw);
+                                try mw.writeAll(",\"type\":\"function\",\"function\":{\"name\":");
+                                try std.json.Stringify.value(name, .{}, mw);
+                                try mw.writeAll(",\"arguments\":");
+                                try std.json.Stringify.value(toolArguments(arena, item.object.get("arguments_json")), .{}, mw);
+                                try mw.writeAll("}}");
+                                call_count += 1;
+                                const owned_id = arena.dupe(u8, id) catch continue;
+                                try issued.append(arena, owned_id);
+                            }
+                        }
+                    } else |_| {}
+                }
+                if (call_count > 0) try mw.writeByte(']');
+                // An assistant turn with neither text nor calls carries
+                // nothing the API accepts.
+                if (msg.content.len == 0 and call_count == 0) continue;
+                try mw.writeByte('}');
+                if (!first) try w.writeByte(',');
+                first = false;
+                try w.writeAll(msg_buf.written());
+            },
             .tool => {
+                const id = msg.tool_call_id orelse continue;
+                const at = indexOfStr(issued.items, id) orelse continue;
+                _ = issued.orderedRemove(at);
+                if (!first) try w.writeByte(',');
+                first = false;
                 try w.writeAll("{\"role\":\"tool\",\"tool_call_id\":");
-                try std.json.Stringify.value(msg.tool_call_id orelse "", .{}, w);
+                try std.json.Stringify.value(id, .{}, w);
                 try w.writeAll(",\"content\":");
                 try std.json.Stringify.value(msg.content, .{}, w);
                 try w.writeByte('}');
@@ -248,10 +353,19 @@ fn buildBody(arena: std.mem.Allocator, req: provider.ModelRequest) ![]u8 {
     }
     try w.writeByte(']');
 
-    if (!std.mem.eql(u8, req.tools_json, "[]")) {
-        try w.writeAll(",\"tools\":");
-        try w.writeAll(req.tools_json);
-        try w.writeAll(",\"tool_choice\":\"auto\"");
+    if (req.tools.len > 0) {
+        try w.writeAll(",\"tools\":[");
+        for (req.tools, 0..) |spec, idx| {
+            if (idx > 0) try w.writeByte(',');
+            try w.writeAll("{\"type\":\"function\",\"function\":{\"name\":");
+            try std.json.Stringify.value(spec.name, .{}, w);
+            try w.writeAll(",\"description\":");
+            try std.json.Stringify.value(spec.description, .{}, w);
+            try w.writeAll(",\"parameters\":");
+            try w.writeAll(spec.parameters_json);
+            try w.writeAll("}}");
+        }
+        try w.writeAll("],\"tool_choice\":\"auto\"");
     }
     if (req.temperature) |t| {
         try w.print(",\"temperature\":{d}", .{t});
@@ -277,4 +391,100 @@ pub const instance = provider.Provider{
 
 fn capabilities() provider.Capabilities {
     return .{ .streaming = true, .tool_use = true, .reasoning = false };
+}
+
+// ---------------------------------------------------------------- tests
+
+fn testRequest(msgs: []const core_types.ChatMessage, tools: []const core_types.ToolSpec) provider.ModelRequest {
+    return .{
+        .model = "gpt-test",
+        .base_url = "https://api.openai.com/v1",
+        .api_key = "k",
+        .system = "sys",
+        .messages = msgs,
+        .tools = tools,
+        .cancel = undefined,
+    };
+}
+
+test "body carries assistant tool_calls so tool results pair up" {
+    const msgs = [_]core_types.ChatMessage{
+        .{ .role = .user, .content = "hi" },
+        .{ .role = .assistant, .content = "", .tool_calls_json = "[{\"id\":\"c1\",\"name\":\"read\",\"arguments_json\":\"{\\\"path\\\":\\\"a.txt\\\"}\"},{\"id\":\"c2\",\"name\":\"bash\",\"arguments_json\":\"not json\"}]" },
+        .{ .role = .tool, .content = "alpha", .tool_call_id = "c1" },
+        .{ .role = .tool, .content = "boom", .tool_call_id = "c2", .is_error = true },
+        .{ .role = .tool, .content = "stray", .tool_call_id = "zzz" },
+    };
+    const tools = [_]core_types.ToolSpec{
+        .{ .name = "read", .description = "d", .parameters_json = "{\"type\":\"object\"}" },
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const body = try buildBody(arena, testRequest(&msgs, &tools));
+    _ = try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{});
+
+    // Assistant text is null but tool_calls are present and well-formed.
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"id\":\"c2\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}") != null);
+
+    // Results for issued calls only; the orphan is dropped.
+    try std.testing.expect(std.mem.indexOf(u8, body, "stray") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"alpha\"}") != null);
+
+    // Tool schemas use the OpenAI function envelope.
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"read\",\"description\":\"d\",\"parameters\":{\"type\":\"object\"}}}]") != null);
+}
+
+test "body skips empty assistant turns and keeps plain replies" {
+    const msgs = [_]core_types.ChatMessage{
+        .{ .role = .user, .content = "hi" },
+        .{ .role = .assistant, .content = "" },
+        .{ .role = .assistant, .content = "hello" },
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const body = try buildBody(arena, testRequest(&msgs, &.{}));
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{});
+    try std.testing.expect(parsed == .object);
+    const arr = parsed.object.get("messages").?.array;
+    try std.testing.expectEqual(@as(usize, 3), arr.items.len); // system + user + assistant
+    try std.testing.expectEqualStrings("assistant", arr.items[2].object.get("role").?.string);
+    try std.testing.expectEqualStrings("hello", arr.items[2].object.get("content").?.string);
+    try std.testing.expect(parsed.object.get("tools") == null);
+}
+
+test "wire golden openai body is byte-stable" {
+    // A fixed request renders byte-for-byte: no maps are involved (every
+    // field is written in source order), so the full body is asserted
+    // instead of a substring set.
+    const msgs = [_]core_types.ChatMessage{
+        .{ .role = .user, .content = "first" },
+        .{ .role = .assistant, .content = "checking", .tool_calls_json = "[{\"id\":\"c1\",\"name\":\"read\",\"arguments_json\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}]" },
+        .{ .role = .tool, .content = "alpha", .tool_call_id = "c1" },
+        .{ .role = .user, .content = "second" },
+    };
+    const tools = [_]core_types.ToolSpec{
+        .{
+            .name = "read",
+            .description = "Read a file",
+            .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}}}",
+        },
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const body = try buildBody(arena, testRequest(&msgs, &tools));
+    const expected =
+        \\{"model":"gpt-test","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"system","content":"sys"},{"role":"user","content":"first"},{"role":"assistant","content":"checking","tool_calls":[{"id":"c1","type":"function","function":{"name":"read","arguments":"{\"path\":\"a.txt\"}"}}]},{"role":"tool","tool_call_id":"c1","content":"alpha"},{"role":"user","content":"second"}],"tools":[{"type":"function","function":{"name":"read","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}],"tool_choice":"auto"}
+    ;
+    try std.testing.expectEqualStrings(expected, body);
 }

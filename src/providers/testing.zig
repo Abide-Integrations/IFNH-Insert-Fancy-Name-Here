@@ -20,15 +20,26 @@ pub const FakeServer = struct {
         arena: std.mem.Allocator,
         body: []const u8,
     ) !*FakeServer {
+        return startWith(io, arena, "200 OK", "Content-Type: text/event-stream\r\n", body);
+    }
+
+    /// Start with a custom status line and extra headers (each ending in
+    /// `\r\n`). Used to exercise provider error paths.
+    pub fn startWith(
+        io: std.Io,
+        arena: std.mem.Allocator,
+        status_line: []const u8,
+        extra_headers: []const u8,
+        body: []const u8,
+    ) !*FakeServer {
         const self = try arena.create(FakeServer);
         const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
         var srv = try addr.listen(io, .{ .reuse_address = true });
         const port = srv.socket.address.getPort();
 
-        const head = try std.fmt.allocPrint(arena, "HTTP/1.1 200 OK\r\n" ++
-            "Content-Type: text/event-stream\r\n" ++
+        const head = try std.fmt.allocPrint(arena, "HTTP/1.1 {s}\r\n{s}" ++
             "Content-Length: {d}\r\n" ++
-            "Connection: close\r\n\r\n", .{body.len});
+            "Connection: close\r\n\r\n", .{ status_line, extra_headers, body.len });
         const full = try std.mem.concat(arena, u8, &.{ head, body });
 
         self.* = .{
@@ -116,6 +127,8 @@ const Collector = struct {
     text: std.ArrayListUnmanaged(u8) = .empty,
     tool_calls: std.ArrayListUnmanaged(core_types.ToolCall) = .empty,
     failure: ?[]const u8 = null,
+    failure_kind: ?core_types.ProviderFailureKind = null,
+    retry_after_s: ?u32 = null,
     done: bool = false,
 
     fn emit(ctx: *anyopaque, ev: core_types.StreamEvent) void {
@@ -125,7 +138,11 @@ const Collector = struct {
             .tool_call => |tc| {
                 self.tool_calls.append(self.arena, tc) catch {};
             },
-            .failure => |f| self.failure = f.message,
+            .failure => |f| {
+                self.failure = f.message;
+                self.failure_kind = f.kind;
+                self.retry_after_s = f.retry_after_s;
+            },
             .done => self.done = true,
             else => {},
         }
@@ -161,6 +178,41 @@ test "openai adapter streams against fake HTTP server" {
     try std.testing.expect(collector.done);
     try std.testing.expectEqualStrings("hello world", collector.text.items);
     try std.testing.expect(collector.failure == null);
+}
+
+test "openai adapter reports rate limit and Retry-After" {
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const srv = try FakeServer.startWith(
+        io,
+        arena,
+        "429 Too Many Requests",
+        "Content-Type: application/json\r\nRetry-After: 7\r\n",
+        "{\"error\":{\"message\":\"slow down\"}}",
+    );
+    defer srv.stop();
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var collector = Collector{ .arena = arena };
+    const base = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}", .{srv.port});
+
+    try openai_adapter.streamFn(undefined, arena, io, .{
+        .model = "test-model",
+        .base_url = base,
+        .api_key = "test-key-1234567890",
+        .system = "",
+        .messages = &.{},
+        .cancel = &cancel,
+    }, .{ .ctx = &collector, .emit_fn = Collector.emit });
+
+    srv.wait();
+    try std.testing.expect(!collector.done);
+    try std.testing.expectEqualStrings("slow down", collector.failure.?);
+    try std.testing.expectEqual(core_types.ProviderFailureKind.rate_limited, collector.failure_kind.?);
+    try std.testing.expectEqual(@as(?u32, 7), collector.retry_after_s);
 }
 
 test "openai adapter accumulates tool calls from stream" {

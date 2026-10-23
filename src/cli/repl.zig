@@ -120,7 +120,7 @@ pub fn run(
 
     // ---- session state (zero-config: lazily create .ifnh) ----
     ensureIfnh(io, cwd) catch {};
-    const sessions_dir_name = ".ifnh/sessions";
+    const sessions_dir_name = sessionsDir(arena, &cfg);
 
     var sess: Session = blk: {
         if (opts.resume_id) |id| {
@@ -146,7 +146,7 @@ pub fn run(
 
     // ---- skills catalog (K148/149) ----
     sess.skills = blk: {
-        const user_dir = std.fmt.allocPrint(arena, "{s}/.config/ifnh/skills", .{environ.get("HOME") orelse ""}) catch break :blk null;
+        const user_dir = config_mod.userSkillsDir(arena, environ) orelse break :blk null;
         const catalog = skills_mod.discover(cwd, io, arena, user_dir) catch break :blk null;
         break :blk catalog;
     };
@@ -250,6 +250,13 @@ pub fn run(
 
 // ---------------------------------------------------------------- turn flow
 
+/// Remove an unanswered turn from in-memory history and mark the persisted
+/// turn interrupted so replay drops it too (A-05).
+fn rollbackTurn(sess: *Session, history_start: usize) void {
+    sess.history.shrinkRetainingCapacity(history_start);
+    _ = sess.store.append(.interrupted) catch {};
+}
+
 fn submitTurn(
     io: std.Io,
     arena: std.mem.Allocator,
@@ -270,10 +277,10 @@ fn submitTurn(
         try out(io, "note: no api key — run /provider key {s} <value> (or export it) before sending a message\n", .{key_env});
     }
 
-    _ = try sess.store.append(.{ .user = .{ .text = user_text } });
-    try sess.history.append(arena, .{ .role = .user, .content = user_text });
-
     var cancel = std.atomic.Value(bool).init(false);
+    // Ctrl-C sets `cancel` while the turn runs; a second one exits (A-06).
+    @import("../core/interrupt.zig").install(&cancel);
+    defer @import("../core/interrupt.zig").uninstall();
     var approver = Approver{ .io = io, .engine = &sess.engine };
     var host = subagent_mod.Host{
         .io = io,
@@ -289,13 +296,18 @@ fn submitTurn(
         .command_allow = sess.engine.command_allow,
         .command_deny = sess.engine.command_deny,
         .env_allow = sess.engine.env_allow,
+        .git_commits = sess.engine.git_commits,
+        .git_push = sess.engine.git_push,
+        .git_force_push = sess.engine.git_force_push,
+        .read_dotenv = sess.engine.read_dotenv,
+        .timeout_tool_s = cfg.getU32("agents.timeout_tool_s", 120),
         .journal = &sess.journal,
         .approval_ctx = &approver,
         .approval_fn = Approver.approve,
         .max_depth = cfg.getU32("agents.max_depth", 1),
         .max_concurrent = cfg.getU32("agents.max_concurrent", 4),
-        .max_rounds = 25,
-        .redactions = redactionsFor(arena, pcfg.api_key),
+        .max_rounds = cfg.getU32("agents.max_tool_rounds", 25),
+        .redactions = redactionsFor(arena, cfg.getBool("debug.redact", true), pcfg.api_key),
         .temperature = cfg.getOptionalF64("model.temperature"),
         .max_output_tokens = cfg.getOptionalU32("model.max_output_tokens"),
         .cancel = &cancel,
@@ -308,8 +320,8 @@ fn submitTurn(
             break :blk g;
         },
         .worktree_root = blk: {
-            const home = environ.get("HOME") orelse break :blk null;
-            const root = std.fmt.allocPrint(arena, "{s}/.local/state/ifnh/worktrees", .{home}) catch break :blk null;
+            const state_root = config_mod.userStateDir(arena, environ) orelse break :blk null;
+            const root = std.fmt.allocPrint(arena, "{s}/worktrees", .{state_root}) catch break :blk null;
             std.Io.Dir.cwd().createDirPath(io, root) catch {};
             break :blk root;
         },
@@ -322,6 +334,7 @@ fn submitTurn(
         .engine = &sess.engine,
         .journal = &sess.journal,
         .max_file_read_bytes = cfg.getU32("context.max_file_read_bytes", 262144),
+        .timeout_s = cfg.getU32("agents.timeout_tool_s", 120),
         .approval_ctx = &approver,
         .approval_fn = Approver.approve,
         .agent_spawn_fn = subagent_mod.spawnHookFn,
@@ -330,6 +343,7 @@ fn submitTurn(
         .agent_label = "parent",
         .mcp_list_fn = mcpListHook,
         .mcp_call_fn = mcpCallHook,
+        .mcp_describe_fn = mcpDescribeHook,
         .mcp_ctx = sess.mcp_registry orelse mcp_registry_sentinel,
         .skill_load_fn = skillLoadHook,
         .skill_ctx = sess,
@@ -342,16 +356,19 @@ fn submitTurn(
 
     const TurnUi = struct {
         io: std.Io,
+        store: *session_mod.Session,
         fn onText(ctx: *anyopaque, text: []const u8) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             std.Io.File.stdout().writeStreamingAll(self.io, text) catch {};
         }
-        fn onToolStart(ctx: *anyopaque, name: []const u8, arguments_json: []const u8) void {
+        fn onToolStart(ctx: *anyopaque, call_id: []const u8, name: []const u8, arguments_json: []const u8) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = self.store.append(.{ .tool_call = .{ .id = call_id, .name = name, .arguments_json = arguments_json } }) catch {};
             out(self.io, "\n[tool] {s} {s}\n", .{ name, arguments_json }) catch {};
         }
-        fn onToolResult(ctx: *anyopaque, name: []const u8, status: tool_mod.Status, output: []const u8) void {
+        fn onToolResult(ctx: *anyopaque, call_id: []const u8, name: []const u8, status: tool_mod.Status, output: []const u8) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = self.store.append(.{ .tool_result = .{ .call_id = call_id, .status = @tagName(status), .output = output } }) catch {};
             _ = name;
             const max_show: usize = 400;
             const shown = if (output.len > max_show) output[0..max_show] else output;
@@ -369,8 +386,14 @@ fn submitTurn(
             const self: *@This() = @ptrCast(@alignCast(ctx));
             out(self.io, "! {s}\n", .{text}) catch {};
         }
+        /// Persist each completed assistant message (text and/or tool calls)
+        /// as it is produced, so a resumed session can replay tool rounds.
+        fn onAssistantMessage(ctx: *anyopaque, content: []const u8, tool_calls_json: ?[]const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = self.store.append(.{ .assistant = .{ .text = content, .tool_calls_json = tool_calls_json } }) catch {};
+        }
     };
-    var ui = TurnUi{ .io = io };
+    var ui = TurnUi{ .io = io, .store = &sess.store };
 
     var hook_engine = hooks_mod.Engine.init(io, cwd, try hooks_mod.Engine.fromConfig(arena, cfg.get("hooks")), arena);
     const pre = hook_engine.dispatch(.before_agent, "{}");
@@ -381,12 +404,15 @@ fn submitTurn(
 
     // ---- automatic context compaction (C36, PLAN §24) ----
     if (cfg.getBool("context.auto_compact", true)) {
-        const threshold: usize = cfg.getU32("context.max_context_tokens", 96_000);
+        // The provider's advertised window is folded into
+        // `context.max_context_tokens` by first-run setup, so only the
+        // configured budget is consulted here.
+        const threshold = compaction_mod.thresholdTokens(cfg.getOptionalU32("context.max_context_tokens"), null);
         const plan = compaction_mod.planCompaction(sess.history.items, threshold, cfg.getF64("context.compact_at_fraction", 0.8));
         if (plan.should_compact) {
             try out(io, "[compacting context... {d} tokens]\n", .{plan.estimated_tokens});
             const res_opt: ?compaction_mod.Result = blk: {
-                break :blk compaction_mod.compact(arena, io, pcfg, &sess.history, redactionsFor(arena, pcfg.api_key)) catch |err| {
+                break :blk compaction_mod.compact(arena, io, pcfg, &sess.history, redactionsFor(arena, cfg.getBool("debug.redact", true), pcfg.api_key)) catch |err| {
                     try out(io, "[compaction failed: {s}; continuing with full context]\n", .{@errorName(err)});
                     break :blk null;
                 };
@@ -402,6 +428,12 @@ fn submitTurn(
         }
     }
 
+    // Append the user message only after compaction and hooks, so the
+    // rollback snapshot is never invalidated by history rewriting.
+    const history_start = sess.history.items.len;
+    _ = try sess.store.append(.{ .user = .{ .text = user_text } });
+    try sess.history.append(arena, .{ .role = .user, .content = user_text });
+
     const outcome = agent_engine.runTurn(.{
         .io = io,
         .arena = arena,
@@ -415,12 +447,15 @@ fn submitTurn(
             .on_tool_start = TurnUi.onToolStart,
             .on_tool_result = TurnUi.onToolResult,
             .on_notice = TurnUi.onNotice,
+            .on_assistant_message = TurnUi.onAssistantMessage,
         },
         .cancel = &cancel,
         .include_tools = cfg.getBool("model.tools_enabled", true),
         .max_retries = cfg.getU32("agents.max_retries", 3),
-        .redactions = redactionsFor(arena, pcfg.api_key),
+        .max_tool_rounds = cfg.getU32("agents.max_tool_rounds", 25),
+        .redactions = redactionsFor(arena, cfg.getBool("debug.redact", true), pcfg.api_key),
     }) catch |err| {
+        rollbackTurn(sess, history_start);
         try out(io, "\nturn failed: {s}\n", .{@errorName(err)});
         return;
     };
@@ -428,10 +463,9 @@ fn submitTurn(
     _ = hook_engine.dispatch(.after_agent, "{}");
     try out(io, "\n", .{});
     switch (outcome.status) {
-        .completed => {
-            _ = try sess.store.append(.{ .assistant = .{ .text = outcome.reply } });
-        },
+        .completed => {},
         .failed => {
+            rollbackTurn(sess, history_start);
             try out(io, "{s}provider error: {s}{s}\n", .{ palette.err("", arena), outcome.error_message, "\x1b[0m" });
             if (@import("../providers/probe.zig").looksLikeToolRejection(outcome.error_message)) {
                 try out(io, "{s}hint: this model may not support tool calling. Set it up as chat-only with /provider tools off{s}\n", .{ palette.warn("", arena), "\x1b[0m" });
@@ -439,8 +473,8 @@ fn submitTurn(
             _ = try sess.store.append(.{ .note = .{ .text = outcome.error_message } });
         },
         .cancelled => {
+            rollbackTurn(sess, history_start);
             try out(io, "(interrupted)\n", .{});
-            _ = try sess.store.append(.interrupted);
         },
     }
     if (outcome.usage.input_tokens > 0 or outcome.usage.output_tokens > 0) {
@@ -560,23 +594,52 @@ const Approver = struct {
 // ---------------------------------------------------------------- history rebuild
 
 fn rebuildHistory(arena: std.mem.Allocator, sess: *Session) !void {
-    const events = try sess.store.readEvents(arena, 10_000);
+    const page = try sess.store.readEventPage(arena, 10_000);
+    if (page.truncated) {
+        try out(sess.io, "note: session has more than {d} events; resuming from the most recent {d}\n", .{ page.records.len, page.records.len });
+    }
+    const events = page.records;
+    var turn_start: ?usize = null;
+    var saw_assistant = false;
     for (events) |ev| {
         switch (ev.event) {
-            .user => |v| try sess.history.append(arena, .{ .role = .user, .content = v.text }),
-            .assistant => |v| try sess.history.append(arena, .{
-                .role = .assistant,
-                .content = v.text,
-                .tool_calls_json = v.tool_calls_json,
-            }),
+            .user => |v| {
+                // A new user message after an unanswered turn means the
+                // previous turn never produced an assistant reply.
+                if (turn_start) |start| {
+                    if (!saw_assistant) sess.history.shrinkRetainingCapacity(start);
+                }
+                turn_start = sess.history.items.len;
+                saw_assistant = false;
+                try sess.history.append(arena, .{ .role = .user, .content = v.text });
+            },
+            .assistant => |v| {
+                saw_assistant = true;
+                try sess.history.append(arena, .{
+                    .role = .assistant,
+                    .content = v.text,
+                    .tool_calls_json = v.tool_calls_json,
+                });
+            },
             .tool_call => {},
             .tool_result => |v| try sess.history.append(arena, .{
                 .role = .tool,
                 .content = v.output,
                 .tool_call_id = v.call_id,
+                .is_error = !std.mem.eql(u8, v.status, "ok"),
             }),
-            .note, .interrupted => {},
+            .note => {},
+            .interrupted => {
+                if (turn_start) |start| sess.history.shrinkRetainingCapacity(start);
+                turn_start = null;
+                saw_assistant = false;
+            },
         }
+    }
+    // A trailing user message with no assistant reply is an unfinished turn
+    // from an older session or a crash; do not replay it.
+    if (turn_start) |start| {
+        if (!saw_assistant) sess.history.shrinkRetainingCapacity(start);
     }
 }
 
@@ -617,6 +680,16 @@ fn mcpListHook(ctx: *anyopaque, arena: std.mem.Allocator) []const u8 {
     }
     if (buf.items.len == 0) return "no MCP tools available";
     return buf.items;
+}
+
+fn mcpDescribeHook(ctx: *anyopaque, arena: std.mem.Allocator, server: []const u8, tool: []const u8) []const u8 {
+    const reg: *mcp_mod.Registry = @ptrCast(@alignCast(ctx));
+    if (reg == mcp_registry_sentinel or reg.configs.len == 0) return "error: no MCP servers configured";
+    const found = reg.describe(arena, server, tool) catch
+        return std.fmt.allocPrint(arena, "error: server '{s}' unavailable", .{server}) catch "error: server unavailable";
+    const t = found orelse
+        return std.fmt.allocPrint(arena, "error: unknown tool {s}.{s}", .{ server, tool }) catch "error: unknown tool";
+    return std.fmt.allocPrint(arena, "{s}.{s}: {s}\ninput schema: {s}", .{ server, t.name, t.description, t.input_schema_json }) catch "error: oom";
 }
 
 fn execStartHook(ctx: *anyopaque, arena: std.mem.Allocator, command: []const u8) []const u8 {
@@ -690,8 +763,8 @@ fn mcpCallHook(ctx: *anyopaque, arena: std.mem.Allocator, server: []const u8, to
     return res.text;
 }
 
-fn redactionsFor(arena: std.mem.Allocator, api_key: []const u8) []const []const u8 {
-    if (api_key.len < 8) return &.{};
+fn redactionsFor(arena: std.mem.Allocator, enabled: bool, api_key: []const u8) []const []const u8 {
+    if (!enabled or api_key.len < 8) return &.{};
     var list: std.ArrayListUnmanaged([]const u8) = .empty;
     list.append(arena, api_key) catch return &.{};
     return list.items;
@@ -1033,7 +1106,26 @@ fn engineFromConfig(arena: std.mem.Allocator, cfg: *config_mod.Store) engine_mod
     e.command_allow = cfg.getStringList("permissions.command_allow");
     e.command_deny = cfg.getStringList("permissions.command_deny");
     e.env_allow = cfg.getStringList("permissions.env_allow");
+    e.git_commits = gitPolicyFromConfig(cfg.getString("git.commits", "ask"), .ask);
+    e.git_push = gitPolicyFromConfig(cfg.getString("git.push", "never"), .never);
+    e.git_force_push = gitPolicyFromConfig(cfg.getString("git.force_push", "never"), .never);
+    e.read_dotenv = cfg.getBool("permissions.read_dotenv", false);
     return e;
+}
+
+/// Parse a `git.*` ceiling; an unrecognized value falls back to the
+/// fail-closed default for that action.
+fn gitPolicyFromConfig(value: []const u8, fallback: engine_mod.GitPolicy) engine_mod.GitPolicy {
+    return std.meta.stringToEnum(engine_mod.GitPolicy, value) orelse fallback;
+}
+
+/// Resolve `sessions.dir` (A-T07). "project" is the zero-config location;
+/// any other value is used as given (relative to the workspace or absolute).
+fn sessionsDir(arena: std.mem.Allocator, cfg: *const config_mod.Store) []const u8 {
+    _ = arena;
+    const v = cfg.getString("sessions.dir", "project");
+    if (v.len == 0 or std.mem.eql(u8, v, "project")) return ".ifnh/sessions";
+    return v;
 }
 
 fn ensureIfnh(io: std.Io, cwd: std.Io.Dir) !void {
@@ -1172,12 +1264,17 @@ fn handleCommand(
             .command_allow = sess.engine.command_allow,
             .command_deny = sess.engine.command_deny,
             .env_allow = sess.engine.env_allow,
+            .git_commits = sess.engine.git_commits,
+            .git_push = sess.engine.git_push,
+            .git_force_push = sess.engine.git_force_push,
+            .read_dotenv = sess.engine.read_dotenv,
+            .timeout_tool_s = cfg.getU32("agents.timeout_tool_s", 120),
             .journal = &sess.journal,
             .approval_ctx = &approver2,
             .approval_fn = Approver.approve,
             .max_depth = cfg.getU32("agents.max_depth", 1),
             .max_concurrent = cfg.getU32("agents.max_concurrent", 4),
-            .max_rounds = 25,
+            .max_rounds = cfg.getU32("agents.max_tool_rounds", 25),
             .redactions = &.{},
             .cancel = &cancel2,
             .git = blk: {
@@ -1189,8 +1286,8 @@ fn handleCommand(
                 break :blk g;
             },
             .worktree_root = blk: {
-                const home = environ.get("HOME") orelse break :blk null;
-                const root2 = std.fmt.allocPrint(arena, "{s}/.local/state/ifnh/worktrees", .{home}) catch break :blk null;
+                const state_root = config_mod.userStateDir(arena, environ) orelse break :blk null;
+                const root2 = std.fmt.allocPrint(arena, "{s}/worktrees", .{state_root}) catch break :blk null;
                 cwd.createDirPath(io, root2) catch {};
                 break :blk root2;
             },
@@ -1307,8 +1404,9 @@ fn handleCommand(
             };
             // Visible for the rest of this session immediately.
             g_merged_env.?.put(name, value.?) catch {};
-            out(io, "{s}stored {s} in ~/.config/ifnh/env (0600); takes effect immediately{s}\n", .{
-                palette.success("", arena), name, "\x1b[0m",
+            const stored_at = keys_mod.Keys.path(arena, environ) orelse "the user env file";
+            out(io, "{s}stored {s} in {s} (0600); takes effect immediately{s}\n", .{
+                palette.success("", arena), name, stored_at, "\x1b[0m",
             }) catch {};
         } else if (std.mem.startsWith(u8, rest, "tools ")) {
             const mode = std.mem.trim(u8, rest[6..], " \t");
@@ -1423,7 +1521,9 @@ fn handleCommand(
     } else if (std.mem.eql(u8, cmd, "skills")) {
         if (sess.skills) |catalog| {
             if (catalog.skills.len == 0) {
-                out(io, "no skills installed (.ifnh/skills/, ~/.config/ifnh/skills/)\n", .{}) catch {};
+                if (config_mod.userSkillsDir(arena, environ)) |user_skills| {
+                    out(io, "no skills installed (.ifnh/skills/, {s}/)\n", .{user_skills}) catch {};
+                } else out(io, "no skills installed (.ifnh/skills/)\n", .{}) catch {};
             }
             for (catalog.skills) |s| {
                 out(io, "  [{s}] {s}: {s}\n", .{ s.scope, s.name, s.description }) catch {};
@@ -1463,7 +1563,7 @@ fn handleCommand(
             for (names.items) |n| out(io, "  .ifnh/reports/{s}\n", .{n}) catch {};
         }
     } else if (std.mem.eql(u8, cmd, "sessions")) {
-        const summaries = session_mod.list(cwd, io, arena, ".ifnh/sessions") catch &.{};
+        const summaries = session_mod.list(cwd, io, arena, sessionsDir(arena, cfg)) catch &.{};
         if (summaries.len == 0) {
             out(io, "no sessions\n", .{}) catch {};
         }
@@ -1542,4 +1642,69 @@ fn out(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
     var buf: [4096]u8 = undefined;
     const text = std.fmt.bufPrint(&buf, fmt, args) catch return error.MessageTooLong;
     try std.Io.File.stdout().writeStreamingAll(io, text);
+}
+
+// ---------------------------------------------------------------- tests
+
+test "default config denies git push and gates dotenv" {
+    var cfg = try config_mod.Store.init(std.testing.allocator);
+    defer cfg.deinit();
+    try cfg.validate();
+    try std.testing.expect(cfg.errors.items.len == 0);
+
+    var e = engineFromConfig(std.testing.allocator, &cfg);
+    defer e.deinit();
+    try std.testing.expectEqual(engine_mod.Decision.deny, e.decideCommand("git push origin main"));
+    try std.testing.expectEqual(engine_mod.Decision.deny, e.decideCommand("git push --force origin main"));
+    try std.testing.expectEqual(engine_mod.Decision.ask, e.decideCommand("git commit -m x"));
+    try std.testing.expect(!e.read_dotenv);
+
+    // Lowering the ceilings through config is honored.
+    try cfg.applyOverride("git.push", "\"auto\"", .{ .layer = .project, .origin = "test" });
+    try cfg.applyOverride("permissions.read_dotenv", "true", .{ .layer = .project, .origin = "test" });
+    var e2 = engineFromConfig(std.testing.allocator, &cfg);
+    defer e2.deinit();
+    try std.testing.expectEqual(engine_mod.Decision.allow, e2.decideCommand("git push origin main"));
+    try std.testing.expect(e2.read_dotenv);
+    // Unknown policy values fall back to the fail-closed default.
+    try cfg.applyOverride("git.force_push", "\"sometimes\"", .{ .layer = .project, .origin = "test" });
+    var e3 = engineFromConfig(std.testing.allocator, &cfg);
+    defer e3.deinit();
+    try std.testing.expectEqual(engine_mod.Decision.deny, e3.decideCommand("git push --force origin main"));
+}
+
+test "replay keeps assistant tool calls and tool results" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = Session{
+        .io = io,
+        .store = try session_mod.Session.create(tmp.dir, io, arena, "sessions", "/tmp/proj"),
+        .journal = try journal_mod.Journal.open(io, arena, tmp.dir),
+        .engine = engine_mod.Engine.init(arena, .ask),
+    };
+    defer s.store.close();
+
+    _ = try s.store.append(.{ .user = .{ .text = "read a" } });
+    _ = try s.store.append(.{ .assistant = .{ .text = "", .tool_calls_json = "[{\"id\":\"c1\",\"name\":\"read\",\"arguments_json\":\"{}\"}]" } });
+    _ = try s.store.append(.{ .tool_call = .{ .id = "c1", .name = "read", .arguments_json = "{}" } });
+    _ = try s.store.append(.{ .tool_result = .{ .call_id = "c1", .status = "failed", .output = "no such file" } });
+    _ = try s.store.append(.{ .assistant = .{ .text = "done" } });
+
+    try rebuildHistory(arena, &s);
+    try std.testing.expectEqual(@as(usize, 4), s.history.items.len);
+
+    try std.testing.expectEqual(core_types.ChatRole.user, s.history.items[0].role);
+    // The assistant tool-call message survives resume, so the tool result can
+    // still be paired on the wire.
+    try std.testing.expectEqual(core_types.ChatRole.assistant, s.history.items[1].role);
+    try std.testing.expect(s.history.items[1].tool_calls_json != null);
+    try std.testing.expectEqualStrings("c1", s.history.items[2].tool_call_id.?);
+    try std.testing.expectEqual(core_types.ChatRole.tool, s.history.items[2].role);
+    try std.testing.expect(s.history.items[2].is_error);
+    try std.testing.expectEqualStrings("done", s.history.items[3].content);
 }
