@@ -242,7 +242,7 @@ Run with `/lifecycle run .ifnh/lifecycle/ship.json` (resume with
 One-liner (after the repo is on GitHub and a tag is released):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<org>/ifnh/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Abide-Integrations/IFNH/main/install.sh | sh
 ```
 
 The root `install.sh` detects platform, prefers static musl builds on
@@ -263,7 +263,7 @@ Project-local `.ifnh/` directories are never touched by the uninstaller.
 A hosted copy works too:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<org>/ifnh/main/uninstall.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Abide-Integrations/IFNH/main/uninstall.sh | sh
 ```
 
 CI is deliberately lean: `ci.yml` runs on ubuntu only (auto-cancel,

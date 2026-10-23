@@ -6,7 +6,7 @@
 #   scripts/install.sh --version v0.1.0 --download
 set -e
 prefix="${IFNH_PREFIX:-$HOME/.local/bin}"
-repo="${IFNH_REPO:-ifnh/ifnh}"   # set to <org>/<repo> when published
+repo="${IFNH_REPO:-Abide-Integrations/IFNH}"
 
 need_download=0
 for arg in "$@"; do

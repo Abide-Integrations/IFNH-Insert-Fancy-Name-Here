@@ -44,8 +44,8 @@
 | ID | Task | Depends | Status | Notes |
 |---|---|---|---|---|
 | M0-T11 | `core/session/`: dir layout, manifest, id generation (`s_` + 12-char), flock/SessionBusy | M0-T02 | `[x]` | tryLock non-blocking; SessionBusy tested |
-| M0-T12 | JSONL event writer with watermark + bounded replay reader + torn-tail handling | M0-T11 | `[x]` | torn tail ignored; assistant tool_calls embedded |
-| M0-T13 | `ifnh sessions list` / `ifnh resume` (picker + last) with UI replay projection | M0-T12 | `[x]` | list + resume by id; interactive picker M1 |
+| M0-T12 | JSONL event writer with watermark + bounded replay reader + torn-tail handling | M0-T11 | `[~]` | torn tail ignored; assistant tool_calls embedded. F-A04: replay truncates at 10k events and tool calls/results are not persisted by the REPL. Awaiting A-04. |
+| M0-T13 | `ifnh sessions list` / `ifnh resume` (picker + last) with UI replay projection | M0-T12 | `[~]` | list + resume by id; interactive picker M1. F-A04: resume/fork lose tool context. Awaiting A-04. |
 | M0-T14 | `core/journal.zig`: intent/commit groups, inverse patches, undo/redo walker | M0-T02 | `[x]` | DESIGN §3.6 |
 | M0-T15 | Crash-recovery pass: replay/rollback incomplete journal groups at startup | M0-T14 | `[x]` | rollback-on-open tested |
 
@@ -57,7 +57,7 @@
 | M0-T17 | `providers/sse.zig`: bounded SSE parser (UTF-8 safe, max event/total bytes, cancel checks) | M0-T16 | `[x]` | 5 tests; std fixed-reader quirk worked around (takeByte state machine) |
 | M0-T18 | `providers/transport.zig`: std.http wrapper, deadlines, cancel flag, retry/backoff/Retry-After, delivery certainty | M0-T16 | `[~]` | std.http streaming wired in adapters w/ status mapping; retry/backoff policy deferred to M1 |
 | M0-T19 | `providers/openai.zig`: chat-completions adapter (streaming + tool calls + usage), config-driven base_url | M0-T18 | `[x]` | tool-call accumulation by index; [DONE] handling |
-| M0-T20 | `providers/anthropic.zig`: messages adapter (streaming + tool use + usage) | M0-T18 | `[x]` | tool_result user blocks; input_json_delta accumulation |
+| M0-T20 | `providers/anthropic.zig`: messages adapter (streaming + tool use + usage) | M0-T18 | `[~]` | tool_result user blocks; input_json_delta accumulation. F-A02: tools are sent in OpenAI shape, so Anthropic tool use fails with HTTP 400. Awaiting A-02. |
 | M0-T21 | `tests/fake_provider.zig` + `tests/fake_server.zig` (in-process, canned responses) | M0-T16 | `[~]` | fake provider (`core/agent/testing.zig`) done + drives engine tests; fake HTTP server for adapter e2e deferred (M1-T15) |
 | M0-T22 | Credential leases: env-var keys, zeroize after use, redaction filter for model-bound output | M0-T16 | `[~]` | env-var keys wired (api_key_env); zeroize+redaction filter M1 |
 
@@ -68,7 +68,7 @@
 | M0-T23 | `tools/tool.zig`: Tool contract + registry + JSON-schema subset + parallel read-only batches | M0-T04 | `[x]` | 7 specs + dispatch; parallel batches land with M1 subagents |
 | M0-T24 | `read`, `glob`, `grep` tools (bounded output, 64 KiB cap, UTF-8-safe truncation marker) | M0-T23 | `[x]` | literal-substring grep (no regex, per fx) |
 | M0-T25 | `edit` (exact old/new, context-hash staleness check) + `write` tools, journal-integrated | M0-T14, M0-T23 | `[x]` | ambiguity + staleness refused; journal groups |
-| M0-T26 | `bash` tool: argv vs `$SHELL -c` classification, lexer, destructive lexicon, process groups, output caps, managed timeout | M0-T23 | `[x]` | 120s timeout; classifier tests; background registry M1 |
+| M0-T26 | `bash` tool: argv vs `$SHELL -c` classification, lexer, destructive lexicon, process groups, output caps, managed timeout | M0-T23 | `[~]` | 120s timeout; classifier tests; background registry M1. F-A03: the non-shell path mis-tokenizes quotes, so `git commit -m "a b"` breaks. Awaiting A-03. |
 | M0-T27 | `git` tool: porcelain-only (status/diff/add/commit/branch/worktree), output parsing | M0-T26 | `[x]` | subcommand classification via command_class |
 
 ### M0.6 Permissions & approvals
@@ -116,7 +116,7 @@
 | M1-T05 | MCP client: stdio dispatcher (NDJSON reader thread) + Streamable HTTP, config, admission/trust, permission integration, per-agent allowlists | M0-T28 | `[~]` | stdio done (lazy spawn, tools/call, permission-gated, /mcp); HTTP transport + per-agent allowlists M2 |
 | M1-T06 | Skills: SKILL.md catalog (user/project/compat roots), budgeted `<available_skills>` index, `skill` loader tool, `/skills`, `/reload skills` | M0-T37 | `[x]` | per-turn catalog; /reload M2 |
 | M1-T07 | Hooks: 10 events, sync, block semantics, trust-gated project hooks | M0-T32 | `[~]` | 8 events wired (before/after agent); tool/merge-level dispatch M2 |
-| M1-T08 | Context compaction: trigger thresholds, chunked summary pipeline, structured handoff checkpoint, `/compact` | M0-T12 | `[x]` | auto at turn boundaries + manual; chunked pipeline C36 note |
+| M1-T08 | Context compaction: trigger thresholds, chunked summary pipeline, structured handoff checkpoint, `/compact` | M0-T12 | `[~]` | auto at turn boundaries + manual; chunked pipeline C36 note. F-A09: compaction can orphan tool results and the threshold ignores the model window. Awaiting A-09. |
 | M1-T09 | Usage tracking: per-agent tokens/cost/time/tool-calls (`usage.jsonl`), surfaced in `/agents` | M0-T32 | `[x]` | session usage.jsonl + /usage totals |
 | M1-T10 | Background/managed executions: execution handles, poll/stop, session-end cleanup | M0-T26 | `[x]` | registry + bash background:true + exec tool + /exec |
 | M1-T11 | Model catalog probing + aliases/fallbacks + routing table + cost estimation | M0-T19 | `[~]` | /model session override + role routing (lifecycle); aliases/fallbacks/cost M2 |
@@ -139,7 +139,7 @@
 | M2-T04 | Reconciliation-agent flow for concurrent conflicts | M2-T01 | `[x]` | /reconcile via journal version history (D045/046) |
 | M2-T05 | Session forks (+ optional worktree binding) + `fork diff` | M0-T13 | `[x]` | fork + `ifnh fork diff` with divergence point |
 | M2-T06 | `ifnh cleanup` (retention, orphan worktrees w/ approval, debug logs) | M1-T04 | `[x]` | dry-run default, --yes executes |
-| M2-T07 | CI: build + test matrix (Linux/macOS), size + startup budget gates, `zig fmt` check | M0-T40/41 | `[x]` | size + startup gates in ci.yml |
+| M2-T07 | CI: build + test matrix (Linux/macOS), size + startup budget gates, `zig fmt` check | M0-T40/41 | `[~]` | size + startup gates run in ci.yml, but the matrix is Linux-only today; macOS arm64 job tracked in E-09. |
 | M2-T08 | `--json` output on all subcommands (output contracts) | M0-T03 | `[~]` | sessions list --json; remaining subcommands post-1.0 |
 | M2-T09 | Reconnaissance skill (repo survey → durable artifact) | M1-T06 | `[x]` | skills/reconnaissance (first-party, disk-shipped) |
 | M2-T09b | First-party skills (create skill) with human-review activation | M1-T06 | `[x]` | skills/create-skill; never self-activate (K161) |

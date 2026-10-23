@@ -1,14 +1,13 @@
 #!/bin/sh
 # IFNH installer — curl-pipe friendly:
-#   curl -fsSL https://raw.githubusercontent.com/<org>/<repo>/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/Abide-Integrations/IFNH/main/install.sh | sh
 # Env overrides:
-#   IFNH_REPO=<org>/<repo>   GitHub repo (see CHANGE ME below)
+#   IFNH_REPO=Abide-Integrations/IFNH   GitHub repo (override when testing a fork)
 #   IFNH_PREFIX=<dir>        install dir (default ~/.local/bin)
 #   IFNH_VERSION=<tag>       release tag (default: latest)
 set -eu
 
-# CHANGE ME once the repo is pushed, or export IFNH_REPO:
-REPO="${IFNH_REPO:-Abide-Integrations/IFNH-Insert-Fancy-Name-Here}"
+REPO="${IFNH_REPO:-Abide-Integrations/IFNH}"
 PREFIX="${IFNH_PREFIX:-$HOME/.local/bin}"
 
 # --- platform detection ---

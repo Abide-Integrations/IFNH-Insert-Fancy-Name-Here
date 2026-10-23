@@ -5,7 +5,7 @@ open-source agentic coding harness written in Zig — for developers who want
 to control their models, tools, agents, workflows, permissions, and
 development lifecycle without adopting a heavyweight AI coding environment.
 
-Status: pre-alpha, active architecture/scaffolding phase.
+Status: early alpha (v0.1.x). Core architecture and M0-M2 features are implemented; correctness and hardening work is tracked in ACTIVE_PLAN.md.
 
 ## Documentation
 
@@ -21,7 +21,7 @@ Status: pre-alpha, active architecture/scaffolding phase.
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Abide-Integrations/ifnh/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Abide-Integrations/IFNH/main/install.sh | sh
 ```
 Or from source:
 
