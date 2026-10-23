@@ -28,6 +28,7 @@ const secret_mod = @import("../ui/secret.zig");
 const models_mod = @import("../providers/models.zig");
 const tool_mod = @import("../tools/tool.zig");
 const core_types = @import("../core/types.zig");
+const trace_mod = @import("../core/trace.zig");
 const openai = @import("../providers/openai.zig");
 const anthropic = @import("../providers/anthropic.zig");
 
@@ -37,6 +38,9 @@ pub const Options = struct {
     resume_id: ?[]const u8 = null,
     json: bool = false,
     no_color: bool = false,
+    /// Timing spans (B-01), created by main so startup is measured from
+    /// process start. Null (no output, no clock reads) when unset.
+    trace: ?*trace_mod.Trace = null,
 };
 
 const Session = struct {
@@ -55,6 +59,8 @@ const Session = struct {
     last_blocked_stage: ?[]const u8 = null,
     /// Persistent key store (user env file) for /provider key.
     user_keys: ?*keys_mod.Keys = null,
+    /// Timing spans for this session (B-01).
+    trace: ?*trace_mod.Trace = null,
 };
 
 var global_user_keys: keys_mod.Keys = undefined;
@@ -77,6 +83,10 @@ pub fn run(
 ) !void {
     g_environ = environ;
     g_no_color = opts.no_color;
+    const trace = opts.trace;
+    // Process start -> first paint (B-01): ends after the welcome banner.
+    var first_paint = trace_mod.startFromOrigin(trace, "startup.first_paint");
+    defer first_paint.end();
 
     // Persistent provider keys (~/.config/ifnh/env) overlay the process
     // environment for lookups (D022; real env wins).
@@ -101,7 +111,11 @@ pub fn run(
     const cwd = std.Io.Dir.cwd();
 
     // ---- configuration ----
-    var cfg = try config_mod.load(arena, io, environ, cwd);
+    var cfg = blk: {
+        var sp = trace_mod.start(trace, "startup.config");
+        defer sp.end();
+        break :blk try config_mod.load(arena, io, environ, cwd);
+    };
     defer cfg.deinit();
     for (cfg.errors.items) |err| {
         try out(io, "config error [{s}]: {s}\n", .{ err.path, err.message });
@@ -144,8 +158,12 @@ pub fn run(
         sess.journal.close();
     }
 
+    sess.trace = trace;
+
     // ---- skills catalog (K148/149) ----
     sess.skills = blk: {
+        var sp = trace_mod.start(trace, "startup.skills");
+        defer sp.end();
         const user_dir = std.fmt.allocPrint(arena, "{s}/.config/ifnh/skills", .{environ.get("HOME") orelse ""}) catch break :blk null;
         const catalog = skills_mod.discover(cwd, io, arena, user_dir) catch break :blk null;
         break :blk catalog;
@@ -171,7 +189,11 @@ pub fn run(
 
     // ---- instructions ----
     const builtin_prompt = system_prompt.system_prompt;
-    const instr = try instructions_mod.assemble(cwd, io, arena, builtin_prompt, &.{});
+    const instr = blk: {
+        var sp = trace_mod.start(trace, "startup.instructions");
+        defer sp.end();
+        break :blk try instructions_mod.assemble(cwd, io, arena, builtin_prompt, &.{});
+    };
 
     // ---- welcome ----
     {
@@ -193,6 +215,7 @@ pub fn run(
         });
         try out(io, "{s}type a message, or /help for commands{s}\n", .{ palette.dim("", arena), "\x1b[0m" });
     }
+    first_paint.end();
 
     // ---- input loop ----
     var stdin_buf: [4096]u8 = undefined;
@@ -227,14 +250,22 @@ pub fn run(
 
         // ---- policy boundary (D029): re-read disk config, re-assemble
         // instructions with focus dirs from recent tool activity ----
+        var setup_span = trace_mod.start(trace, "turn.setup");
+        defer setup_span.end();
         if (reloadConfig(io, arena, cwd, environ, &sess)) |fresh| {
             cfg.deinit();
             cfg = fresh;
         }
         const focus = instructions_mod.focusDirsFromHistory(arena, sess.history.items, 8);
-        const turn_instr = instructions_mod.assemble(cwd, io, arena, system_prompt.system_prompt, focus) catch instr;
+        const turn_instr = blk: {
+            var sp = trace_mod.start(trace, "turn.instructions");
+            defer sp.end();
+            break :blk instructions_mod.assemble(cwd, io, arena, system_prompt.system_prompt, focus) catch instr;
+        };
         // Skills catalog appendix (budgeted, K148).
         const skill_prompt = blk: {
+            var sp = trace_mod.start(trace, "turn.skills_catalog");
+            defer sp.end();
             if (sess.skills) |catalog| {
                 const rendered = skills_mod.renderCatalog(arena, catalog) catch "";
                 if (rendered.len > 0) {
@@ -300,6 +331,8 @@ fn submitTurn(
         .max_output_tokens = cfg.getOptionalU32("model.max_output_tokens"),
         .cancel = &cancel,
         .git = blk: {
+            var sp = trace_mod.start(sess.trace, "turn.git");
+            defer sp.end();
             var path_buf: [std.fs.max_path_bytes]u8 = undefined;
             const n = cwd.realPath(io, &path_buf) catch break :blk null;
             const repo_path = arena.dupe(u8, path_buf[0..n]) catch break :blk null;
@@ -372,8 +405,10 @@ fn submitTurn(
     };
     var ui = TurnUi{ .io = io };
 
+    var hooks_span = trace_mod.start(sess.trace, "turn.hooks");
     var hook_engine = hooks_mod.Engine.init(io, cwd, try hooks_mod.Engine.fromConfig(arena, cfg.get("hooks")), arena);
     const pre = hook_engine.dispatch(.before_agent, "{}");
+    hooks_span.end();
     if (pre.blocked) {
         try out(io, "before_agent hook blocked the turn: {s}\n", .{pre.output});
         return;
@@ -406,6 +441,7 @@ fn submitTurn(
         .io = io,
         .arena = arena,
         .pcfg = pcfg,
+        .trace = sess.trace,
         .system = system,
         .history = &sess.history,
         .tool_ctx = &tool_ctx,

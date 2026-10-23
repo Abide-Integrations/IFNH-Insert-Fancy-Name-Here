@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const core_types = @import("../core/types.zig");
+const trace_mod = @import("../core/trace.zig");
 
 pub const StreamEvent = core_types.StreamEvent;
 
@@ -36,6 +37,9 @@ pub const ModelRequest = struct {
     /// Opaque provider-specific options (JSON object text) or "".
     provider_options: []const u8 = "",
     cancel: *std.atomic.Value(bool),
+    /// Timing spans for request build, time-to-first-token and stream
+    /// completion (B-01). Null when tracing is off.
+    trace: ?*trace_mod.Trace = null,
 };
 
 pub const Capabilities = struct {

@@ -6,6 +6,7 @@
 //! hard startup error, never silently ignored.
 
 const std = @import("std");
+const trace_mod = @import("../trace.zig");
 const builtin = @import("builtin");
 
 pub const Layer = enum {
@@ -442,7 +443,7 @@ pub fn load(
         var it = env.iterator();
         while (it.next()) |entry| {
             const key = entry.key_ptr.*;
-            if (!std.mem.startsWith(u8, key, "IFNH_")) continue;
+            if (!isConfigEnvKey(key)) continue;
             const rest = key["IFNH_".len..];
             if (rest.len == 0) continue;
             var parts: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -527,6 +528,8 @@ test "env overrides with __ nesting and json values" {
     try env.put("IFNH_PERMISSIONS__DEFAULT_MODE", "auto");
     try env.put("IFNH_AGENTS__MAX_DEPTH", "2");
     try env.put("IFNH_MODEL__MODEL", "gpt-x");
+    // Trace switch is a diagnostic flag, not a config key: no warning, no entry.
+    try env.put(trace_mod.env_var, "1");
 
     var store = try Store.init(std.testing.allocator);
     defer store.deinit();
@@ -536,6 +539,16 @@ test "env overrides with __ nesting and json values" {
     try std.testing.expectEqual(@as(u32, 2), store.getU32("agents.max_depth", 0));
     try std.testing.expectEqualStrings("gpt-x", store.getString("model.model", ""));
     try std.testing.expectEqual(Layer.env, store.getSource("permissions.default_mode").?.layer);
+    try std.testing.expect(store.get("trace_startup") == null);
+    for (store.warnings.items) |w| {
+        try std.testing.expect(std.mem.indexOf(u8, w, "trace_startup") == null);
+    }
+}
+
+/// `IFNH_<PATH>` env vars are config overrides, except for diagnostic
+/// switches: those are not config paths and must not warn (B-01).
+fn isConfigEnvKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, "IFNH_") and !std.mem.eql(u8, key, trace_mod.env_var);
 }
 
 /// Test helper mirroring the env pass of `load` without disk layers.
@@ -543,7 +556,7 @@ fn applyEnvForTest(store: *Store, env: *const std.process.Environ.Map) !void {
     var it = env.iterator();
     while (it.next()) |entry| {
         const key = entry.key_ptr.*;
-        if (!std.mem.startsWith(u8, key, "IFNH_")) continue;
+        if (!isConfigEnvKey(key)) continue;
         const rest = key["IFNH_".len..];
         var parts: std.ArrayListUnmanaged([]const u8) = .empty;
         var sit = std.mem.splitSequence(u8, rest, "__");

@@ -11,6 +11,7 @@ const core_types = @import("../types.zig");
 const provider_mod = @import("../../providers/provider.zig");
 const tool_mod = @import("../../tools/tool.zig");
 const redact_mod = @import("../redact.zig");
+const trace_mod = @import("../trace.zig");
 
 pub const max_tool_rounds_default: usize = 25;
 
@@ -143,10 +144,28 @@ pub const RunParams = struct {
     redactions: []const []const u8 = &.{},
     temperature: ?f64 = null,
     max_output_tokens: ?u32 = null,
+    /// Timing spans (B-01); null unless `IFNH_TRACE_STARTUP=1`.
+    trace: ?*trace_mod.Trace = null,
 };
 
 /// Run one agent turn. Appends assistant/tool messages to `history`.
+/// Emits the turn's total tool time as a trace note (B-01).
 pub fn runTurn(p: RunParams) !Outcome {
+    var turn_span = trace_mod.start(p.trace, "turn.total");
+    defer turn_span.end();
+    var tool_ms: f64 = 0;
+    const outcome = try runRounds(p, &tool_ms);
+    if (p.trace) |t| {
+        if (t.isOn()) {
+            var buf: [96]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, "turn.tool_time {d:.3}ms total", .{tool_ms}) catch "";
+            trace_mod.note(p.trace, text);
+        }
+    }
+    return outcome;
+}
+
+fn runRounds(p: RunParams, tool_ms: *f64) !Outcome {
     var total_usage = core_types.Usage{};
     var rounds: usize = 0;
     var total_calls: usize = 0;
@@ -158,6 +177,7 @@ pub fn runTurn(p: RunParams) !Outcome {
         }
 
         var collector = Collector{ .arena = p.arena, .callbacks = p.callbacks };
+        var round_span = trace_mod.start(p.trace, "turn.provider_round");
         const tools_json = if (p.include_tools)
             try renderToolsJson(p.arena, null)
         else
@@ -175,6 +195,7 @@ pub fn runTurn(p: RunParams) !Outcome {
                 .temperature = p.temperature,
                 .max_output_tokens = p.max_output_tokens,
                 .cancel = p.cancel,
+                .trace = p.trace,
             }, .{ .ctx = &collector, .emit_fn = sinkEmit });
             if (collector.failure) |f| {
                 if (core_types.isRetryable(f.kind) and attempt < p.max_retries and !p.cancel.load(.acquire)) {
@@ -187,6 +208,7 @@ pub fn runTurn(p: RunParams) !Outcome {
             break;
         }
 
+        round_span.end();
         total_usage.input_tokens += collector.usage.input_tokens;
         total_usage.output_tokens += collector.usage.output_tokens;
 
@@ -206,7 +228,13 @@ pub fn runTurn(p: RunParams) !Outcome {
 
         if (collector.tool_calls.items.len == 0) {
             try p.history.append(p.arena, .{ .role = .assistant, .content = reply });
+            trace_mod.note(p.trace, "turn.complete");
             return .{ .status = .completed, .reply = reply, .tool_rounds = rounds + 1, .tool_calls = total_calls, .usage = total_usage };
+        }
+        var tools_span = trace_mod.start(p.trace, "turn.tools_round");
+        defer {
+            tool_ms.* += tools_span.elapsedMs();
+            tools_span.end();
         }
 
         // Assistant message with tool calls; remember calls for the wire.

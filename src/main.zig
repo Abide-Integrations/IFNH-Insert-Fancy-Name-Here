@@ -12,6 +12,7 @@ const fsutil = @import("core/fsutil.zig");
 const repl = @import("cli/repl.zig");
 const session_mod = @import("core/session/store.zig");
 const config_mod = @import("core/config/config.zig");
+const trace_mod = @import("core/trace.zig");
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -20,6 +21,11 @@ pub const std_options: std.Options = .{
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const arena = init.arena.allocator();
+
+    // Baseline for IFNH_TRACE_STARTUP spans (B-01); a no-op when unset.
+    var trace = trace_mod.Trace.init(io, init.environ_map);
+    var main_span = trace_mod.start(&trace, "process.argv");
+    defer main_span.end();
 
     // Collect argv (skip argv[0]).
     var argv: std.ArrayList([]const u8) = .empty;
@@ -47,7 +53,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (parsed.subcommand == .none) {
-        repl.run(io, arena, init.environ_map, .{ .no_color = parsed.flags.no_color }) catch |err| {
+        repl.run(io, arena, init.environ_map, .{ .no_color = parsed.flags.no_color, .trace = &trace }) catch |err| {
             if (err == error.AccessDenied) {
                 try printOut(io, arena, "error: permission denied\n" ++
                     "ifnh needs to write .ifnh/ in the current directory.\n" ++
@@ -62,7 +68,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    dispatch(io, arena, init.environ_map, parsed) catch |err| {
+    dispatch(io, arena, init.environ_map, parsed, &trace) catch |err| {
         if (err == error.AccessDenied) {
             try printOut(io, arena, "error: permission denied\n" ++
                 "ifnh writes its state (.ifnh/) in the current directory.\n" ++
@@ -82,12 +88,13 @@ fn dispatch(
     arena: std.mem.Allocator,
     environ: *const std.process.Environ.Map,
     parsed: cli_args.Parsed,
+    trace: ?*trace_mod.Trace,
 ) !void {
     const io_arg = io;
     _ = io_arg;
     switch (parsed.subcommand) {
         .none => {
-            try repl.run(io, arena, environ, .{ .no_color = parsed.flags.no_color });
+            try repl.run(io, arena, environ, .{ .no_color = parsed.flags.no_color, .trace = trace });
             return;
         },
         .init => try runInit(io, arena, parsed.args),
@@ -108,6 +115,7 @@ fn dispatch(
             break :blk try repl.run(io, arena, environ, .{
                 .resume_id = parsed.args[0],
                 .no_color = parsed.flags.no_color,
+                .trace = trace,
             });
         },
         .doctor => try runDoctor(io, arena, environ),
@@ -476,6 +484,7 @@ const help_text =
 test {
     _ = @import("version.zig");
     _ = @import("core/types.zig");
+    _ = @import("core/trace.zig");
     _ = @import("core/fsutil.zig");
     _ = @import("cli/args.zig");
     _ = @import("core/config/config.zig");

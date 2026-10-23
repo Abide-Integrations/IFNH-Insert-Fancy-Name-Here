@@ -8,6 +8,7 @@
 const std = @import("std");
 const provider = @import("provider.zig");
 const sse = @import("sse.zig");
+const trace_mod = @import("../core/trace.zig");
 
 const anthropic_version = "2023-06-01";
 const transfer_buffer_size: usize = 16 * 1024;
@@ -24,9 +25,16 @@ pub fn streamFn(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    var stream_span = trace_mod.start(req.trace, "provider.stream");
+    defer stream_span.end();
+
     const url = try std.fmt.allocPrint(arena, "{s}/v1/messages", .{trimSlash(req.base_url)});
     const uri = std.Uri.parse(url) catch return error.InvalidBaseUrl;
-    const body = try buildBody(arena, req);
+    const body = blk: {
+        var build_span = trace_mod.start(req.trace, "provider.request_build");
+        defer build_span.end();
+        break :blk try buildBody(arena, req);
+    };
 
     var client: std.http.Client = .{ .allocator = alloc, .io = io };
     defer client.deinit();
@@ -77,6 +85,7 @@ pub fn streamFn(
     var tool_count: usize = 0;
     var input_tokens: u64 = 0;
     var output_tokens: u64 = 0;
+    var first_token = false;
 
     while (try parser.next(arena)) |payload| {
         if (req.cancel.load(.acquire)) {
@@ -123,7 +132,13 @@ pub fn streamFn(
             if (dt != .string) continue;
             if (std.mem.eql(u8, dt.string, "text_delta")) {
                 if (d.get("text")) |t| {
-                    if (t == .string and t.string.len > 0) sink.emit(.{ .content_delta = t.string });
+                    if (t == .string and t.string.len > 0) {
+                        if (!first_token) {
+                            first_token = true;
+                            stream_span.mark("provider.ttft");
+                        }
+                        sink.emit(.{ .content_delta = t.string });
+                    }
                 }
             } else if (std.mem.eql(u8, dt.string, "input_json_delta")) {
                 if (d.get("partial_json")) |pj| {

@@ -9,6 +9,7 @@ const std = @import("std");
 const provider = @import("provider.zig");
 const sse = @import("sse.zig");
 const core_types = @import("../core/types.zig");
+const trace_mod = @import("../core/trace.zig");
 
 pub const default_context: Context = .{};
 
@@ -29,9 +30,16 @@ pub fn streamFn(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    var stream_span = trace_mod.start(req.trace, "provider.stream");
+    defer stream_span.end();
+
     const url = try std.fmt.allocPrint(arena, "{s}/chat/completions", .{trimSlash(req.base_url)});
     const uri = std.Uri.parse(url) catch return error.InvalidBaseUrl;
-    const body = try buildBody(arena, req);
+    const body = blk: {
+        var build_span = trace_mod.start(req.trace, "provider.request_build");
+        defer build_span.end();
+        break :blk try buildBody(arena, req);
+    };
 
     var client: std.http.Client = .{ .allocator = alloc, .io = io };
     defer client.deinit();
@@ -81,6 +89,7 @@ pub fn streamFn(
     };
     var tools: [16]ToolAcc = undefined;
     var tool_count: usize = 0;
+    var first_token = false;
 
     while (try parser.next(arena)) |payload| {
         if (req.cancel.load(.acquire)) {
@@ -122,6 +131,10 @@ pub fn streamFn(
                 const d = delta_v.object;
                 if (d.get("content")) |c| {
                     if (c == .string and c.string.len > 0) {
+                        if (!first_token) {
+                            first_token = true;
+                            stream_span.mark("provider.ttft");
+                        }
                         sink.emit(.{ .content_delta = c.string });
                     }
                 }
