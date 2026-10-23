@@ -10,6 +10,7 @@ const version = @import("version.zig");
 const cli_args = @import("cli/args.zig");
 const fsutil = @import("core/fsutil.zig");
 const repl = @import("cli/repl.zig");
+const ask = @import("cli/ask.zig");
 const session_mod = @import("core/session/store.zig");
 const config_mod = @import("core/config/config.zig");
 
@@ -89,6 +90,10 @@ fn dispatch(
         .none => {
             try repl.run(io, arena, environ, .{ .no_color = parsed.flags.no_color });
             return;
+        },
+        .ask => {
+            const code = try ask.run(io, arena, environ, parsed.ask);
+            if (code != ask.exit_ok) std.process.exit(code);
         },
         .init => try runInit(io, arena, parsed.args),
         .config => try runConfig(io, arena, environ, parsed.args),
@@ -454,6 +459,7 @@ const help_text =
     \\
     \\subcommands:
     \\  (none)      start an interactive session (M0)
+    \\  ask <text>  run one turn headlessly (also: -p <text>)
     \\  init        create a .ifnh/ project skeleton
     \\  config      validate/explain configuration (M0)
     \\  sessions    list recorded sessions (--json supported)
@@ -465,11 +471,18 @@ const help_text =
     \\  version     print version
     \\
     \\global flags:
-    \\  --json                  machine-readable output
+    \\  --json                  machine-readable output (ask: NDJSON events)
     \\  --no-color              disable color
     \\  --log-level <level>     err | info | debug | trace
     \\  -h, --help              show help
     \\  -V, --version           print version
+    \\
+    \\ask flags:
+    \\  -p, --prompt <text>     one-turn prompt (same as: ifnh ask <text>)
+    \\  --json                  NDJSON events on stdout
+    \\  --yes                   auto-approve tool approvals
+    \\  --deny-all              deny every approval request (default headless)
+    \\  --policy <path>         load a permissions policy JSON for this run
     \\
 ;
 
@@ -491,6 +504,7 @@ test {
     _ = @import("providers/anthropic.zig");
     _ = @import("core/instructions.zig");
     _ = @import("core/agent/engine.zig");
+    _ = @import("core/agent/session_runtime.zig");
     _ = @import("core/agent/testing.zig");
     _ = @import("core/agent/subagent.zig");
     _ = @import("core/git.zig");
@@ -507,6 +521,7 @@ test {
     _ = @import("core/config/keys.zig");
     _ = @import("core/agent/system_prompt.zig");
     _ = @import("cli/repl.zig");
+    _ = @import("cli/ask.zig");
     _ = @import("core/redact.zig");
     _ = @import("providers/testing.zig");
 }

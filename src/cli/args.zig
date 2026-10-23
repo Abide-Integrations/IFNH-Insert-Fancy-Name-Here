@@ -16,10 +16,20 @@ pub const GlobalFlags = struct {
     version: bool = false,
 };
 
+pub const ApprovalMode = enum { deny_all, yes };
+
+pub const AskOptions = struct {
+    prompt: ?[]const u8 = null,
+    json: bool = false,
+    approval: ApprovalMode = .deny_all,
+    policy_path: ?[]const u8 = null,
+};
+
 pub const Subcommand = enum {
     none,
     help,
     version,
+    ask,
     init,
     config,
     sessions,
@@ -37,12 +47,43 @@ pub const Parsed = struct {
     /// Raw arguments after the subcommand token; owned by the caller's
     /// backing memory (here: the caller-provided argv slice).
     args: []const []const u8 = &.{},
+    /// `ifnh ask` / `ifnh -p` options (prompt, NDJSON, approvals).
+    ask: AskOptions = .{},
 };
 
 pub const ParseError = error{
     UnknownFlag,
     MissingFlagValue,
+    TooManyArgs,
 };
+
+/// Parse the arguments that follow `ifnh ask` (flags may appear anywhere).
+/// `ifnh -p "<prompt>"` uses this same shape, with the prompt already set.
+pub fn parseAskArgs(args: []const []const u8, opts: *AskOptions, json_default: bool) ParseError!void {
+    if (json_default) opts.json = true;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--json")) {
+            opts.json = true;
+        } else if (std.mem.eql(u8, arg, "--yes")) {
+            opts.approval = .yes;
+        } else if (std.mem.eql(u8, arg, "--deny-all")) {
+            opts.approval = .deny_all;
+        } else if (std.mem.eql(u8, arg, "--policy")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            opts.policy_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--no-color")) {
+            // Accepted for parity; headless output never styles text.
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            return error.UnknownFlag;
+        } else {
+            if (opts.prompt != null) return error.TooManyArgs;
+            opts.prompt = arg;
+        }
+    }
+}
 
 pub fn parse(argv: []const []const u8) ParseError!Parsed {
     var result = Parsed{};
@@ -64,6 +105,13 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
             if (i >= argv.len) return error.MissingFlagValue;
             result.flags.log_level = std.meta.stringToEnum(LogLevel, argv[i]) orelse
                 return error.UnknownFlag;
+        } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--prompt")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingFlagValue;
+            result.ask.prompt = argv[i];
+            result.subcommand = .ask;
+            try parseAskArgs(argv[i + 1 ..], &result.ask, result.flags.json);
+            return result;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             result.flags.help = true;
         } else if (std.mem.eql(u8, arg, "-V") or std.mem.eql(u8, arg, "--version")) {
@@ -73,7 +121,10 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
         }
     }
 
-    if (i >= argv.len) return result;
+    if (i >= argv.len) {
+        result.ask.json = result.ask.json or result.flags.json;
+        return result;
+    }
 
     const cmd_name = argv[i];
     i += 1;
@@ -82,6 +133,8 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
         .help
     else if (std.mem.eql(u8, cmd_name, "version"))
         .version
+    else if (std.mem.eql(u8, cmd_name, "ask"))
+        .ask
     else if (std.mem.eql(u8, cmd_name, "init"))
         .init
     else if (std.mem.eql(u8, cmd_name, "config"))
@@ -100,6 +153,7 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
         .unknown;
 
     result.args = argv[i..];
+    if (result.subcommand == .ask) try parseAskArgs(result.args, &result.ask, result.flags.json);
     return result;
 }
 
@@ -127,6 +181,35 @@ test "parse -V and -h" {
 test "unknown flag is an error" {
     try std.testing.expectError(error.UnknownFlag, parse(&.{"--bogus"}));
     try std.testing.expectError(error.MissingFlagValue, parse(&.{"--log-level"}));
+}
+
+test "parse ask subcommand with flags and prompt" {
+    const p = try parse(&.{ "ask", "--json", "--yes", "--policy", "p.json", "hello" });
+    try std.testing.expectEqual(Subcommand.ask, p.subcommand);
+    try std.testing.expect(p.ask.json);
+    try std.testing.expectEqual(ApprovalMode.yes, p.ask.approval);
+    try std.testing.expectEqualStrings("p.json", p.ask.policy_path.?);
+    try std.testing.expectEqualStrings("hello", p.ask.prompt.?);
+}
+
+test "parse -p alias and global json" {
+    const p = try parse(&.{ "--json", "-p", "hello world" });
+    try std.testing.expectEqual(Subcommand.ask, p.subcommand);
+    try std.testing.expect(p.ask.json);
+    try std.testing.expectEqual(ApprovalMode.deny_all, p.ask.approval);
+    try std.testing.expectEqualStrings("hello world", p.ask.prompt.?);
+}
+
+test "parse -p accepts ask flags after the prompt" {
+    const p = try parse(&.{ "-p", "hello", "--yes", "--policy", "p.json" });
+    try std.testing.expectEqual(Subcommand.ask, p.subcommand);
+    try std.testing.expectEqual(ApprovalMode.yes, p.ask.approval);
+    try std.testing.expectEqualStrings("p.json", p.ask.policy_path.?);
+}
+
+test "ask rejects unknown flags and extra prompts" {
+    try std.testing.expectError(error.UnknownFlag, parse(&.{ "ask", "--bogus", "x" }));
+    try std.testing.expectError(error.TooManyArgs, parse(&.{ "ask", "a", "b" }));
 }
 
 test "unknown subcommand captures args" {
