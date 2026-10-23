@@ -36,6 +36,13 @@ pub const ModelRequest = struct {
     /// Opaque provider-specific options (JSON object text) or "".
     provider_options: []const u8 = "",
     cancel: *std.atomic.Value(bool),
+    /// Session-scoped HTTP client (keep-alive, TLS session reuse). When
+    /// null the adapter creates and destroys its own client per request.
+    /// A client may be shared across threads for distinct requests
+    /// ("connections are opened in a thread-safe manner, but individual
+    /// requests are not" — std/http/Client.zig), so its allocator must be
+    /// thread-safe.
+    client: ?*std.http.Client = null,
 };
 
 pub const Capabilities = struct {

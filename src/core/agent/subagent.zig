@@ -42,6 +42,9 @@ pub const Host = struct {
     base_url: []const u8,
     api_key: []const u8,
     default_model: []const u8,
+    /// Session HTTP client shared with the parent (keep-alive). Safe from
+    /// child threads: distinct requests on one client are allowed.
+    http_client: ?*std.http.Client = null,
     // Parent permission snapshot (borrowed slices, stable for the session).
     mode: engine_mod.Mode,
     read_globs: []const []const u8,
@@ -242,6 +245,7 @@ fn runChild(
             .model = model orelse host.default_model,
             .base_url = host.base_url,
             .api_key = host.api_key,
+            .client = host.http_client,
         },
         .system = system,
         .history = &history,

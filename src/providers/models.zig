@@ -22,10 +22,12 @@ pub const Result = union(enum) {
     failure: []const u8,
 };
 
-/// Fetch the model list. `is_anthropic` selects header style.
+/// Fetch the model list. `is_anthropic` selects header style. Pass the
+/// session client when there is one; otherwise a throwaway client is used.
 pub fn fetchModels(
     arena: std.mem.Allocator,
     io: std.Io,
+    client_opt: ?*std.http.Client,
     base_url: []const u8,
     api_key: []const u8,
     is_anthropic: bool,
@@ -34,8 +36,12 @@ pub fn fetchModels(
     const uri = std.Uri.parse(url) catch
         return .{ .failure = "invalid base URL" };
 
-    var client: std.http.Client = .{ .allocator = arena, .io = io };
-    defer client.deinit();
+    var owned: std.http.Client = undefined;
+    const client: *std.http.Client = client_opt orelse blk: {
+        owned = .{ .allocator = arena, .io = io };
+        break :blk &owned;
+    };
+    defer if (client_opt == null) owned.deinit();
 
     var extra: [2]std.http.Header = undefined;
     var extra_len: usize = 0;

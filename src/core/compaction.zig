@@ -118,6 +118,7 @@ pub fn compact(
         .system = compaction_instructions,
         .messages = msgs[0..],
         .cancel = &cancel,
+        .client = pcfg.client,
     }, .{ .ctx = &sink_ctx, .emit_fn = SinkCtx.emit });
 
     if (sink_ctx.failed or reply.items.len == 0) return error.CompactionFailed;

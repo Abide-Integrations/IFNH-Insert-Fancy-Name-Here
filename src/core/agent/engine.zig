@@ -20,6 +20,8 @@ pub const ProviderConfig = struct {
     model: []const u8,
     base_url: []const u8,
     api_key: []const u8,
+    /// Session-scoped HTTP client (B-02). Null = one client per request.
+    client: ?*std.http.Client = null,
 };
 
 pub const Callbacks = struct {
@@ -184,6 +186,7 @@ pub fn runTurn(p: RunParams) !Outcome {
                 .temperature = p.temperature,
                 .max_output_tokens = p.max_output_tokens,
                 .cancel = p.cancel,
+                .client = p.pcfg.client,
             }, .{ .ctx = &collector, .emit_fn = sinkEmit });
             _ = trace.end(p.io, provider_span);
             if (collector.failure) |f| {

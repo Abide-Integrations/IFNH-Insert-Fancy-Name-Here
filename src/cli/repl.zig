@@ -42,6 +42,12 @@ pub const Options = struct {
 
 const Session = struct {
     io: std.Io,
+    /// One HTTP client for the whole session (ACTIVE_PLAN B-02): keep-alive
+    /// connection reuse and no per-request CA-bundle rescan. `std.http.Client`
+    /// opens connections thread-safely but does not share individual requests,
+    /// so subagent threads may use it concurrently; its allocator must be
+    /// thread-safe (smp_allocator, not the REPL arena).
+    http: std.http.Client,
     store: session_mod.Session,
     journal: journal_mod.Journal,
     engine: engine_mod.Engine,
@@ -125,24 +131,34 @@ pub fn run(
     ensureIfnh(io, cwd) catch {};
     const sessions_dir_name = ".ifnh/sessions";
 
+    const session_span = trace.begin(io, "startup.session");
     var sess: Session = blk: {
+        // `now` is set once so the client does not rescan the system CA
+        // bundle on every HTTPS request (see std/http/Client.zig `now`).
+        const http_client: std.http.Client = .{
+            .allocator = std.heap.smp_allocator,
+            .io = io,
+            .now = std.Io.Timestamp.now(io, .real),
+        };
         if (opts.resume_id) |id| {
             const store = try session_mod.Session.open(cwd, io, arena, sessions_dir_name, id);
             const j = try journal_mod.Journal.open(io, arena, store.dir);
-            var s = Session{ .io = io, .store = store, .journal = j, .engine = engineFromConfig(arena, &cfg) };
+            var s = Session{ .io = io, .http = http_client, .store = store, .journal = j, .engine = engineFromConfig(arena, &cfg) };
             try rebuildHistory(arena, &s);
             break :blk s;
         } else {
             const cwd_copy: []const u8 = if (environ.get("PWD")) |pwd| pwd else ".";
             const store = try session_mod.Session.create(cwd, io, arena, sessions_dir_name, cwd_copy);
             const j = try journal_mod.Journal.open(io, arena, store.dir);
-            break :blk Session{ .io = io, .store = store, .journal = j, .engine = engineFromConfig(arena, &cfg) };
+            break :blk Session{ .io = io, .http = http_client, .store = store, .journal = j, .engine = engineFromConfig(arena, &cfg) };
         }
     };
+    _ = trace.end(io, session_span);
     sess.user_keys = &global_user_keys;
     defer {
         if (sess.executions) |reg| reg.deinit(); // kill background children (I125)
         if (sess.mcp_registry) |reg| reg.deinit();
+        sess.http.deinit(); // closes pooled keep-alive connections
         sess.store.close();
         sess.journal.close();
     }
@@ -270,11 +286,15 @@ fn submitTurn(
     environ: *const std.process.Environ.Map,
     sess: *Session,
     cfg: *config_mod.Store,
-    pcfg: agent_engine.ProviderConfig,
+    pcfg_in: agent_engine.ProviderConfig,
     system: []const u8,
     user_text: []const u8,
     cwd: std.Io.Dir,
 ) !void {
+    // The session owns one HTTP client for every request this turn makes
+    // (provider, compaction, subagents) — B-02.
+    var pcfg = pcfg_in;
+    pcfg.client = &sess.http;
     if (pcfg.model.len == 0) {
         try out(io, "no model configured — run /provider set <openai|anthropic> <model> [base_url] [key_env]\n", .{});
         return;
@@ -297,6 +317,7 @@ fn submitTurn(
         .base_url = pcfg.base_url,
         .api_key = pcfg.api_key,
         .default_model = pcfg.model,
+        .http_client = pcfg.client,
         .mode = sess.engine.mode,
         .read_globs = sess.engine.read_globs,
         .write_globs = sess.engine.write_globs,
@@ -870,7 +891,7 @@ fn runFirstRunSetup(
 
     // Live model list; typed fallback when unavailable.
     var model_name: []const u8 = preset.default_model;
-    const models_res = models_mod.fetchModels(arena, io, base_url, key_value, std.mem.eql(u8, preset.id, "anthropic"));
+    const models_res = models_mod.fetchModels(arena, io, null, base_url, key_value, std.mem.eql(u8, preset.id, "anthropic"));
     switch (models_res) {
         .models => |list| {
             try out(io, "{s}({d} models available — enter a number, or type a model id){s}\n", .{

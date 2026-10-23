@@ -39,8 +39,14 @@ pub fn streamFn(
     const body = try buildBody(arena, req);
     _ = trace.end(io, build_span);
 
-    var client: std.http.Client = .{ .allocator = alloc, .io = io };
-    defer client.deinit();
+    // Reuse the session client when given one (keep-alive + no CA rescan);
+    // otherwise own a throwaway client for this request.
+    var owned: std.http.Client = undefined;
+    const client: *std.http.Client = req.client orelse blk: {
+        owned = .{ .allocator = alloc, .io = io };
+        break :blk &owned;
+    };
+    defer if (req.client == null) owned.deinit();
 
     var extra = [_]std.http.Header{
         .{ .name = "accept", .value = "text/event-stream" },

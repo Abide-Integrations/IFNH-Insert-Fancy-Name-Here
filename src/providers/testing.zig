@@ -196,3 +196,132 @@ test "openai adapter accumulates tool calls from stream" {
     try std.testing.expectEqualStrings("read", tc.name);
     try std.testing.expectEqualStrings("{\"path\":\"x\"}", tc.arguments_json);
 }
+
+/// Keep-alive counterpart of `FakeServer`: serves `expected_requests`
+/// requests (possibly several per connection) and counts the connections
+/// it had to accept, so a test can prove connection reuse (B-02).
+pub const KeepAliveServer = struct {
+    thread: ?std.Thread = null,
+    server: std.Io.net.Server,
+    io: std.Io,
+    response: []const u8,
+    port: u16,
+    expected_requests: usize,
+    connections: std.atomic.Value(usize) = .init(0),
+    requests: std.atomic.Value(usize) = .init(0),
+    done: std.atomic.Value(bool) = .init(false),
+
+    pub fn start(
+        io: std.Io,
+        arena: std.mem.Allocator,
+        body: []const u8,
+        expected_requests: usize,
+    ) !*KeepAliveServer {
+        const self = try arena.create(KeepAliveServer);
+        const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        var srv = try addr.listen(io, .{ .reuse_address = true });
+        self.* = .{
+            .server = srv,
+            .io = io,
+            .port = srv.socket.address.getPort(),
+            .expected_requests = expected_requests,
+            .response = try std.fmt.allocPrint(arena, "HTTP/1.1 200 OK\r\n" ++
+                "Content-Type: text/event-stream\r\n" ++
+                "Content-Length: {d}\r\n" ++
+                "Connection: keep-alive\r\n\r\n{s}", .{ body.len, body }),
+        };
+        self.thread = try std.Thread.spawn(.{}, main, .{self});
+        return self;
+    }
+
+    fn main(self: *KeepAliveServer) void {
+        defer self.done.store(true, .release);
+        while (self.requests.load(.acquire) < self.expected_requests) {
+            const conn = self.server.accept(self.io) catch return;
+            _ = self.connections.fetchAdd(1, .acq_rel);
+            defer conn.socket.close(self.io);
+
+            var rbuf: [8192]u8 = undefined;
+            var r = conn.reader(self.io, &rbuf);
+            var wbuf: [8192]u8 = undefined;
+            var w = conn.writer(self.io, &wbuf);
+
+            while (self.requests.load(.acquire) < self.expected_requests) {
+                var content_length: usize = 0;
+                var seen: [4]u8 = .{ 0, 0, 0, 0 };
+                var head: [8192]u8 = undefined;
+                var head_len: usize = 0;
+                while (true) {
+                    const b = r.interface.takeByte() catch return;
+                    if (head_len < head.len) {
+                        head[head_len] = b;
+                        head_len += 1;
+                    }
+                    seen[0] = seen[1];
+                    seen[1] = seen[2];
+                    seen[2] = seen[3];
+                    seen[3] = b;
+                    if (std.mem.eql(u8, &seen, "\r\n\r\n")) break;
+                }
+                if (std.ascii.indexOfIgnoreCase(head[0..head_len], "content-length:")) |pos| {
+                    const rest = head[pos + "content-length:".len .. head_len];
+                    const end = std.mem.indexOfScalar(u8, rest, '\r') orelse rest.len;
+                    content_length = std.fmt.parseInt(usize, std.mem.trim(u8, rest[0..end], " \t"), 10) catch 0;
+                }
+                var remaining = content_length;
+                while (remaining > 0) : (remaining -= 1) {
+                    _ = r.interface.takeByte() catch return;
+                }
+
+                w.interface.writeAll(self.response) catch return;
+                w.interface.flush() catch return;
+                _ = self.requests.fetchAdd(1, .acq_rel);
+            }
+        }
+    }
+
+    pub fn wait(self: *KeepAliveServer) void {
+        while (!self.done.load(.acquire)) std.Thread.yield() catch {};
+        if (self.thread) |t| t.join();
+        self.thread = null;
+    }
+
+    pub fn stop(self: *KeepAliveServer) void {
+        self.server.deinit(self.io);
+    }
+};
+
+test "session-scoped client reuses one keep-alive connection (B-02)" {
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" ++
+        "data\n";
+    const srv = try KeepAliveServer.start(io, arena, body, 2);
+    defer srv.stop();
+
+    // One client, two requests: what a session does (B-02).
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = io };
+    defer client.deinit();
+    var cancel = std.atomic.Value(bool).init(false);
+    const base = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}", .{srv.port});
+
+    for (0..2) |_| {
+        var collector = Collector{ .arena = arena };
+        try openai_adapter.streamFn(undefined, arena, io, .{
+            .model = "test-model",
+            .base_url = base,
+            .api_key = "",
+            .system = "",
+            .messages = &.{},
+            .cancel = &cancel,
+            .client = if (true) @as(?*std.http.Client, null) else &client,
+        }, .{ .ctx = &collector, .emit_fn = Collector.emit });
+        try std.testing.expect(collector.done);
+    }
+    srv.wait();
+    try std.testing.expectEqual(@as(usize, 2), srv.requests.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), srv.connections.load(.acquire));
+}
