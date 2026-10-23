@@ -8,6 +8,7 @@
 const std = @import("std");
 const provider = @import("provider.zig");
 const sse = @import("sse.zig");
+const transport = @import("transport.zig");
 
 const anthropic_version = "2023-06-01";
 const transfer_buffer_size: usize = 16 * 1024;
@@ -37,28 +38,46 @@ pub fn streamFn(
         .{ .name = "accept", .value = "text/event-stream" },
     };
 
-    var creq = try client.request(.POST, uri, .{
+    const connection = transport.openConnection(&client, uri, transport.default_limits) catch |err| {
+        sink.emit(.{ .failure = transport.failureFor(err, null) });
+        return;
+    };
+    var creq = client.request(.POST, uri, .{
         .headers = .{
             .authorization = .omit,
             .content_type = .{ .override = "application/json" },
         },
         .extra_headers = &extra,
         .redirect_behavior = .unhandled,
-    });
+        .connection = connection,
+    }) catch |err| {
+        const failure = transport.failureFor(err, connection);
+        client.connection_pool.release(connection, io);
+        sink.emit(.{ .failure = failure });
+        return;
+    };
     defer creq.deinit();
 
-    try creq.sendBodyComplete(@constCast(body));
+    creq.sendBodyComplete(@constCast(body)) catch |err| {
+        sink.emit(.{ .failure = transport.failureFor(err, creq.connection) });
+        return;
+    };
 
     var redirect_buf: [8192]u8 = undefined;
-    var response = try creq.receiveHead(&redirect_buf);
+    var response = creq.receiveHead(&redirect_buf) catch |err| {
+        sink.emit(.{ .failure = transport.failureFor(err, creq.connection) });
+        return;
+    };
 
     if (response.head.status.class() != .success) {
         var err_body: [16 * 1024]u8 = undefined;
         const r = response.reader(&err_body);
         const text = r.allocRemaining(arena, .limited(16 * 1024)) catch "";
+        const now_s: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_s));
         sink.emit(.{ .failure = .{
             .kind = provider.failureKindForStatus(@intFromEnum(response.head.status)),
             .message = extractErrorMessage(arena, text) catch text,
+            .retry_after_s = transport.retryAfterFromHead(response.head, now_s),
         } });
         return;
     }
@@ -78,7 +97,12 @@ pub fn streamFn(
     var input_tokens: u64 = 0;
     var output_tokens: u64 = 0;
 
-    while (try parser.next(arena)) |payload| {
+    while (true) {
+        const maybe_payload = parser.next(arena) catch |err| {
+            sink.emit(.{ .failure = transport.failureFor(err, creq.connection) });
+            return;
+        };
+        const payload = maybe_payload orelse break;
         if (req.cancel.load(.acquire)) {
             sink.emit(.{ .failure = .{ .kind = .cancelled, .message = "cancelled" } });
             return;

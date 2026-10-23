@@ -250,6 +250,13 @@ pub fn run(
 
 // ---------------------------------------------------------------- turn flow
 
+/// Remove an unanswered turn from in-memory history and mark the persisted
+/// turn interrupted so replay drops it too (A-05).
+fn rollbackTurn(sess: *Session, history_start: usize) void {
+    sess.history.shrinkRetainingCapacity(history_start);
+    _ = sess.store.append(.interrupted) catch {};
+}
+
 fn submitTurn(
     io: std.Io,
     arena: std.mem.Allocator,
@@ -269,9 +276,6 @@ fn submitTurn(
         const key_env = cfg.getOptionalString("model.api_key_env") orelse "OPENAI_API_KEY";
         try out(io, "note: no api key — run /provider key {s} <value> (or export it) before sending a message\n", .{key_env});
     }
-
-    _ = try sess.store.append(.{ .user = .{ .text = user_text } });
-    try sess.history.append(arena, .{ .role = .user, .content = user_text });
 
     var cancel = std.atomic.Value(bool).init(false);
     var approver = Approver{ .io = io, .engine = &sess.engine };
@@ -402,6 +406,12 @@ fn submitTurn(
         }
     }
 
+    // Append the user message only after compaction and hooks, so the
+    // rollback snapshot is never invalidated by history rewriting.
+    const history_start = sess.history.items.len;
+    _ = try sess.store.append(.{ .user = .{ .text = user_text } });
+    try sess.history.append(arena, .{ .role = .user, .content = user_text });
+
     const outcome = agent_engine.runTurn(.{
         .io = io,
         .arena = arena,
@@ -421,6 +431,7 @@ fn submitTurn(
         .max_retries = cfg.getU32("agents.max_retries", 3),
         .redactions = redactionsFor(arena, pcfg.api_key),
     }) catch |err| {
+        rollbackTurn(sess, history_start);
         try out(io, "\nturn failed: {s}\n", .{@errorName(err)});
         return;
     };
@@ -432,6 +443,7 @@ fn submitTurn(
             _ = try sess.store.append(.{ .assistant = .{ .text = outcome.reply } });
         },
         .failed => {
+            rollbackTurn(sess, history_start);
             try out(io, "{s}provider error: {s}{s}\n", .{ palette.err("", arena), outcome.error_message, "\x1b[0m" });
             if (@import("../providers/probe.zig").looksLikeToolRejection(outcome.error_message)) {
                 try out(io, "{s}hint: this model may not support tool calling. Set it up as chat-only with /provider tools off{s}\n", .{ palette.warn("", arena), "\x1b[0m" });
@@ -439,8 +451,8 @@ fn submitTurn(
             _ = try sess.store.append(.{ .note = .{ .text = outcome.error_message } });
         },
         .cancelled => {
+            rollbackTurn(sess, history_start);
             try out(io, "(interrupted)\n", .{});
-            _ = try sess.store.append(.interrupted);
         },
     }
     if (outcome.usage.input_tokens > 0 or outcome.usage.output_tokens > 0) {
@@ -561,22 +573,46 @@ const Approver = struct {
 
 fn rebuildHistory(arena: std.mem.Allocator, sess: *Session) !void {
     const events = try sess.store.readEvents(arena, 10_000);
+    var turn_start: ?usize = null;
+    var saw_assistant = false;
     for (events) |ev| {
         switch (ev.event) {
-            .user => |v| try sess.history.append(arena, .{ .role = .user, .content = v.text }),
-            .assistant => |v| try sess.history.append(arena, .{
-                .role = .assistant,
-                .content = v.text,
-                .tool_calls_json = v.tool_calls_json,
-            }),
+            .user => |v| {
+                // A new user message after an unanswered turn means the
+                // previous turn never produced an assistant reply.
+                if (turn_start) |start| {
+                    if (!saw_assistant) sess.history.shrinkRetainingCapacity(start);
+                }
+                turn_start = sess.history.items.len;
+                saw_assistant = false;
+                try sess.history.append(arena, .{ .role = .user, .content = v.text });
+            },
+            .assistant => |v| {
+                saw_assistant = true;
+                try sess.history.append(arena, .{
+                    .role = .assistant,
+                    .content = v.text,
+                    .tool_calls_json = v.tool_calls_json,
+                });
+            },
             .tool_call => {},
             .tool_result => |v| try sess.history.append(arena, .{
                 .role = .tool,
                 .content = v.output,
                 .tool_call_id = v.call_id,
             }),
-            .note, .interrupted => {},
+            .note => {},
+            .interrupted => {
+                if (turn_start) |start| sess.history.shrinkRetainingCapacity(start);
+                turn_start = null;
+                saw_assistant = false;
+            },
         }
+    }
+    // A trailing user message with no assistant reply is an unfinished turn
+    // from an older session or a crash; do not replay it.
+    if (turn_start) |start| {
+        if (!saw_assistant) sess.history.shrinkRetainingCapacity(start);
     }
 }
 

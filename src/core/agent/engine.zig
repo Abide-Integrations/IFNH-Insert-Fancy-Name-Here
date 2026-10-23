@@ -13,6 +13,18 @@ const tool_mod = @import("../../tools/tool.zig");
 const redact_mod = @import("../redact.zig");
 
 pub const max_tool_rounds_default: usize = 25;
+/// Upper bound on a server-provided `Retry-After` delay. Keeps a misbehaving
+/// or hostile endpoint from stalling a turn indefinitely.
+pub const max_retry_after_s: u64 = 60;
+
+/// Delay before the next provider attempt. `Retry-After` wins over the
+/// exponential backoff and is capped; otherwise backoff doubles from 1 s and
+/// caps at 16 s.
+pub fn retryDelaySeconds(attempt: usize, retry_after_s: ?u32) u64 {
+    if (retry_after_s) |seconds| return @min(@as(u64, seconds), max_retry_after_s);
+    const shift: u6 = @intCast(@min(attempt, 4));
+    return @min(@as(u64, 1) << shift, 16);
+}
 
 pub const ProviderConfig = struct {
     provider: provider_mod.Provider,
@@ -177,10 +189,10 @@ pub fn runTurn(p: RunParams) !Outcome {
                 .cancel = p.cancel,
             }, .{ .ctx = &collector, .emit_fn = sinkEmit });
             if (collector.failure) |f| {
-                if (core_types.isRetryable(f.kind) and attempt < p.max_retries and !p.cancel.load(.acquire)) {
-                    const shift: u6 = @intCast(@min(attempt, 4));
-                    const delay_s: u64 = @min(@as(u64, 1) << shift, 16);
-                    sleepSeconds(p.io, delay_s) catch break;
+                if (core_types.isRetryable(f.kind) and attempt < p.max_retries and
+                    collector.text.items.len == 0 and !p.cancel.load(.acquire))
+                {
+                    sleepSeconds(p.io, retryDelaySeconds(attempt, f.retry_after_s)) catch break;
                     continue;
                 }
             }
@@ -621,4 +633,48 @@ test "consecutive agent calls run in parallel and append in order" {
     const r2 = history.items[3].content;
     try std.testing.expect(std.mem.indexOf(u8, r1, "child-one") != null);
     try std.testing.expect(std.mem.indexOf(u8, r2, "child-two") != null);
+}
+
+test "retry delay honors Retry-After and caps backoff" {
+    try std.testing.expectEqual(@as(u64, 5), retryDelaySeconds(0, 5));
+    try std.testing.expectEqual(@as(u64, 60), retryDelaySeconds(3, 600));
+    try std.testing.expectEqual(@as(u64, 1), retryDelaySeconds(0, null));
+    try std.testing.expectEqual(@as(u64, 8), retryDelaySeconds(3, null));
+    try std.testing.expectEqual(@as(u64, 16), retryDelaySeconds(9, null));
+}
+
+test "partial stream failure is not retried" {
+    var fake = testing.Fake{ .script = &.{
+        &.{
+            .{ .text = "partial" },
+            .{ .failure = .{ .kind = .network, .message = "connection dropped" } },
+        },
+        &.{.{ .text = "must not run" }},
+    } };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var history: std.ArrayListUnmanaged(core_types.ChatMessage) = .empty;
+    try history.append(arena, .{ .role = .user, .content = "hi" });
+    var cancel = std.atomic.Value(bool).init(false);
+
+    const outcome = try runTurn(.{
+        .arena = arena,
+        .io = std.testing.io,
+        .pcfg = .{ .provider = fake.provider(), .model = "fake", .base_url = "", .api_key = "" },
+        .history = &history,
+        .cancel = &cancel,
+        .callbacks = .{
+            .ctx = undefined,
+            .on_text = noopText,
+            .on_tool_start = noopStart,
+            .on_tool_result = noopResult,
+            .on_notice = noopNotice,
+        },
+    });
+
+    try std.testing.expectEqual(Status.failed, outcome.status);
+    try std.testing.expectEqualStrings("partial", outcome.reply);
+    try std.testing.expectEqual(@as(usize, 1), fake.call_index);
 }

@@ -55,7 +55,7 @@
 |---|---|---|---|---|
 | M0-T16 | `providers/provider.zig` contract + `EventSink` + capability descriptor | M0-T04 | `[x]` | fn-pointer struct per DESIGN |
 | M0-T17 | `providers/sse.zig`: bounded SSE parser (UTF-8 safe, max event/total bytes, cancel checks) | M0-T16 | `[x]` | 5 tests; std fixed-reader quirk worked around (takeByte state machine) |
-| M0-T18 | `providers/transport.zig`: std.http wrapper, deadlines, cancel flag, retry/backoff/Retry-After, delivery certainty | M0-T16 | `[~]` | std.http streaming wired in adapters w/ status mapping; retry/backoff policy deferred to M1 |
+| M0-T18 | `providers/transport.zig`: std.http wrapper, deadlines, cancel flag, retry/backoff/Retry-After, delivery certainty | M0-T16 | `[~]` | A-05 landed (awaiting owner verification): connect/idle limits, adapter `.failure` conversion, Retry-After parsing, engine backoff; delivery certainty still open |
 | M0-T19 | `providers/openai.zig`: chat-completions adapter (streaming + tool calls + usage), config-driven base_url | M0-T18 | `[x]` | tool-call accumulation by index; [DONE] handling |
 | M0-T20 | `providers/anthropic.zig`: messages adapter (streaming + tool use + usage) | M0-T18 | `[x]` | tool_result user blocks; input_json_delta accumulation |
 | M0-T21 | `tests/fake_provider.zig` + `tests/fake_server.zig` (in-process, canned responses) | M0-T16 | `[~]` | fake provider (`core/agent/testing.zig`) done + drives engine tests; fake HTTP server for adapter e2e deferred (M1-T15) |

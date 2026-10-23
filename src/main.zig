@@ -486,6 +486,7 @@ test {
     _ = @import("core/permissions/engine.zig");
     _ = @import("tools/tool.zig");
     _ = @import("providers/provider.zig");
+    _ = @import("providers/transport.zig");
     _ = @import("providers/sse.zig");
     _ = @import("providers/openai.zig");
     _ = @import("providers/anthropic.zig");
