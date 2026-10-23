@@ -427,8 +427,36 @@ fn grepDir(
 }
 
 fn grepFile(ctx: *ToolContext, rel: []const u8, pattern: []const u8, limits: *WalkLimits, out: *std.ArrayListUnmanaged(u8)) void {
+    // Stream line by line (B-05): no whole-file allocation, so scanning a
+    // large tree does not grow the per-call arena by 1 MiB per file.
+    var file = ctx.workspace.openFile(ctx.io, rel, .{}) catch return;
+    defer file.close(ctx.io);
+    var buf: [64 * 1024]u8 = undefined;
+    var fr = file.reader(ctx.io, &buf);
+    var line_no: usize = 0;
+    var file_hits: usize = 0;
+    while (true) {
+        const line_raw = fr.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
+            error.EndOfStream => return,
+            // Pathological long line: fall back to the bounded whole-file path.
+            error.StreamTooLong => return grepFileWhole(ctx, rel, pattern, limits, out),
+            else => return,
+        };
+        const line = std.mem.trimEnd(u8, line_raw, "\r\n");
+        if (!std.unicode.utf8ValidateSlice(line)) return; // skip binary
+        if (file_hits < 10 and limits.max_matches > 0 and std.mem.indexOf(u8, line, pattern) != null) {
+            out.print(ctx.arena, "{s}:{d}: {s}\n", .{ rel, line_no + 1, line }) catch return;
+            file_hits += 1;
+            limits.max_matches -= 1;
+        }
+        if (file_hits >= 10 or limits.max_matches == 0) return;
+        line_no += 1;
+    }
+}
+
+fn grepFileWhole(ctx: *ToolContext, rel: []const u8, pattern: []const u8, limits: *WalkLimits, out: *std.ArrayListUnmanaged(u8)) void {
     const data = ctx.workspace.readFileAlloc(ctx.io, rel, ctx.arena, .limited(max_file_size_bytes)) catch return;
-    if (!std.unicode.utf8ValidateSlice(data)) return; // skip binary
+    if (!std.unicode.utf8ValidateSlice(data)) return;
     var lines = std.mem.splitScalar(u8, data, '\n');
     var line_no: usize = 0;
     var file_hits: usize = 0;

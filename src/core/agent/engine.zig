@@ -480,7 +480,14 @@ fn isAgentCall(tc: core_types.ToolCall) bool {
 }
 
 fn executeOne(p: RunParams, tc: core_types.ToolCall) tool_mod.ToolResult {
-    const raw = tool_mod.execute(tc.name, tc.arguments_json, p.tool_ctx);
+    // Per-call scratch arena (B-05): tool intermediates (file bodies, glob
+    // lists) are freed before the next call; only the final output is copied
+    // into the turn arena.
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    var ctx = p.tool_ctx.*;
+    ctx.arena = arena_state.allocator();
+    const raw = tool_mod.execute(tc.name, tc.arguments_json, &ctx);
     return .{
         .output = redact_mod.redact(p.arena, raw.output, p.redactions),
         .status = raw.status,
