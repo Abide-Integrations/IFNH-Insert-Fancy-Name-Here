@@ -48,4 +48,20 @@ pub fn build(b: *std.Build) void {
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+
+    // `zig build bench`: offline engine timings against the fake provider
+    // (B-09). No network or API key; scripts/bench.sh wraps it with the
+    // process-level cold-start and RSS measurements.
+    const bench_module = b.createModule(.{
+        .root_source_file = b.path("src/bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const bench_exe = b.addExecutable(.{
+        .name = "ifnh-bench",
+        .root_module = bench_module,
+    });
+    const run_bench = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("bench", "Run offline engine benchmarks (fake provider)");
+    bench_step.dependOn(&run_bench.step);
 }
