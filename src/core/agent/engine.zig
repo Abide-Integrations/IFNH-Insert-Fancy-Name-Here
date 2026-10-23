@@ -40,6 +40,8 @@ pub const Outcome = struct {
     reply: []const u8,
     tool_rounds: usize = 0,
     tool_calls: usize = 0,
+    /// Read-only batches that ran concurrently (observability for tests/trace).
+    parallel_batches: usize = 0,
     usage: core_types.Usage = .{},
     error_message: []const u8 = "",
 };
@@ -150,11 +152,12 @@ pub fn runTurn(p: RunParams) !Outcome {
     var total_usage = core_types.Usage{};
     var rounds: usize = 0;
     var total_calls: usize = 0;
+    var parallel_batches: usize = 0;
     var last_reply: []const u8 = "";
 
     while (rounds < p.max_tool_rounds) : (rounds += 1) {
         if (p.cancel.load(.acquire)) {
-            return .{ .status = .cancelled, .reply = last_reply, .tool_rounds = rounds, .tool_calls = total_calls, .usage = total_usage };
+            return .{ .status = .cancelled, .reply = last_reply, .tool_rounds = rounds, .tool_calls = total_calls, .parallel_batches = parallel_batches, .usage = total_usage };
         }
 
         var collector = Collector{ .arena = p.arena, .callbacks = p.callbacks };
@@ -196,6 +199,7 @@ pub fn runTurn(p: RunParams) !Outcome {
                 .reply = last_reply,
                 .tool_rounds = rounds,
                 .tool_calls = total_calls,
+                .parallel_batches = parallel_batches,
                 .usage = total_usage,
                 .error_message = f.message,
             };
@@ -206,7 +210,7 @@ pub fn runTurn(p: RunParams) !Outcome {
 
         if (collector.tool_calls.items.len == 0) {
             try p.history.append(p.arena, .{ .role = .assistant, .content = reply });
-            return .{ .status = .completed, .reply = reply, .tool_rounds = rounds + 1, .tool_calls = total_calls, .usage = total_usage };
+            return .{ .status = .completed, .reply = reply, .tool_rounds = rounds + 1, .tool_calls = total_calls, .parallel_batches = parallel_batches, .usage = total_usage };
         }
 
         // Assistant message with tool calls; remember calls for the wire.
@@ -232,55 +236,43 @@ pub fn runTurn(p: RunParams) !Outcome {
             .tool_calls_json = tc_json,
         });
 
-        // Execute tool calls; consecutive `agent` calls run in parallel
-        // (E58), everything else sequentially, results appended in order.
+        // Execute tool calls. Consecutive read-only calls (read/glob/grep) and
+        // consecutive `agent` calls run in parallel (DESIGN §6, DECISIONS E58);
+        // everything else is sequential. Results are appended in call order.
         const calls = collector.tool_calls.items;
         var i: usize = 0;
         while (i < calls.len) {
             if (p.cancel.load(.acquire)) {
-                return .{ .status = .cancelled, .reply = last_reply, .tool_rounds = rounds, .tool_calls = total_calls, .usage = total_usage };
+                return .{ .status = .cancelled, .reply = last_reply, .tool_rounds = rounds, .tool_calls = total_calls, .parallel_batches = parallel_batches, .usage = total_usage };
             }
-            if (isAgentCall(calls[i])) {
+            if (isReadOnlyCall(calls[i])) {
+                var j = i + 1;
+                while (j < calls.len and isReadOnlyCall(calls[j])) j += 1;
+                const batch = calls[i..j];
+                if (batch.len > 1) {
+                    const results = try runParallelBatch(p, batch);
+                    parallel_batches += 1;
+                    for (batch, results) |tc, result| try recordResult(p, tc, result);
+                } else {
+                    try recordResult(p, batch[0], executeOne(p, batch[0]));
+                }
+                total_calls += batch.len;
+                i = j;
+            } else if (isAgentCall(calls[i])) {
                 var j = i + 1;
                 while (j < calls.len and isAgentCall(calls[j])) j += 1;
                 const batch = calls[i..j];
-                const results = if (batch.len > 1)
-                    try runAgentBatch(p, batch)
-                else blk: {
-                    const one = try p.arena.alloc(tool_mod.ToolResult, 1);
-                    one[0] = executeOne(p, batch[0]);
-                    total_calls += 1;
-                    break :blk one;
-                };
-                for (batch, results) |tc, result| {
-                    p.callbacks.on_tool_start(p.callbacks.ctx, tc.name, tc.arguments_json);
-                    p.callbacks.on_tool_result(p.callbacks.ctx, tc.name, result.status, result.output);
-                    if (result.status == .denied) {
-                        p.callbacks.on_notice(p.callbacks.ctx, result.output);
-                    }
-                    try p.history.append(p.arena, .{
-                        .role = .tool,
-                        .content = result.output,
-                        .tool_call_id = tc.id,
-                        .tool_name = tc.name,
-                    });
+                if (batch.len > 1) {
+                    const results = try runParallelBatch(p, batch);
+                    for (batch, results) |tc, result| try recordResult(p, tc, result);
+                } else {
+                    try recordResult(p, batch[0], executeOne(p, batch[0]));
                 }
                 total_calls += batch.len;
                 i = j;
             } else {
-                const result = executeOne(p, calls[i]);
+                try recordResult(p, calls[i], executeOne(p, calls[i]));
                 total_calls += 1;
-                p.callbacks.on_tool_start(p.callbacks.ctx, calls[i].name, calls[i].arguments_json);
-                p.callbacks.on_tool_result(p.callbacks.ctx, calls[i].name, result.status, result.output);
-                if (result.status == .denied) {
-                    p.callbacks.on_notice(p.callbacks.ctx, result.output);
-                }
-                try p.history.append(p.arena, .{
-                    .role = .tool,
-                    .content = result.output,
-                    .tool_call_id = calls[i].id,
-                    .tool_name = calls[i].name,
-                });
                 i += 1;
             }
         }
@@ -412,6 +404,75 @@ test "runTurn executes scripted tool call and feeds result back" {
     _ = &outcome;
 }
 
+test "parallel read-only batch preserves call order" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "alpha\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "bravo\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "c.txt", .data = "charlie\n" });
+
+    var fake = testing.Fake{ .script = &.{
+        &.{
+            .{ .tool_call = .{ .id = "r1", .name = "read", .arguments_json = "{\"path\":\"a.txt\"}" } },
+            .{ .tool_call = .{ .id = "r2", .name = "read", .arguments_json = "{\"path\":\"b.txt\"}" } },
+            .{ .tool_call = .{ .id = "r3", .name = "read", .arguments_json = "{\"path\":\"c.txt\"}" } },
+        },
+        &.{.{ .text = "all read" }},
+    } };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var perm_engine = @import("../permissions/engine.zig").Engine.init(arena, .auto);
+    var tool_ctx: tool_mod.ToolContext = .{
+        .io = io,
+        .arena = arena,
+        .workspace = tmp.dir,
+        .engine = &perm_engine,
+        .journal = null,
+        .max_file_read_bytes = 64 * 1024,
+        .approval_ctx = undefined,
+        .approval_fn = struct {
+            fn approve(_: *anyopaque, _: tool_mod.ApprovalRequest) tool_mod.ApprovalResponse {
+                return .denied;
+            }
+        }.approve,
+    };
+    var history: std.ArrayListUnmanaged(core_types.ChatMessage) = .empty;
+    try history.append(arena, .{ .role = .user, .content = "read three files" });
+    var cancel = std.atomic.Value(bool).init(false);
+
+    const outcome = try runTurn(.{
+        .io = io,
+        .arena = arena,
+        .pcfg = .{ .provider = fake.provider(), .model = "fake", .base_url = "", .api_key = "" },
+        .system = "",
+        .history = &history,
+        .tool_ctx = &tool_ctx,
+        .callbacks = .{
+            .ctx = undefined,
+            .on_text = noopText,
+            .on_tool_start = noopStart,
+            .on_tool_result = noopResult,
+            .on_notice = noopNotice,
+        },
+        .cancel = &cancel,
+    });
+
+    try std.testing.expectEqual(Status.completed, outcome.status);
+    try std.testing.expectEqual(@as(usize, 3), outcome.tool_calls);
+    try std.testing.expectEqual(@as(usize, 1), outcome.parallel_batches);
+    // Results land in the original call order (not completion order).
+    try std.testing.expect(std.mem.indexOf(u8, history.items[2].content, "alpha") != null);
+    try std.testing.expect(std.mem.indexOf(u8, history.items[3].content, "bravo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, history.items[4].content, "charlie") != null);
+    try std.testing.expectEqualStrings("r1", history.items[2].tool_call_id.?);
+    try std.testing.expectEqualStrings("r2", history.items[3].tool_call_id.?);
+    try std.testing.expectEqualStrings("r3", history.items[4].tool_call_id.?);
+}
+
 test "runTurn surfaces provider failure" {
     const io = std.testing.io;
     var fake = testing.Fake{ .script = &.{
@@ -459,6 +520,27 @@ fn isAgentCall(tc: core_types.ToolCall) bool {
     return std.mem.eql(u8, tc.name, "agent");
 }
 
+/// Read-only tools can run concurrently without approvals or journal writes.
+fn isReadOnlyCall(tc: core_types.ToolCall) bool {
+    return std.mem.eql(u8, tc.name, "read") or
+        std.mem.eql(u8, tc.name, "glob") or
+        std.mem.eql(u8, tc.name, "grep");
+}
+
+fn recordResult(p: RunParams, tc: core_types.ToolCall, result: tool_mod.ToolResult) !void {
+    p.callbacks.on_tool_start(p.callbacks.ctx, tc.name, tc.arguments_json);
+    p.callbacks.on_tool_result(p.callbacks.ctx, tc.name, result.status, result.output);
+    if (result.status == .denied) {
+        p.callbacks.on_notice(p.callbacks.ctx, result.output);
+    }
+    try p.history.append(p.arena, .{
+        .role = .tool,
+        .content = result.output,
+        .tool_call_id = tc.id,
+        .tool_name = tc.name,
+    });
+}
+
 fn executeOne(p: RunParams, tc: core_types.ToolCall) tool_mod.ToolResult {
     // Tool arguments, scratch files and intermediate output live only for this
     // call. Copy the final, redacted result into the long-lived history arena.
@@ -474,9 +556,9 @@ fn executeOne(p: RunParams, tc: core_types.ToolCall) tool_mod.ToolResult {
     return .{ .output = output, .status = raw.status };
 }
 
-/// Run consecutive agent calls on parallel threads, each with its own
-/// arena and ToolContext copy; results are ordered on return.
-fn runAgentBatch(p: RunParams, calls: []const core_types.ToolCall) ![]tool_mod.ToolResult {
+/// Run a tool batch on parallel threads, each call with its own arena and
+/// ToolContext copy; results are ordered on return.
+fn runParallelBatch(p: RunParams, calls: []const core_types.ToolCall) ![]tool_mod.ToolResult {
     const Slot = struct {
         thread: ?std.Thread = null,
         arena_state: ?std.heap.ArenaAllocator = null,
@@ -492,7 +574,8 @@ fn runAgentBatch(p: RunParams, calls: []const core_types.ToolCall) ![]tool_mod.T
             var ctx = params.tool_ctx.*;
             ctx.arena = arena_state.allocator();
             const raw = tool_mod.execute(tc.name, tc.arguments_json, &ctx);
-            slot.result = raw;
+            const redacted = redact_mod.redact(ctx.arena, raw.output, params.redactions);
+            slot.result = .{ .output = redacted, .status = raw.status };
             slot.arena_state = arena_state; // handed back for ordered copy
             slot.done.store(true, .release);
         }
@@ -500,10 +583,7 @@ fn runAgentBatch(p: RunParams, calls: []const core_types.ToolCall) ![]tool_mod.T
 
     var spawned: usize = 0;
     for (calls, slots) |tc, *slot| {
-        slot.thread = std.Thread.spawn(.{}, Worker.run, .{ p, tc, slot }) catch {
-            slot.done.store(true, .release); // runs inline below
-            continue;
-        };
+        slot.thread = std.Thread.spawn(.{}, Worker.run, .{ p, tc, slot }) catch continue; // runs inline below
         spawned += 1;
     }
     // Inline any that failed to spawn.
@@ -516,9 +596,7 @@ fn runAgentBatch(p: RunParams, calls: []const core_types.ToolCall) ![]tool_mod.T
     for (slots) |*slot| {
         if (slot.thread) |t| t.join();
         var arena_state = slot.arena_state orelse continue;
-        const output = arena_state.allocator().dupe(u8, slot.result.output) catch slot.result.output;
-        const out_copy = p.arena.dupe(u8, output) catch output;
-        slot.result.output = out_copy;
+        slot.result.output = p.arena.dupe(u8, slot.result.output) catch "error: out of memory";
         arena_state.deinit();
         slot.arena_state = null;
     }
