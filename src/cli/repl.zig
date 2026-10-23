@@ -404,7 +404,10 @@ fn submitTurn(
 
     // ---- automatic context compaction (C36, PLAN §24) ----
     if (cfg.getBool("context.auto_compact", true)) {
-        const threshold: usize = cfg.getU32("context.max_context_tokens", 96_000);
+        // The provider's advertised window is folded into
+        // `context.max_context_tokens` by first-run setup, so only the
+        // configured budget is consulted here.
+        const threshold = compaction_mod.thresholdTokens(cfg.getOptionalU32("context.max_context_tokens"), null);
         const plan = compaction_mod.planCompaction(sess.history.items, threshold, cfg.getF64("context.compact_at_fraction", 0.8));
         if (plan.should_compact) {
             try out(io, "[compacting context... {d} tokens]\n", .{plan.estimated_tokens});
