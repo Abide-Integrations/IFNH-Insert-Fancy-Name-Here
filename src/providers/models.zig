@@ -22,6 +22,33 @@ pub const Result = union(enum) {
     failure: []const u8,
 };
 
+/// Per-model output-token defaults (B-10). Used only when the config leaves
+/// `model.max_output_tokens` unset; an explicit config value always wins.
+/// Values are deliberately conservative: enough for a full edit, below the
+/// smallest published ceiling for the family. Unknown models return null so
+/// adapters keep their previous behaviour.
+pub fn defaultMaxOutputTokens(model: []const u8) ?u32 {
+    const Entry = struct { needle: []const u8, tokens: u32 };
+    const entries = [_]Entry{
+        .{ .needle = "claude-3-5-sonnet", .tokens = 8192 },
+        .{ .needle = "claude-3-5-haiku", .tokens = 8192 },
+        .{ .needle = "claude-3-7-sonnet", .tokens = 8192 },
+        .{ .needle = "claude-sonnet-4", .tokens = 16384 },
+        .{ .needle = "claude-opus-4", .tokens = 16384 },
+        .{ .needle = "claude-haiku-4", .tokens = 8192 },
+        .{ .needle = "claude", .tokens = 8192 },
+        .{ .needle = "gpt-5", .tokens = 32768 },
+        .{ .needle = "gpt-4.1", .tokens = 32768 },
+        .{ .needle = "gpt-4o", .tokens = 16384 },
+        .{ .needle = "o1", .tokens = 32768 },
+        .{ .needle = "o3", .tokens = 32768 },
+    };
+    for (entries) |e| {
+        if (std.mem.indexOf(u8, model, e.needle) != null) return e.tokens;
+    }
+    return null;
+}
+
 /// Fetch the model list. `is_anthropic` selects header style.
 pub fn fetchModels(
     arena: std.mem.Allocator,
@@ -160,4 +187,12 @@ test "model list url construction" {
     try std.testing.expectEqualStrings("https://openrouter.ai/api/v1/models", modelListUrl(a, "https://openrouter.ai/api/v1", false));
     try std.testing.expectEqualStrings("http://localhost:11434/v1/models", modelListUrl(a, "http://localhost:11434/v1/", false));
     try std.testing.expectEqualStrings("https://api.anthropic.com/v1/models?limit=100", modelListUrl(a, "https://api.anthropic.com", true));
+}
+
+test "per-model output defaults and config override" {
+    try std.testing.expectEqual(@as(?u32, 16384), defaultMaxOutputTokens("claude-sonnet-4-5"));
+    try std.testing.expectEqual(@as(?u32, 8192), defaultMaxOutputTokens("claude-3-5-haiku-20241022"));
+    try std.testing.expectEqual(@as(?u32, 32768), defaultMaxOutputTokens("openai/gpt-4.1"));
+    try std.testing.expectEqual(@as(?u32, 16384), defaultMaxOutputTokens("gpt-4o"));
+    try std.testing.expectEqual(@as(?u32, null), defaultMaxOutputTokens("local-unknown"));
 }

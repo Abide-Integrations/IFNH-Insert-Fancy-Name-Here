@@ -9,6 +9,7 @@ const std = @import("std");
 const provider = @import("provider.zig");
 const sse = @import("sse.zig");
 const core_types = @import("../core/types.zig");
+const models = @import("models.zig");
 const trace = @import("../core/trace.zig");
 
 pub const default_context: Context = .{};
@@ -283,7 +284,8 @@ fn buildBody(arena: std.mem.Allocator, req: provider.ModelRequest) ![]u8 {
     if (req.temperature) |t| {
         try w.print(",\"temperature\":{d}", .{t});
     }
-    if (req.max_output_tokens) |t| {
+    const max_out = req.max_output_tokens orelse models.defaultMaxOutputTokens(req.model);
+    if (max_out) |t| {
         try w.print(",\"max_tokens\":{d}", .{t});
     }
     if (req.provider_options.len > 0) {

@@ -213,7 +213,8 @@ fn buildBody(arena: std.mem.Allocator, req: provider.ModelRequest) ![]u8 {
 
     try w.writeAll("{\"model\":");
     try std.json.Stringify.value(req.model, .{}, w);
-    try w.print(",\"max_tokens\":{d},\"stream\":true", .{req.max_output_tokens orelse 4096});
+    const max_out = req.max_output_tokens orelse models.defaultMaxOutputTokens(req.model) orelse 4096;
+    try w.print(",\"max_tokens\":{d},\"stream\":true", .{max_out});
 
     if (req.system.len > 0) {
         const stable_len = @min(req.system_cache_prefix_len, req.system.len);
@@ -332,6 +333,50 @@ test "golden body: prompt cache breakpoint after stable prefix" {
     try std.testing.expectEqualStrings("ephemeral", blocks[0].object.get("cache_control").?.object.get("type").?.string);
     try std.testing.expectEqualStrings("\n\nVOLATILE SUFFIX", blocks[1].object.get("text").?.string);
     try std.testing.expect(blocks[1].object.get("cache_control") == null);
+}
+
+test "golden body: per-model max tokens and config override" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var cancel = std.atomic.Value(bool).init(false);
+
+    const body = try buildBody(a, .{
+        .model = "claude-sonnet-4-5",
+        .base_url = "",
+        .api_key = "",
+        .system = "",
+        .messages = &.{},
+        .cancel = &cancel,
+    });
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{});
+    try std.testing.expectEqual(@as(i64, 16384), v.object.get("max_tokens").?.integer);
+
+    // Explicit config wins over the table.
+    const body2 = try buildBody(a, .{
+        .model = "claude-sonnet-4-5",
+        .base_url = "",
+        .api_key = "",
+        .system = "",
+        .messages = &.{},
+        .max_output_tokens = 2048,
+        .cancel = &cancel,
+    });
+    const v2 = try std.json.parseFromSliceLeaky(std.json.Value, a, body2, .{});
+    try std.testing.expectEqual(@as(i64, 2048), v2.object.get("max_tokens").?.integer);
+
+    // Unknown Anthropic-compatible models keep the old 4096 fallback.
+    const body3 = try buildBody(a, .{
+        .model = "some-local-model",
+        .base_url = "",
+        .api_key = "",
+        .system = "",
+        .messages = &.{},
+        .cancel = &cancel,
+    });
+    const v3 = try std.json.parseFromSliceLeaky(std.json.Value, a, body3, .{});
+    try std.testing.expectEqual(@as(i64, 4096), v3.object.get("max_tokens").?.integer);
 }
 
 pub var instance_context: u8 = 0;
