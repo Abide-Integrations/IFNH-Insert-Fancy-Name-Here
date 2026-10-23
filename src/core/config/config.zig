@@ -68,6 +68,8 @@ pub const default_config_json =
     \\  "agents": {
     \\    "max_depth": 1,
     \\    "max_concurrent": 4,
+    \\    "max_retries": 3,
+    \\    "max_tool_rounds": 25,
     \\    "timeout_tool_s": 120,
     \\    "timeout_turn_s": 600
     \\  },
@@ -100,6 +102,47 @@ pub const default_config_json =
 pub const known_sections = [_][]const u8{
     "schema_version", "model",    "permissions", "git", "agents",
     "context",        "planning", "sessions",    "ui",  "debug",
+};
+
+/// Top-level keys consumed at runtime that have no builtin default value
+/// (optional features). They are valid and never warn.
+pub const extra_top_level_keys = [_][]const u8{ "hooks", "mcp_servers" };
+
+/// Section keys read by code that intentionally have no builtin default
+/// (feature-detected or derived values). They are valid and never warn.
+pub const extra_section_keys = [_][]const u8{
+    "model.provider_label",
+    "model.tools_enabled",
+    "context.max_context_tokens",
+};
+
+/// Defaults leaves read at runtime (A-T07). The test at the bottom of this
+/// file keeps this list and the defaults table in sync.
+pub const wired_defaults = [_][]const u8{
+    "model.provider",              "model.model",
+    "model.base_url",              "model.api_key_env",
+    "model.temperature",           "model.max_output_tokens",
+    "permissions.default_mode",    "permissions.read",
+    "permissions.write",           "permissions.command_allow",
+    "permissions.command_deny",    "permissions.env_allow",
+    "permissions.read_dotenv",     "git.commits",
+    "git.push",                    "git.force_push",
+    "agents.max_depth",            "agents.max_concurrent",
+    "agents.max_retries",          "agents.max_tool_rounds",
+    "agents.timeout_tool_s",       "context.auto_compact",
+    "context.compact_at_fraction", "context.max_file_read_bytes",
+    "sessions.dir",                "sessions.keep",
+    "ui.colors",                   "debug.redact",
+};
+
+/// Defaults leaves deliberately not read yet: each would need a feature that
+/// does not exist. Documented allowlist (A-T07), not a silent gap.
+pub const unwired_defaults = [_][]const u8{
+    "agents.timeout_turn_s", // no turn deadline yet (F-A06 follow-up)
+    "planning.auto_call_threshold", // planning auto-invocation not implemented
+    "ui.symbols", // no ascii/unicode symbol set yet
+    "ui.verbosity", // no verbosity levels yet
+    "debug.level", // std log level is comptime (`std_options`); no runtime logger
 };
 
 pub const Store = struct {
@@ -303,22 +346,54 @@ pub const Store = struct {
 
     /// Structural validation (DECISIONS B19/B20). Fills `errors` for hard
     /// failures; `warnings` for unknown keys.
+    /// Recursively compare the merged tree against the defaults schema,
+    /// warning on keys the schema does not know (A-T07).
+    fn validateKeys(self: *Store, value: std.json.Value, defaults: std.json.Value, prefix: []const u8) !void {
+        if (value != .object) return;
+        const arena = self.alloc();
+        var it = value.object.iterator();
+        loop: while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const path = if (prefix.len == 0)
+                key
+            else
+                try std.fmt.allocPrint(arena, "{s}.{s}", .{ prefix, key });
+            if (prefix.len == 0) {
+                for (known_sections) |known| {
+                    if (!std.mem.eql(u8, known, key)) continue;
+                    const no_default: std.json.Value = .{ .null = {} };
+                    const child = if (defaults == .object) defaults.object.get(key) orelse no_default else no_default;
+                    try self.validateKeys(entry.value_ptr.*, child, path);
+                    continue :loop;
+                }
+                for (extra_top_level_keys) |known| {
+                    if (std.mem.eql(u8, known, key)) continue :loop;
+                }
+            } else {
+                for (extra_section_keys) |known| {
+                    if (std.mem.eql(u8, known, path)) continue :loop;
+                }
+                if (defaults == .object) {
+                    if (defaults.object.get(key)) |child| {
+                        try self.validateKeys(entry.value_ptr.*, child, path);
+                        continue :loop;
+                    }
+                }
+            }
+            try self.warn("unknown config key '{s}' ignored", .{path});
+        }
+    }
+
     pub fn validate(self: *Store) !void {
         if (self.get("schema_version")) |v| {
             if (v != .integer or v.integer != 1) {
                 try self.addError("schema_version", "unsupported schema version (expected 1)", .{});
             }
         }
-        // Unknown top-level keys warn.
-        if (self.value == .object) {
-            var it = self.value.object.iterator();
-            outer: while (it.next()) |entry| {
-                for (known_sections) |known| {
-                    if (std.mem.eql(u8, known, entry.key_ptr.*)) continue :outer;
-                }
-                try self.warn("unknown config key '{s}' ignored", .{entry.key_ptr.*});
-            }
-        }
+        // Unknown keys warn, at any depth, with their full dotted path. The
+        // defaults table is the schema.
+        const defaults = try std.json.parseFromSliceLeaky(std.json.Value, self.alloc(), default_config_json, .{});
+        try self.validateKeys(self.value, defaults, "");
         // Security sections fail closed.
         const mode = self.getString("permissions.default_mode", "ask");
         if (!std.mem.eql(u8, mode, "ask") and !std.mem.eql(u8, mode, "auto")) {
@@ -579,6 +654,79 @@ test "security section fails closed on bad mode" {
     try store.validate();
     try std.testing.expect(store.errors.items.len == 1);
     try std.testing.expectEqualStrings("permissions.default_mode", store.errors.items[0].path);
+}
+
+test "validate warns on unknown keys at any depth with full path" {
+    var store = try Store.init(std.testing.allocator);
+    defer store.deinit();
+    const project_json =
+        \\{ "permissions": { "read_dotenv": true, "command_allowed": ["ls"] },
+        \\  "model": { "provider_label": "local" },
+        \\  "hooks": {}, "mcp_servers": {}, "bogus": 1 }
+    ;
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, store.alloc(), project_json, .{});
+    try store.mergeValue(v, .{ .layer = .project, .origin = ".ifnh/config.json" });
+    try store.validate();
+    try std.testing.expect(store.errors.items.len == 0);
+    var saw_nested = false;
+    var saw_top = false;
+    for (store.warnings.items) |w| {
+        if (std.mem.indexOf(u8, w, "permissions.command_allowed") != null) saw_nested = true;
+        if (std.mem.indexOf(u8, w, "bogus") != null) saw_top = true;
+    }
+    try std.testing.expect(saw_nested);
+    try std.testing.expect(saw_top);
+    // Real keys (including runtime-only ones) never warn.
+    for (store.warnings.items) |w| {
+        try std.testing.expect(std.mem.indexOf(u8, w, "provider_label") == null);
+        try std.testing.expect(std.mem.indexOf(u8, w, "hooks") == null);
+        try std.testing.expect(std.mem.indexOf(u8, w, "mcp_servers") == null);
+        try std.testing.expect(std.mem.indexOf(u8, w, "read_dotenv") == null);
+    }
+}
+
+test "every defaults key is wired or documented as unwired" {
+    var store = try Store.init(std.testing.allocator);
+    defer store.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var leaves: std.ArrayListUnmanaged([]const u8) = .empty;
+    try collectLeaves(arena_state.allocator(), store.value, "", &leaves);
+
+    for (leaves.items) |leaf| {
+        const known = std.mem.eql(u8, leaf, "schema_version") or
+            inList(&wired_defaults, leaf) or inList(&unwired_defaults, leaf);
+        if (!known) {
+            std.debug.print("defaults key '{s}' is neither wired nor in unwired_defaults\n", .{leaf});
+            return error.TestUnexpectedResult;
+        }
+    }
+    // Entries that are not defaults leaves are stale.
+    for (&wired_defaults) |key| try std.testing.expect(inList(leaves.items, key));
+    for (&unwired_defaults) |key| try std.testing.expect(inList(leaves.items, key));
+}
+
+fn inList(list: []const []const u8, key: []const u8) bool {
+    for (list) |item| {
+        if (std.mem.eql(u8, item, key)) return true;
+    }
+    return false;
+}
+
+fn collectLeaves(alloc: std.mem.Allocator, value: std.json.Value, prefix: []const u8, out: *std.ArrayListUnmanaged([]const u8)) !void {
+    if (value != .object) return;
+    var it = value.object.iterator();
+    while (it.next()) |entry| {
+        const path = if (prefix.len == 0)
+            try alloc.dupe(u8, entry.key_ptr.*)
+        else
+            try std.fmt.allocPrint(alloc, "{s}.{s}", .{ prefix, entry.key_ptr.* });
+        switch (entry.value_ptr.*) {
+            .object => try collectLeaves(alloc, entry.value_ptr.*, path, out),
+            else => try out.append(alloc, path),
+        }
+    }
 }
 
 test "setPath creates intermediate objects" {

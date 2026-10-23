@@ -120,7 +120,7 @@ pub fn run(
 
     // ---- session state (zero-config: lazily create .ifnh) ----
     ensureIfnh(io, cwd) catch {};
-    const sessions_dir_name = ".ifnh/sessions";
+    const sessions_dir_name = sessionsDir(arena, &cfg);
 
     var sess: Session = blk: {
         if (opts.resume_id) |id| {
@@ -293,13 +293,18 @@ fn submitTurn(
         .command_allow = sess.engine.command_allow,
         .command_deny = sess.engine.command_deny,
         .env_allow = sess.engine.env_allow,
+        .git_commits = sess.engine.git_commits,
+        .git_push = sess.engine.git_push,
+        .git_force_push = sess.engine.git_force_push,
+        .read_dotenv = sess.engine.read_dotenv,
+        .timeout_tool_s = cfg.getU32("agents.timeout_tool_s", 120),
         .journal = &sess.journal,
         .approval_ctx = &approver,
         .approval_fn = Approver.approve,
         .max_depth = cfg.getU32("agents.max_depth", 1),
         .max_concurrent = cfg.getU32("agents.max_concurrent", 4),
-        .max_rounds = 25,
-        .redactions = redactionsFor(arena, pcfg.api_key),
+        .max_rounds = cfg.getU32("agents.max_tool_rounds", 25),
+        .redactions = redactionsFor(arena, cfg.getBool("debug.redact", true), pcfg.api_key),
         .temperature = cfg.getOptionalF64("model.temperature"),
         .max_output_tokens = cfg.getOptionalU32("model.max_output_tokens"),
         .cancel = &cancel,
@@ -326,6 +331,7 @@ fn submitTurn(
         .engine = &sess.engine,
         .journal = &sess.journal,
         .max_file_read_bytes = cfg.getU32("context.max_file_read_bytes", 262144),
+        .timeout_s = cfg.getU32("agents.timeout_tool_s", 120),
         .approval_ctx = &approver,
         .approval_fn = Approver.approve,
         .agent_spawn_fn = subagent_mod.spawnHookFn,
@@ -390,7 +396,7 @@ fn submitTurn(
         if (plan.should_compact) {
             try out(io, "[compacting context... {d} tokens]\n", .{plan.estimated_tokens});
             const res_opt: ?compaction_mod.Result = blk: {
-                break :blk compaction_mod.compact(arena, io, pcfg, &sess.history, redactionsFor(arena, pcfg.api_key)) catch |err| {
+                break :blk compaction_mod.compact(arena, io, pcfg, &sess.history, redactionsFor(arena, cfg.getBool("debug.redact", true), pcfg.api_key)) catch |err| {
                     try out(io, "[compaction failed: {s}; continuing with full context]\n", .{@errorName(err)});
                     break :blk null;
                 };
@@ -429,7 +435,8 @@ fn submitTurn(
         .cancel = &cancel,
         .include_tools = cfg.getBool("model.tools_enabled", true),
         .max_retries = cfg.getU32("agents.max_retries", 3),
-        .redactions = redactionsFor(arena, pcfg.api_key),
+        .max_tool_rounds = cfg.getU32("agents.max_tool_rounds", 25),
+        .redactions = redactionsFor(arena, cfg.getBool("debug.redact", true), pcfg.api_key),
     }) catch |err| {
         rollbackTurn(sess, history_start);
         try out(io, "\nturn failed: {s}\n", .{@errorName(err)});
@@ -726,8 +733,8 @@ fn mcpCallHook(ctx: *anyopaque, arena: std.mem.Allocator, server: []const u8, to
     return res.text;
 }
 
-fn redactionsFor(arena: std.mem.Allocator, api_key: []const u8) []const []const u8 {
-    if (api_key.len < 8) return &.{};
+fn redactionsFor(arena: std.mem.Allocator, enabled: bool, api_key: []const u8) []const []const u8 {
+    if (!enabled or api_key.len < 8) return &.{};
     var list: std.ArrayListUnmanaged([]const u8) = .empty;
     list.append(arena, api_key) catch return &.{};
     return list.items;
@@ -1069,7 +1076,26 @@ fn engineFromConfig(arena: std.mem.Allocator, cfg: *config_mod.Store) engine_mod
     e.command_allow = cfg.getStringList("permissions.command_allow");
     e.command_deny = cfg.getStringList("permissions.command_deny");
     e.env_allow = cfg.getStringList("permissions.env_allow");
+    e.git_commits = gitPolicyFromConfig(cfg.getString("git.commits", "ask"), .ask);
+    e.git_push = gitPolicyFromConfig(cfg.getString("git.push", "never"), .never);
+    e.git_force_push = gitPolicyFromConfig(cfg.getString("git.force_push", "never"), .never);
+    e.read_dotenv = cfg.getBool("permissions.read_dotenv", false);
     return e;
+}
+
+/// Parse a `git.*` ceiling; an unrecognized value falls back to the
+/// fail-closed default for that action.
+fn gitPolicyFromConfig(value: []const u8, fallback: engine_mod.GitPolicy) engine_mod.GitPolicy {
+    return std.meta.stringToEnum(engine_mod.GitPolicy, value) orelse fallback;
+}
+
+/// Resolve `sessions.dir` (A-T07). "project" is the zero-config location;
+/// any other value is used as given (relative to the workspace or absolute).
+fn sessionsDir(arena: std.mem.Allocator, cfg: *const config_mod.Store) []const u8 {
+    _ = arena;
+    const v = cfg.getString("sessions.dir", "project");
+    if (v.len == 0 or std.mem.eql(u8, v, "project")) return ".ifnh/sessions";
+    return v;
 }
 
 fn ensureIfnh(io: std.Io, cwd: std.Io.Dir) !void {
@@ -1208,12 +1234,17 @@ fn handleCommand(
             .command_allow = sess.engine.command_allow,
             .command_deny = sess.engine.command_deny,
             .env_allow = sess.engine.env_allow,
+            .git_commits = sess.engine.git_commits,
+            .git_push = sess.engine.git_push,
+            .git_force_push = sess.engine.git_force_push,
+            .read_dotenv = sess.engine.read_dotenv,
+            .timeout_tool_s = cfg.getU32("agents.timeout_tool_s", 120),
             .journal = &sess.journal,
             .approval_ctx = &approver2,
             .approval_fn = Approver.approve,
             .max_depth = cfg.getU32("agents.max_depth", 1),
             .max_concurrent = cfg.getU32("agents.max_concurrent", 4),
-            .max_rounds = 25,
+            .max_rounds = cfg.getU32("agents.max_tool_rounds", 25),
             .redactions = &.{},
             .cancel = &cancel2,
             .git = blk: {
@@ -1499,7 +1530,7 @@ fn handleCommand(
             for (names.items) |n| out(io, "  .ifnh/reports/{s}\n", .{n}) catch {};
         }
     } else if (std.mem.eql(u8, cmd, "sessions")) {
-        const summaries = session_mod.list(cwd, io, arena, ".ifnh/sessions") catch &.{};
+        const summaries = session_mod.list(cwd, io, arena, sessionsDir(arena, cfg)) catch &.{};
         if (summaries.len == 0) {
             out(io, "no sessions\n", .{}) catch {};
         }
@@ -1578,4 +1609,33 @@ fn out(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
     var buf: [4096]u8 = undefined;
     const text = std.fmt.bufPrint(&buf, fmt, args) catch return error.MessageTooLong;
     try std.Io.File.stdout().writeStreamingAll(io, text);
+}
+
+// ---------------------------------------------------------------- tests
+
+test "default config denies git push and gates dotenv" {
+    var cfg = try config_mod.Store.init(std.testing.allocator);
+    defer cfg.deinit();
+    try cfg.validate();
+    try std.testing.expect(cfg.errors.items.len == 0);
+
+    var e = engineFromConfig(std.testing.allocator, &cfg);
+    defer e.deinit();
+    try std.testing.expectEqual(engine_mod.Decision.deny, e.decideCommand("git push origin main"));
+    try std.testing.expectEqual(engine_mod.Decision.deny, e.decideCommand("git push --force origin main"));
+    try std.testing.expectEqual(engine_mod.Decision.ask, e.decideCommand("git commit -m x"));
+    try std.testing.expect(!e.read_dotenv);
+
+    // Lowering the ceilings through config is honored.
+    try cfg.applyOverride("git.push", "\"auto\"", .{ .layer = .project, .origin = "test" });
+    try cfg.applyOverride("permissions.read_dotenv", "true", .{ .layer = .project, .origin = "test" });
+    var e2 = engineFromConfig(std.testing.allocator, &cfg);
+    defer e2.deinit();
+    try std.testing.expectEqual(engine_mod.Decision.allow, e2.decideCommand("git push origin main"));
+    try std.testing.expect(e2.read_dotenv);
+    // Unknown policy values fall back to the fail-closed default.
+    try cfg.applyOverride("git.force_push", "\"sometimes\"", .{ .layer = .project, .origin = "test" });
+    var e3 = engineFromConfig(std.testing.allocator, &cfg);
+    defer e3.deinit();
+    try std.testing.expectEqual(engine_mod.Decision.deny, e3.decideCommand("git push --force origin main"));
 }

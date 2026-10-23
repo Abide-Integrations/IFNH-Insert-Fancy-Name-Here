@@ -134,6 +134,79 @@ fn classifySimple(cmd: []const u8) Effect {
     return .unknown;
 }
 
+/// Policy-relevant git action found in a command line (A-T07). Ordered by
+/// severity so a compound command reports its worst action.
+pub const GitAction = enum {
+    commit,
+    push,
+    force_push,
+
+    fn rank(self: GitAction) u8 {
+        return switch (self) {
+            .commit => 0,
+            .push => 1,
+            .force_push => 2,
+        };
+    }
+};
+
+/// Detect the strongest git action in a command line, ignoring global git
+/// options (`-C dir`, `-c k=v`, `--git-dir=...`). Returns null when the
+/// command does not run git at all. Used for the `git.*` config ceilings.
+pub fn gitAction(command: []const u8) ?GitAction {
+    var worst: ?GitAction = null;
+    var it = std.mem.splitAny(u8, command, "|;&\n");
+    while (it.next()) |segment| {
+        const found = segmentGitAction(segment) orelse continue;
+        if (worst == null or found.rank() > worst.?.rank()) worst = found;
+    }
+    return worst;
+}
+
+fn segmentGitAction(segment: []const u8) ?GitAction {
+    var it = std.mem.tokenizeAny(u8, segment, " \t(){}`");
+    const prog = it.next() orelse return null;
+    if (!std.mem.eql(u8, std.fs.path.basename(prog), "git")) return null;
+
+    var sub: ?[]const u8 = null;
+    var force = false;
+    while (it.next()) |tok| {
+        if (sub == null) {
+            if (tok.len > 0 and tok[0] == '-' and !std.mem.eql(u8, tok, "--")) {
+                // Value-taking global options consume the next token.
+                if (takesValue(tok)) _ = it.next();
+                continue;
+            }
+            sub = tok;
+            continue;
+        }
+        if (isForceArg(tok)) force = true;
+    }
+    const s = sub orelse return null;
+    if (std.mem.eql(u8, s, "commit")) return .commit;
+    if (std.mem.eql(u8, s, "push")) return if (force) .force_push else .push;
+    return null;
+}
+
+fn takesValue(tok: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, tok, '=') != null) return false;
+    const valued = [_][]const u8{ "-C", "-c", "--git-dir", "--work-tree", "--namespace" };
+    for (valued) |v| {
+        if (std.mem.eql(u8, tok, v)) return true;
+    }
+    return false;
+}
+
+fn isForceArg(tok: []const u8) bool {
+    if (std.mem.startsWith(u8, tok, "--force")) return true; // --force, --force-with-lease, --force-if-includes
+    if (tok.len > 1 and tok[0] == '+') return true; // +refspec
+    if (tok.len > 1 and tok[0] == '-' and tok[1] != '-') {
+        // Short flag cluster containing f (-f, -fu, -vf).
+        return std.mem.indexOfScalar(u8, tok[1..], 'f') != null;
+    }
+    return false;
+}
+
 fn classifyGit(cmd: []const u8) Effect {
     for (git_destructive_subcommands) |d| {
         if (std.mem.indexOf(u8, cmd, d) != null) return .destructive;
@@ -195,6 +268,24 @@ fn containsAny(haystack: []const u8, needles: []const []const u8) bool {
         if (std.mem.indexOf(u8, haystack, n) != null) return true;
     }
     return false;
+}
+
+test "gitAction detects push/force-push/commit" {
+    try std.testing.expectEqual(GitAction.commit, gitAction("git commit -m x").?);
+    try std.testing.expectEqual(GitAction.push, gitAction("git push origin main").?);
+    try std.testing.expectEqual(GitAction.push, gitAction("git -C sub push origin main").?);
+    try std.testing.expectEqual(GitAction.push, gitAction("git -c user.name=x push").?);
+    try std.testing.expectEqual(GitAction.force_push, gitAction("git push --force origin main").?);
+    try std.testing.expectEqual(GitAction.force_push, gitAction("git push -f origin main").?);
+    try std.testing.expectEqual(GitAction.force_push, gitAction("git push --force-with-lease origin main").?);
+    try std.testing.expectEqual(GitAction.force_push, gitAction("git push origin +main").?);
+    try std.testing.expectEqual(GitAction.force_push, gitAction("cd repo && git push -fu origin main").?);
+    try std.testing.expectEqual(GitAction.push, gitAction("(git push)").?);
+    // Not git, or a non-policy git subcommand.
+    try std.testing.expect(gitAction("grep push src/x.zig") == null);
+    try std.testing.expect(gitAction("echo 'git push'") == null);
+    try std.testing.expect(gitAction("git status") == null);
+    try std.testing.expect(gitAction("ls -la") == null);
 }
 
 test "classify read-only programs" {

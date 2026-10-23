@@ -474,7 +474,9 @@ fn isAgentCall(tc: core_types.ToolCall) bool {
 }
 
 fn executeOne(p: RunParams, tc: core_types.ToolCall) tool_mod.ToolResult {
-    const raw = tool_mod.execute(tc.name, tc.arguments_json, p.tool_ctx);
+    var ctx = p.tool_ctx.*;
+    ctx.cancel = p.cancel;
+    const raw = tool_mod.execute(tc.name, tc.arguments_json, &ctx);
     return .{
         .output = redact_mod.redact(p.arena, raw.output, p.redactions),
         .status = raw.status,
@@ -498,6 +500,7 @@ fn runAgentBatch(p: RunParams, calls: []const core_types.ToolCall) ![]tool_mod.T
             var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             var ctx = params.tool_ctx.*;
             ctx.arena = arena_state.allocator();
+            ctx.cancel = params.cancel;
             const raw = tool_mod.execute(tc.name, tc.arguments_json, &ctx);
             slot.result = raw;
             slot.arena_state = arena_state; // handed back for ordered copy
