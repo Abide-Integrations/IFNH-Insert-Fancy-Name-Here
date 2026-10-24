@@ -6,6 +6,7 @@
 //! hard startup error, never silently ignored.
 
 const std = @import("std");
+const trace_mod = @import("../trace.zig");
 
 pub const Layer = enum {
     builtin,
@@ -517,6 +518,7 @@ pub fn load(
         while (it.next()) |entry| {
             const key = entry.key_ptr.*;
             if (!std.mem.startsWith(u8, key, "IFNH_")) continue;
+            if (std.mem.eql(u8, key, trace_mod.env_var)) continue; // runtime switch, not config
             const rest = key["IFNH_".len..];
             if (rest.len == 0) continue;
             var parts: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -672,12 +674,29 @@ test "env overrides with __ nesting and json values" {
     try std.testing.expectEqual(Layer.env, store.getSource("permissions.default_mode").?.layer);
 }
 
+test "trace runtime env switch is not a config key" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put(trace_mod.env_var, "1");
+
+    var store = try Store.init(std.testing.allocator);
+    defer store.deinit();
+    try applyEnvForTest(&store, &env);
+    try store.validate();
+
+    try std.testing.expect(store.get("trace.startup") == null);
+    for (store.warnings.items) |w| {
+        try std.testing.expect(std.mem.indexOf(u8, w, "trace") == null);
+    }
+}
+
 /// Test helper mirroring the env pass of `load` without disk layers.
 fn applyEnvForTest(store: *Store, env: *const std.process.Environ.Map) !void {
     var it = env.iterator();
     while (it.next()) |entry| {
         const key = entry.key_ptr.*;
         if (!std.mem.startsWith(u8, key, "IFNH_")) continue;
+        if (std.mem.eql(u8, key, trace_mod.env_var)) continue; // runtime switch, not config
         const rest = key["IFNH_".len..];
         var parts: std.ArrayListUnmanaged([]const u8) = .empty;
         var sit = std.mem.splitSequence(u8, rest, "__");

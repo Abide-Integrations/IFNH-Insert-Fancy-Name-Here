@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const core_types = @import("../core/types.zig");
+const trace_mod = @import("../core/trace.zig");
 
 pub const StreamEvent = core_types.StreamEvent;
 
@@ -28,6 +29,10 @@ pub const ModelRequest = struct {
     base_url: []const u8,
     api_key: []const u8,
     system: []const u8,
+    /// Byte length of the byte-stable prefix of `system` (B-03). Adapters
+    /// that support prompt caching may split there and mark the prefix
+    /// cacheable; 0 (or the whole string) means "no split".
+    system_stable_len: usize = 0,
     messages: []const core_types.ChatMessage,
     /// Neutral tool specs; adapters serialize them for their wire format.
     tools: []const core_types.ToolSpec = &.{},
@@ -35,6 +40,11 @@ pub const ModelRequest = struct {
     max_output_tokens: ?u32 = null,
     /// Opaque provider-specific options (JSON object text) or "".
     provider_options: []const u8 = "",
+    /// Optional timing trace owned by the session (B-01).
+    trace: ?*trace_mod.Trace = null,
+    /// Session-owned HTTP client; adapters fall back to a per-request
+    /// client when null and never deinit a caller-supplied one (B-02).
+    client: ?*std.http.Client = null,
     cancel: *std.atomic.Value(bool),
 };
 

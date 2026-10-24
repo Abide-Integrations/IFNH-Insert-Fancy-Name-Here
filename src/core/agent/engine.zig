@@ -11,6 +11,7 @@ const core_types = @import("../types.zig");
 const provider_mod = @import("../../providers/provider.zig");
 const tool_mod = @import("../../tools/tool.zig");
 const redact_mod = @import("../redact.zig");
+const trace_mod = @import("../trace.zig");
 
 pub const max_tool_rounds_default: usize = 25;
 /// Upper bound on a server-provided `Retry-After` delay. Keeps a misbehaving
@@ -31,6 +32,8 @@ pub const ProviderConfig = struct {
     model: []const u8,
     base_url: []const u8,
     api_key: []const u8,
+    /// Session-owned client shared by every round (B-02).
+    client: ?*std.http.Client = null,
 };
 
 pub const Callbacks = struct {
@@ -91,6 +94,8 @@ const Collector = struct {
             .usage => |u| {
                 self.usage.input_tokens += u.input_tokens;
                 self.usage.output_tokens += u.output_tokens;
+                self.usage.cache_read_tokens += u.cache_read_tokens;
+                self.usage.cache_write_tokens += u.cache_write_tokens;
             },
             .done => {},
             .failure => |f| {
@@ -108,11 +113,30 @@ fn sinkEmit(ctx: *anyopaque, ev: core_types.StreamEvent) void {
     Collector.emit(ctx, ev);
 }
 
+/// Delivers events to the collector and closes the time-to-first-token span
+/// on the first event of a provider round.
+const TraceSink = struct {
+    collector: *Collector,
+    ttft: trace_mod.Span,
+    seen: bool = false,
+
+    fn emit(ctx: *anyopaque, ev: core_types.StreamEvent) void {
+        const self: *TraceSink = @ptrCast(@alignCast(ctx));
+        if (!self.seen) {
+            self.seen = true;
+            self.ttft.end("");
+        }
+        Collector.emit(self.collector, ev);
+    }
+};
+
 pub const RunParams = struct {
     io: std.Io,
     arena: std.mem.Allocator,
     pcfg: ProviderConfig,
     system: []const u8,
+    /// Byte length of the byte-stable system-prompt prefix (B-03).
+    system_stable_len: usize = 0,
     history: *std.ArrayListUnmanaged(core_types.ChatMessage),
     tool_ctx: *tool_mod.ToolContext,
     callbacks: Callbacks,
@@ -126,6 +150,8 @@ pub const RunParams = struct {
     redactions: []const []const u8 = &.{},
     temperature: ?f64 = null,
     max_output_tokens: ?u32 = null,
+    /// Optional per-session timing trace (B-01).
+    trace: ?*trace_mod.Trace = null,
 };
 
 /// Run one agent turn. Appends assistant/tool messages to `history`.
@@ -134,6 +160,14 @@ pub fn runTurn(p: RunParams) !Outcome {
     var rounds: usize = 0;
     var total_calls: usize = 0;
     var last_reply: []const u8 = "";
+    var tool_total_ns: i96 = 0;
+    defer if (p.trace) |t| {
+        if (t.enabled) {
+            var buf: [64]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, "{d}ms", .{@divTrunc(tool_total_ns, std.time.ns_per_ms)}) catch "";
+            t.note("turn.total_tools", text);
+        }
+    };
 
     while (rounds < p.max_tool_rounds) : (rounds += 1) {
         if (p.cancel.load(.acquire)) {
@@ -142,20 +176,29 @@ pub fn runTurn(p: RunParams) !Outcome {
 
         var collector = Collector{ .arena = p.arena, .callbacks = p.callbacks };
         const tools: []const core_types.ToolSpec = if (p.include_tools) &tool_mod.specs else &.{};
+        var round_span = trace_mod.Span.begin(p.trace, "turn.provider_round");
+        const ttft_span = trace_mod.Span.begin(p.trace, "provider.ttft");
+        // One sink for the whole round: a retry must not end the TTFT span a
+        // second time when the replacement attempt emits its first event.
+        var trace_sink = TraceSink{ .collector = &collector, .ttft = ttft_span };
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
             collector = Collector{ .arena = p.arena, .callbacks = p.callbacks };
+            trace_sink.collector = &collector;
             try p.pcfg.provider.stream(p.arena, p.io, .{
                 .model = p.pcfg.model,
                 .base_url = p.pcfg.base_url,
                 .api_key = p.pcfg.api_key,
                 .system = p.system,
+                .system_stable_len = p.system_stable_len,
                 .messages = p.history.items,
                 .tools = tools,
                 .temperature = p.temperature,
                 .max_output_tokens = p.max_output_tokens,
                 .cancel = p.cancel,
-            }, .{ .ctx = &collector, .emit_fn = sinkEmit });
+                .trace = p.trace,
+                .client = p.pcfg.client,
+            }, .{ .ctx = &trace_sink, .emit_fn = TraceSink.emit });
             if (collector.failure) |f| {
                 if (core_types.isRetryable(f.kind) and attempt < p.max_retries and
                     collector.text.items.len == 0 and !p.cancel.load(.acquire))
@@ -166,9 +209,12 @@ pub fn runTurn(p: RunParams) !Outcome {
             }
             break;
         }
+        round_span.end("");
 
         total_usage.input_tokens += collector.usage.input_tokens;
         total_usage.output_tokens += collector.usage.output_tokens;
+        total_usage.cache_read_tokens += collector.usage.cache_read_tokens;
+        total_usage.cache_write_tokens += collector.usage.cache_write_tokens;
 
         // Keep the text streamed before a failure so the caller can show (and
         // roll back) a partial reply instead of losing it.
@@ -224,6 +270,11 @@ pub fn runTurn(p: RunParams) !Outcome {
         // Execute tool calls; consecutive `agent` calls run in parallel
         // (E58), everything else sequentially, results appended in order.
         const calls = collector.tool_calls.items;
+        const tools_span = trace_mod.Span.begin(p.trace, "turn.tools_round");
+        const tool_start: ?std.Io.Timestamp = if (p.trace) |t|
+            (if (t.enabled) std.Io.Timestamp.now(t.io, .awake) else null)
+        else
+            null;
         var i: usize = 0;
         while (i < calls.len) {
             if (p.cancel.load(.acquire)) {
@@ -273,6 +324,10 @@ pub fn runTurn(p: RunParams) !Outcome {
                 });
                 i += 1;
             }
+        }
+        tools_span.end("");
+        if (tool_start) |start| {
+            tool_total_ns += std.Io.Timestamp.durationTo(start, std.Io.Timestamp.now(p.io, .awake)).nanoseconds;
         }
     }
 

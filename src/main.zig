@@ -12,6 +12,7 @@ const fsutil = @import("core/fsutil.zig");
 const repl = @import("cli/repl.zig");
 const session_mod = @import("core/session/store.zig");
 const config_mod = @import("core/config/config.zig");
+const trace_mod = @import("core/trace.zig");
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -20,6 +21,9 @@ pub const std_options: std.Options = .{
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const arena = init.arena.allocator();
+    // The trace must start before argument parsing so startup.first_paint
+    // measures from process start (B-01).
+    var startup_trace = trace_mod.Trace.init(io, init.environ_map);
 
     // Collect argv (skip argv[0]).
     var argv: std.ArrayList([]const u8) = .empty;
@@ -47,7 +51,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (parsed.subcommand == .none) {
-        repl.run(io, arena, init.environ_map, .{ .no_color = parsed.flags.no_color }) catch |err| {
+        repl.run(io, arena, init.environ_map, .{ .no_color = parsed.flags.no_color, .trace = &startup_trace }) catch |err| {
             if (err == error.AccessDenied) {
                 try printOut(io, arena, "error: permission denied\n" ++
                     "ifnh needs to write .ifnh/ in the current directory.\n" ++
@@ -494,6 +498,8 @@ test {
     _ = @import("providers/openai.zig");
     _ = @import("providers/anthropic.zig");
     _ = @import("core/instructions.zig");
+    _ = @import("core/trace.zig");
+    _ = @import("core/turn_cache.zig");
     _ = @import("core/agent/engine.zig");
     _ = @import("core/agent/testing.zig");
     _ = @import("core/agent/subagent.zig");
