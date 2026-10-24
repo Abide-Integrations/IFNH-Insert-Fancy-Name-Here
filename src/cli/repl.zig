@@ -30,6 +30,7 @@ const tool_mod = @import("../tools/tool.zig");
 const core_types = @import("../core/types.zig");
 const openai = @import("../providers/openai.zig");
 const anthropic = @import("../providers/anthropic.zig");
+const trace_mod = @import("../core/trace.zig");
 
 const max_output_bytes: usize = 256 * 1024;
 
@@ -37,6 +38,8 @@ pub const Options = struct {
     resume_id: ?[]const u8 = null,
     json: bool = false,
     no_color: bool = false,
+    /// Startup trace owned by main, measured from process start (B-01).
+    trace: ?*trace_mod.Trace = null,
 };
 
 const Session = struct {
@@ -55,6 +58,8 @@ const Session = struct {
     last_blocked_stage: ?[]const u8 = null,
     /// Persistent key store (user env file) for /provider key.
     user_keys: ?*keys_mod.Keys = null,
+    /// Per-session timing trace (B-01).
+    trace: ?*trace_mod.Trace = null,
 };
 
 var global_user_keys: keys_mod.Keys = undefined;
@@ -101,7 +106,12 @@ pub fn run(
     const cwd = std.Io.Dir.cwd();
 
     // ---- configuration ----
-    var cfg = try config_mod.load(arena, io, environ, cwd);
+    var config_span = trace_mod.Span.begin(opts.trace, "startup.config");
+    var cfg = config_mod.load(arena, io, environ, cwd) catch |err| {
+        config_span.end("error");
+        return err;
+    };
+    config_span.end("");
     defer cfg.deinit();
     for (cfg.errors.items) |err| {
         try out(io, "config error [{s}]: {s}\n", .{ err.path, err.message });
@@ -126,14 +136,14 @@ pub fn run(
         if (opts.resume_id) |id| {
             const store = try session_mod.Session.open(cwd, io, arena, sessions_dir_name, id);
             const j = try journal_mod.Journal.open(io, arena, store.dir);
-            var s = Session{ .io = io, .store = store, .journal = j, .engine = engineFromConfig(arena, &cfg) };
+            var s = Session{ .io = io, .store = store, .journal = j, .engine = engineFromConfig(arena, &cfg), .trace = opts.trace };
             try rebuildHistory(arena, &s);
             break :blk s;
         } else {
             const cwd_copy: []const u8 = if (environ.get("PWD")) |pwd| pwd else ".";
             const store = try session_mod.Session.create(cwd, io, arena, sessions_dir_name, cwd_copy);
             const j = try journal_mod.Journal.open(io, arena, store.dir);
-            break :blk Session{ .io = io, .store = store, .journal = j, .engine = engineFromConfig(arena, &cfg) };
+            break :blk Session{ .io = io, .store = store, .journal = j, .engine = engineFromConfig(arena, &cfg), .trace = opts.trace };
         }
     };
     sess.user_keys = &global_user_keys;
@@ -145,11 +155,13 @@ pub fn run(
     }
 
     // ---- skills catalog (K148/149) ----
+    var skills_span = trace_mod.Span.begin(opts.trace, "startup.skills");
     sess.skills = blk: {
         const user_dir = config_mod.userSkillsDir(arena, environ) orelse break :blk null;
         const catalog = skills_mod.discover(cwd, io, arena, user_dir) catch break :blk null;
         break :blk catalog;
     };
+    skills_span.end("");
 
     // ---- background executions (I123-125) ----
     sess.executions = blk: {
@@ -171,7 +183,9 @@ pub fn run(
 
     // ---- instructions ----
     const builtin_prompt = system_prompt.system_prompt;
+    var instructions_span = trace_mod.Span.begin(opts.trace, "startup.instructions");
     const instr = try instructions_mod.assemble(cwd, io, arena, builtin_prompt, &.{});
+    instructions_span.end("");
 
     // ---- welcome ----
     {
@@ -192,6 +206,12 @@ pub fn run(
             key_note,
         });
         try out(io, "{s}type a message, or /help for commands{s}\n", .{ palette.dim("", arena), "\x1b[0m" });
+    }
+
+    // First paint is measured from process start, not from REPL setup.
+    if (opts.trace) |t| {
+        const first_paint = trace_mod.Span{ .trace = t, .name = "startup.first_paint", .start = t.t0 };
+        first_paint.end("");
     }
 
     // ---- input loop ----
@@ -232,11 +252,15 @@ pub fn run(
             cfg = fresh;
         }
         const focus = instructions_mod.focusDirsFromHistory(arena, sess.history.items, 8);
+        var turn_instructions_span = trace_mod.Span.begin(sess.trace, "turn.instructions");
         const turn_instr = instructions_mod.assemble(cwd, io, arena, system_prompt.system_prompt, focus) catch instr;
+        turn_instructions_span.end("");
         // Skills catalog appendix (budgeted, K148).
         const skill_prompt = blk: {
             if (sess.skills) |catalog| {
+                var skills_catalog_span = trace_mod.Span.begin(sess.trace, "turn.skills_catalog");
                 const rendered = skills_mod.renderCatalog(arena, catalog) catch "";
+                skills_catalog_span.end("");
                 if (rendered.len > 0) {
                     break :blk std.fmt.allocPrint(arena, "{s}\n\nAvailable skills (load with the skill tool):\n{s}", .{ turn_instr.text, rendered }) catch turn_instr.text;
                 }
@@ -277,11 +301,24 @@ fn submitTurn(
         try out(io, "note: no api key — run /provider key {s} <value> (or export it) before sending a message\n", .{key_env});
     }
 
+    var total_span = trace_mod.Span.begin(sess.trace, "turn.total");
+    defer total_span.end("");
     var cancel = std.atomic.Value(bool).init(false);
     // Ctrl-C sets `cancel` while the turn runs; a second one exits (A-06).
     @import("../core/interrupt.zig").install(&cancel);
     defer @import("../core/interrupt.zig").uninstall();
     var approver = Approver{ .io = io, .engine = &sess.engine };
+    var setup_span = trace_mod.Span.begin(sess.trace, "turn.setup");
+    var git_span = trace_mod.Span.begin(sess.trace, "turn.git");
+    const turn_git: ?git_mod.Git = blk: {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const n = cwd.realPath(io, &path_buf) catch break :blk null;
+        const repo_path = arena.dupe(u8, path_buf[0..n]) catch break :blk null;
+        const g = git_mod.Git.init(io, repo_path);
+        if (!g.isRepo(arena)) break :blk null;
+        break :blk g;
+    };
+    git_span.end("");
     var host = subagent_mod.Host{
         .io = io,
         .workspace = cwd,
@@ -311,14 +348,7 @@ fn submitTurn(
         .temperature = cfg.getOptionalF64("model.temperature"),
         .max_output_tokens = cfg.getOptionalU32("model.max_output_tokens"),
         .cancel = &cancel,
-        .git = blk: {
-            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-            const n = cwd.realPath(io, &path_buf) catch break :blk null;
-            const repo_path = arena.dupe(u8, path_buf[0..n]) catch break :blk null;
-            const g = git_mod.Git.init(io, repo_path);
-            if (!g.isRepo(arena)) break :blk null;
-            break :blk g;
-        },
+        .git = turn_git,
         .worktree_root = blk: {
             const state_root = config_mod.userStateDir(arena, environ) orelse break :blk null;
             const root = std.fmt.allocPrint(arena, "{s}/worktrees", .{state_root}) catch break :blk null;
@@ -353,6 +383,7 @@ fn submitTurn(
     };
     tool_ctx.approval_ctx = &approver;
     tool_ctx.approval_fn = Approver.approve;
+    setup_span.end("");
 
     const TurnUi = struct {
         io: std.Io,
@@ -395,8 +426,10 @@ fn submitTurn(
     };
     var ui = TurnUi{ .io = io, .store = &sess.store };
 
+    var hooks_span = trace_mod.Span.begin(sess.trace, "turn.hooks");
     var hook_engine = hooks_mod.Engine.init(io, cwd, try hooks_mod.Engine.fromConfig(arena, cfg.get("hooks")), arena);
     const pre = hook_engine.dispatch(.before_agent, "{}");
+    hooks_span.end("");
     if (pre.blocked) {
         try out(io, "before_agent hook blocked the turn: {s}\n", .{pre.output});
         return;
@@ -454,6 +487,7 @@ fn submitTurn(
         .max_retries = cfg.getU32("agents.max_retries", 3),
         .max_tool_rounds = cfg.getU32("agents.max_tool_rounds", 25),
         .redactions = redactionsFor(arena, cfg.getBool("debug.redact", true), pcfg.api_key),
+        .trace = sess.trace,
     }) catch |err| {
         rollbackTurn(sess, history_start);
         try out(io, "\nturn failed: {s}\n", .{@errorName(err)});
