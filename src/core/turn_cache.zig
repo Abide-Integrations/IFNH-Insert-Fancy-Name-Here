@@ -187,6 +187,12 @@ pub const TurnCache = struct {
     /// packed refs change.
     pub fn gitRepo(self: *TurnCache, cwd: std.Io.Dir) !Lookup(?git_mod.Git) {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        // `Dir.realPath` on `.cwd()` fails in Zig 0.16 (the AT_FDCWD
+        // sentinel has no /proc entry), so this returns null in the REPL
+        // exactly as the code it replaced did. Resolving "." through
+        // `realPathFile` makes the probe work, but that also switches on
+        // subagent worktree isolation and costs one `git rev-parse` on turn
+        // one; see B-11 in ACTIVE_PLAN.md.
         const n = cwd.realPath(self.io, &path_buf) catch return .{ .value = null, .hit = false };
         const repo_path = try self.arena.dupe(u8, path_buf[0..n]);
         const git_dir = try findGitDir(self.io, self.arena, repo_path);
@@ -205,8 +211,11 @@ pub const TurnCache = struct {
         if (self.git) |entry| {
             if (std.mem.eql(u8, &entry.fp, &fp)) return .{ .value = entry.value, .hit = true };
         }
-        const g = git_mod.Git.init(self.io, repo_path);
-        const value: ?git_mod.Git = if (g.isRepo(self.arena)) g else null;
+        // No `.git` above us: no repo, and no reason to spawn git.
+        const value: ?git_mod.Git = if (git_dir == null) null else blk: {
+            const g = git_mod.Git.init(self.io, repo_path);
+            break :blk if (g.isRepo(self.arena)) g else null;
+        };
         self.git = .{ .fp = fp, .value = value };
         return .{ .value = value, .hit = false };
     }
