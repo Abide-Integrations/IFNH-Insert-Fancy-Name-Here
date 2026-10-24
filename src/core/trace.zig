@@ -63,7 +63,8 @@ pub const Span = struct {
         const t = self.trace orelse return;
         if (!t.enabled) return;
         const elapsed = std.Io.Timestamp.durationTo(self.start, std.Io.Timestamp.now(t.io, .awake));
-        const us = elapsed.toMicroseconds();
+        // Unsigned: zero-padded signed formatting prints a leading `+`.
+        const us: u64 = @intCast(elapsed.toMicroseconds());
         var buf: [512]u8 = undefined;
         const line = if (note_text.len == 0)
             std.fmt.bufPrint(&buf, "[trace] {s} {d}.{d:0>3}ms\n", .{ self.name, @divTrunc(us, 1000), @mod(us, 1000) }) catch return
@@ -118,4 +119,6 @@ test "enabled span emits exactly one line" {
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, lines, "\n"));
     try std.testing.expect(std.mem.startsWith(u8, lines, "[trace] startup.config "));
     try std.testing.expect(std.mem.indexOf(u8, lines, "turn.total.tools") != null);
+    // Durations are unsigned: no `+` from zero-padded signed formatting.
+    try std.testing.expect(std.mem.indexOf(u8, lines, "+") == null);
 }

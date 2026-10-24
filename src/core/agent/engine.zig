@@ -178,10 +178,13 @@ pub fn runTurn(p: RunParams) !Outcome {
         const tools: []const core_types.ToolSpec = if (p.include_tools) &tool_mod.specs else &.{};
         var round_span = trace_mod.Span.begin(p.trace, "turn.provider_round");
         const ttft_span = trace_mod.Span.begin(p.trace, "provider.ttft");
+        // One sink for the whole round: a retry must not end the TTFT span a
+        // second time when the replacement attempt emits its first event.
+        var trace_sink = TraceSink{ .collector = &collector, .ttft = ttft_span };
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
             collector = Collector{ .arena = p.arena, .callbacks = p.callbacks };
-            var trace_sink = TraceSink{ .collector = &collector, .ttft = ttft_span };
+            trace_sink.collector = &collector;
             try p.pcfg.provider.stream(p.arena, p.io, .{
                 .model = p.pcfg.model,
                 .base_url = p.pcfg.base_url,
