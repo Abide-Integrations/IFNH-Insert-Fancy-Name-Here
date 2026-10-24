@@ -102,8 +102,7 @@ pub fn streamFn(
     };
     var tools: [16]ToolAcc = undefined;
     var tool_count: usize = 0;
-    var input_tokens: u64 = 0;
-    var output_tokens: u64 = 0;
+    var usage: core_types.Usage = .{};
 
     while (true) {
         const maybe_payload = parser.next(arena) catch |err| {
@@ -125,9 +124,7 @@ pub fn streamFn(
         if (std.mem.eql(u8, ev, "message_start")) {
             if (o.get("message")) |m| {
                 if (m == .object) {
-                    if (m.object.get("usage")) |u| {
-                        if (u == .object) input_tokens = intOf(u.object.get("input_tokens")) orelse 0;
-                    }
+                    if (m.object.get("usage")) |u| usage = parseUsage(u);
                 }
             }
         } else if (std.mem.eql(u8, ev, "content_block_start")) {
@@ -167,7 +164,7 @@ pub fn streamFn(
             }
         } else if (std.mem.eql(u8, ev, "message_delta")) {
             if (o.get("usage")) |u| {
-                if (u == .object) output_tokens = intOf(u.object.get("output_tokens")) orelse output_tokens;
+                if (u == .object) usage.output_tokens = intOf(u.object.get("output_tokens")) orelse usage.output_tokens;
             }
         } else if (std.mem.eql(u8, ev, "message_stop")) {
             break;
@@ -183,10 +180,23 @@ pub fn streamFn(
         } });
     }
 
-    if (input_tokens != 0 or output_tokens != 0) {
-        sink.emit(.{ .usage = .{ .input_tokens = input_tokens, .output_tokens = output_tokens } });
+    if (usage.input_tokens != 0 or usage.output_tokens != 0 or
+        usage.cache_read_tokens != 0 or usage.cache_write_tokens != 0)
+    {
+        sink.emit(.{ .usage = usage });
     }
     sink.emit(.done);
+}
+
+/// Anthropic usage object (B-03): input/output plus the two cache counters.
+/// Missing fields are zero.
+fn parseUsage(u: std.json.Value) core_types.Usage {
+    if (u != .object) return .{};
+    return .{
+        .input_tokens = intOf(u.object.get("input_tokens")) orelse 0,
+        .cache_read_tokens = intOf(u.object.get("cache_read_input_tokens")) orelse 0,
+        .cache_write_tokens = intOf(u.object.get("cache_creation_input_tokens")) orelse 0,
+    };
 }
 
 fn trimSlash(s: []const u8) []const u8 {
@@ -225,8 +235,23 @@ fn buildBody(arena: std.mem.Allocator, req: provider.ModelRequest) ![]u8 {
     try w.print(",\"max_tokens\":{d},\"stream\":true", .{req.max_output_tokens orelse 4096});
 
     if (req.system.len > 0) {
+        // Prompt caching (B-03): when the caller reports a stable prefix,
+        // send the system prompt as two text blocks and mark the first one
+        // cacheable. With no split the body stays the single-block form.
+        const split = if (req.system_stable_len > 0 and req.system_stable_len < req.system.len)
+            req.system_stable_len
+        else
+            0;
         try w.writeAll(",\"system\":");
-        try std.json.Stringify.value(req.system, .{}, w);
+        if (split > 0) {
+            try w.writeAll("[{\"type\":\"text\",\"text\":");
+            try std.json.Stringify.value(req.system[0..split], .{}, w);
+            try w.writeAll(",\"cache_control\":{\"type\":\"ephemeral\"}},{\"type\":\"text\",\"text\":");
+            try std.json.Stringify.value(req.system[split..], .{}, w);
+            try w.writeAll("}]");
+        } else {
+            try std.json.Stringify.value(req.system, .{}, w);
+        }
     }
 
     try w.writeAll(",\"messages\":[");
@@ -493,4 +518,76 @@ test "wire golden anthropic body is byte-stable" {
         \\{"model":"claude-test","max_tokens":4096,"stream":true,"system":"sys","messages":[{"role":"user","content":"first"},{"role":"assistant","content":[{"type":"text","text":"checking"},{"type":"tool_use","id":"t1","name":"read","input":{"path":"a.txt"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"alpha"}]},{"role":"user","content":"second"}],"tools":[{"name":"read","description":"Read a file","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}}]}
     ;
     try std.testing.expectEqualStrings(expected, body);
+}
+
+test "body splits a cacheable system prefix into two blocks" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const stable = "stable rules";
+    const volatile_tail = "\n\nfocus rules";
+    const system = stable ++ volatile_tail;
+
+    var req = testRequest(&.{.{ .role = .user, .content = "hi" }}, &.{});
+    req.system = system;
+    req.system_stable_len = stable.len;
+
+    const body = try buildBody(arena, req);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{});
+    try std.testing.expect(parsed == .object);
+    const sys = parsed.object.get("system").?;
+    try std.testing.expect(sys == .array);
+    try std.testing.expectEqual(@as(usize, 2), sys.array.items.len);
+    // First block is the stable prefix with the ephemeral cache marker.
+    try std.testing.expectEqualStrings("text", sys.array.items[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings(stable, sys.array.items[0].object.get("text").?.string);
+    try std.testing.expectEqualStrings(
+        "ephemeral",
+        sys.array.items[0].object.get("cache_control").?.object.get("type").?.string,
+    );
+    // Second block carries the volatile tail and no cache marker.
+    try std.testing.expectEqualStrings(volatile_tail, sys.array.items[1].object.get("text").?.string);
+    try std.testing.expect(sys.array.items[1].object.get("cache_control") == null);
+}
+
+test "body without a stable split keeps the single-block system form" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const msgs = [_]core_types.ChatMessage{.{ .role = .user, .content = "hi" }};
+
+    var plain = testRequest(&msgs, &.{});
+    const a = try buildBody(arena, plain);
+
+    // The whole prompt counted as stable, or no length at all: no split, and
+    // the body is byte-identical to the pre-B-03 form.
+    plain.system_stable_len = plain.system.len;
+    const b = try buildBody(arena, plain);
+    try std.testing.expectEqualStrings(a, b);
+    plain.system_stable_len = 0;
+    const c = try buildBody(arena, plain);
+    try std.testing.expectEqualStrings(a, c);
+    try std.testing.expect(std.mem.indexOf(u8, a, "\"system\":\"sys\"") != null);
+}
+
+test "usage parses cache read and write tokens" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const full = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\{"input_tokens":11,"output_tokens":7,"cache_read_input_tokens":2000,"cache_creation_input_tokens":300}
+    , .{});
+    const u = parseUsage(full);
+    try std.testing.expectEqual(@as(u64, 11), u.input_tokens);
+    try std.testing.expectEqual(@as(u64, 2000), u.cache_read_tokens);
+    try std.testing.expectEqual(@as(u64, 300), u.cache_write_tokens);
+
+    // Absent cache fields read as zero.
+    const plain = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"input_tokens\":5}", .{});
+    const v = parseUsage(plain);
+    try std.testing.expectEqual(@as(u64, 5), v.input_tokens);
+    try std.testing.expectEqual(@as(u64, 0), v.cache_read_tokens);
+    try std.testing.expectEqual(@as(u64, 0), v.cache_write_tokens);
 }

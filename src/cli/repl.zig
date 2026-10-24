@@ -243,7 +243,7 @@ pub fn run(
             switch (action) {
                 .quit => break,
                 .submit => |prompt| {
-                    try submitTurn(io, arena, environ, &sess, &cfg, buildProviderConfig(&cfg, environ, &sess.http), instr.text, prompt, cwd);
+                    try submitTurn(io, arena, environ, &sess, &cfg, buildProviderConfig(&cfg, environ, &sess.http), instr.text, instr.stable_len, prompt, cwd);
                 },
                 .none => {},
             }
@@ -260,20 +260,23 @@ pub fn run(
         var turn_instructions_span = trace_mod.Span.begin(sess.trace, "turn.instructions");
         const turn_instr = instructions_mod.assemble(cwd, io, arena, system_prompt.system_prompt, focus) catch instr;
         turn_instructions_span.end("");
-        // Skills catalog appendix (budgeted, K148).
+        // Skills catalog appendix (budgeted, K148). It goes after the stable
+        // prefix, so a cacheable prefix stays valid across turns (B-03).
+        const Prompt = struct { text: []const u8, stable_len: usize };
         const skill_prompt = blk: {
             if (sess.skills) |catalog| {
                 var skills_catalog_span = trace_mod.Span.begin(sess.trace, "turn.skills_catalog");
                 const rendered = skills_mod.renderCatalog(arena, catalog) catch "";
                 skills_catalog_span.end("");
                 if (rendered.len > 0) {
-                    break :blk std.fmt.allocPrint(arena, "{s}\n\nAvailable skills (load with the skill tool):\n{s}", .{ turn_instr.text, rendered }) catch turn_instr.text;
+                    const text = std.fmt.allocPrint(arena, "{s}\n\nAvailable skills (load with the skill tool):\n{s}", .{ turn_instr.text, rendered }) catch turn_instr.text;
+                    break :blk Prompt{ .text = text, .stable_len = turn_instr.stable_len };
                 }
             }
-            break :blk turn_instr.text;
+            break :blk Prompt{ .text = turn_instr.text, .stable_len = turn_instr.stable_len };
         };
 
-        try submitTurn(io, arena, environ, &sess, &cfg, buildProviderConfig(&cfg, environ, &sess.http), skill_prompt, line, cwd);
+        try submitTurn(io, arena, environ, &sess, &cfg, buildProviderConfig(&cfg, environ, &sess.http), skill_prompt.text, skill_prompt.stable_len, line, cwd);
     }
 }
 
@@ -294,6 +297,8 @@ fn submitTurn(
     cfg: *config_mod.Store,
     pcfg: agent_engine.ProviderConfig,
     system: []const u8,
+    /// Byte length of the byte-stable prefix of `system` (B-03).
+    system_stable_len: usize,
     user_text: []const u8,
     cwd: std.Io.Dir,
 ) !void {
@@ -478,6 +483,7 @@ fn submitTurn(
         .arena = arena,
         .pcfg = pcfg,
         .system = system,
+        .system_stable_len = system_stable_len,
         .history = &sess.history,
         .tool_ctx = &tool_ctx,
         .callbacks = .{
@@ -519,15 +525,20 @@ fn submitTurn(
     }
     if (outcome.usage.input_tokens > 0 or outcome.usage.output_tokens > 0) {
         try out(io, "[tokens: {d} in / {d} out, {d} tool calls]\n", .{ outcome.usage.input_tokens, outcome.usage.output_tokens, outcome.tool_calls });
+        // Prompt-cache counters, shown only when the provider reports them
+        // (B-03).
+        if (outcome.usage.cache_read_tokens > 0 or outcome.usage.cache_write_tokens > 0) {
+            try out(io, "[cache: {d} read / {d} written]\n", .{ outcome.usage.cache_read_tokens, outcome.usage.cache_write_tokens });
+        }
         // Session usage log (S254-258).
-        const usage_line = try std.fmt.allocPrint(arena, "{{\"ts_ms\":{d},\"input_tokens\":{d},\"output_tokens\":{d},\"tool_calls\":{d}}}\n", .{
+        const usage_line = try std.fmt.allocPrint(arena, "{{\"ts_ms\":{d},\"input_tokens\":{d},\"output_tokens\":{d},\"cache_read_tokens\":{d},\"cache_write_tokens\":{d},\"tool_calls\":{d}}}\n", .{
             @as(i64, @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms))),
             outcome.usage.input_tokens,
             outcome.usage.output_tokens,
+            outcome.usage.cache_read_tokens,
+            outcome.usage.cache_write_tokens,
             outcome.tool_calls,
         });
-        var usage_buf: [256]u8 = undefined;
-        @memcpy(usage_buf[0..usage_line.len], usage_line);
         const f = sess.store.dir.createFile(io, "usage.jsonl", .{ .truncate = false }) catch null;
         if (f) |file| {
             defer file.close(io);

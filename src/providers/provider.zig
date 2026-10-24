@@ -29,6 +29,10 @@ pub const ModelRequest = struct {
     base_url: []const u8,
     api_key: []const u8,
     system: []const u8,
+    /// Byte length of the byte-stable prefix of `system` (B-03). Adapters
+    /// that support prompt caching may split there and mark the prefix
+    /// cacheable; 0 (or the whole string) means "no split".
+    system_stable_len: usize = 0,
     messages: []const core_types.ChatMessage,
     /// Neutral tool specs; adapters serialize them for their wire format.
     tools: []const core_types.ToolSpec = &.{},

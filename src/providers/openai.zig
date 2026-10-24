@@ -141,13 +141,7 @@ pub fn streamFn(
         }
 
         if (o.get("usage")) |usage_v| {
-            if (usage_v == .object) {
-                const u = usage_v.object;
-                sink.emit(.{ .usage = .{
-                    .input_tokens = intOf(u.get("prompt_tokens")) orelse 0,
-                    .output_tokens = intOf(u.get("completion_tokens")) orelse 0,
-                } });
-            }
+            sink.emit(.{ .usage = parseUsage(usage_v) });
         }
 
         const choices_v = o.get("choices") orelse continue;
@@ -224,6 +218,23 @@ pub fn streamFn(
 
 fn trimSlash(s: []const u8) []const u8 {
     return if (std.mem.endsWith(u8, s, "/")) s[0 .. s.len - 1] else s;
+}
+
+/// Chat Completions usage (B-03): OpenAI reports cache hits under
+/// `prompt_tokens_details.cached_tokens`; missing fields are zero.
+fn parseUsage(u: std.json.Value) core_types.Usage {
+    if (u != .object) return .{};
+    const o = u.object;
+    var out = core_types.Usage{
+        .input_tokens = intOf(o.get("prompt_tokens")) orelse 0,
+        .output_tokens = intOf(o.get("completion_tokens")) orelse 0,
+    };
+    if (o.get("prompt_tokens_details")) |details| {
+        if (details == .object) {
+            out.cache_read_tokens = intOf(details.object.get("cached_tokens")) orelse 0;
+        }
+    }
+    return out;
 }
 
 fn intOf(v: ?std.json.Value) ?u64 {
@@ -494,4 +505,25 @@ test "wire golden openai body is byte-stable" {
         \\{"model":"gpt-test","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"system","content":"sys"},{"role":"user","content":"first"},{"role":"assistant","content":"checking","tool_calls":[{"id":"c1","type":"function","function":{"name":"read","arguments":"{\"path\":\"a.txt\"}"}}]},{"role":"tool","tool_call_id":"c1","content":"alpha"},{"role":"user","content":"second"}],"tools":[{"type":"function","function":{"name":"read","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}],"tool_choice":"auto"}
     ;
     try std.testing.expectEqualStrings(expected, body);
+}
+
+test "usage parses prompt_tokens_details.cached_tokens" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const cached = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\{"prompt_tokens":120,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":64}}
+    , .{});
+    const u = parseUsage(cached);
+    try std.testing.expectEqual(@as(u64, 120), u.input_tokens);
+    try std.testing.expectEqual(@as(u64, 9), u.output_tokens);
+    try std.testing.expectEqual(@as(u64, 64), u.cache_read_tokens);
+    try std.testing.expectEqual(@as(u64, 0), u.cache_write_tokens);
+
+    // Absent details block reads as a cache miss.
+    const plain = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"prompt_tokens\":5,\"completion_tokens\":2}", .{});
+    const v = parseUsage(plain);
+    try std.testing.expectEqual(@as(u64, 5), v.input_tokens);
+    try std.testing.expectEqual(@as(u64, 0), v.cache_read_tokens);
 }
