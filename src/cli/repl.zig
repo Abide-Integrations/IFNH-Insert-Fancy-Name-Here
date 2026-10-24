@@ -31,6 +31,7 @@ const core_types = @import("../core/types.zig");
 const openai = @import("../providers/openai.zig");
 const anthropic = @import("../providers/anthropic.zig");
 const trace_mod = @import("../core/trace.zig");
+const turn_cache_mod = @import("../core/turn_cache.zig");
 
 const max_output_bytes: usize = 256 * 1024;
 
@@ -60,6 +61,8 @@ const Session = struct {
     user_keys: ?*keys_mod.Keys = null,
     /// Per-session timing trace (B-01).
     trace: ?*trace_mod.Trace = null,
+    /// Per-turn prologue cache, owned by the session (B-04).
+    turn_cache: turn_cache_mod.TurnCache,
     /// One long-lived HTTP client for all provider rounds (B-02).
     http: std.http.Client,
 };
@@ -141,14 +144,14 @@ pub fn run(
         if (opts.resume_id) |id| {
             const store = try session_mod.Session.open(cwd, io, arena, sessions_dir_name, id);
             const j = try journal_mod.Journal.open(io, arena, store.dir);
-            var s = Session{ .io = io, .store = store, .journal = j, .engine = engineFromConfig(arena, &cfg), .trace = opts.trace, .http = http_client };
+            var s = Session{ .io = io, .store = store, .journal = j, .engine = engineFromConfig(arena, &cfg), .trace = opts.trace, .turn_cache = turn_cache_mod.TurnCache.init(io, arena), .http = http_client };
             try rebuildHistory(arena, &s);
             break :blk s;
         } else {
             const cwd_copy: []const u8 = if (environ.get("PWD")) |pwd| pwd else ".";
             const store = try session_mod.Session.create(cwd, io, arena, sessions_dir_name, cwd_copy);
             const j = try journal_mod.Journal.open(io, arena, store.dir);
-            break :blk Session{ .io = io, .store = store, .journal = j, .engine = engineFromConfig(arena, &cfg), .trace = opts.trace, .http = http_client };
+            break :blk Session{ .io = io, .store = store, .journal = j, .engine = engineFromConfig(arena, &cfg), .trace = opts.trace, .turn_cache = turn_cache_mod.TurnCache.init(io, arena), .http = http_client };
         }
     };
     sess.user_keys = &global_user_keys;
@@ -250,24 +253,29 @@ pub fn run(
             continue;
         }
 
-        // ---- policy boundary (D029): re-read disk config, re-assemble
-        // instructions with focus dirs from recent tool activity ----
-        if (reloadConfig(io, arena, cwd, environ, &sess)) |fresh| {
-            cfg.deinit();
-            cfg = fresh;
+        // ---- policy boundary (D029): re-read disk config only when its
+        // files changed (B-04); instructions, the skills catalog and the git
+        // state are memoised per source by the turn cache ----
+        if (sess.turn_cache.configChanged(cwd, config_mod.userConfigPath(arena, environ))) {
+            if (reloadConfig(io, arena, cwd, environ, &sess)) |fresh| {
+                cfg.deinit();
+                cfg = fresh;
+            } else sess.turn_cache.configInvalidate(); // retry next turn
         }
         const focus = instructions_mod.focusDirsFromHistory(arena, sess.history.items, 8);
         var turn_instructions_span = trace_mod.Span.begin(sess.trace, "turn.instructions");
-        const turn_instr = instructions_mod.assemble(cwd, io, arena, system_prompt.system_prompt, focus) catch instr;
-        turn_instructions_span.end("");
+        const turn_instr_lookup = sess.turn_cache.instructions(cwd, system_prompt.system_prompt, focus) catch turn_cache_mod.Lookup(instructions_mod.Assembled){ .value = instr, .hit = false };
+        turn_instructions_span.end(if (turn_instr_lookup.hit) "cached" else "");
+        const turn_instr = turn_instr_lookup.value;
         // Skills catalog appendix (budgeted, K148). It goes after the stable
         // prefix, so a cacheable prefix stays valid across turns (B-03).
         const Prompt = struct { text: []const u8, stable_len: usize };
         const skill_prompt = blk: {
             if (sess.skills) |catalog| {
                 var skills_catalog_span = trace_mod.Span.begin(sess.trace, "turn.skills_catalog");
-                const rendered = skills_mod.renderCatalog(arena, catalog) catch "";
-                skills_catalog_span.end("");
+                const rendered_lookup = sess.turn_cache.skillsText(cwd, config_mod.userSkillsDir(arena, environ), catalog) catch turn_cache_mod.Lookup([]const u8){ .value = "", .hit = false };
+                skills_catalog_span.end(if (rendered_lookup.hit) "cached" else "");
+                const rendered = rendered_lookup.value;
                 if (rendered.len > 0) {
                     const text = std.fmt.allocPrint(arena, "{s}\n\nAvailable skills (load with the skill tool):\n{s}", .{ turn_instr.text, rendered }) catch turn_instr.text;
                     break :blk Prompt{ .text = text, .stable_len = turn_instr.stable_len };
@@ -317,18 +325,12 @@ fn submitTurn(
     // Ctrl-C sets `cancel` while the turn runs; a second one exits (A-06).
     @import("../core/interrupt.zig").install(&cancel);
     defer @import("../core/interrupt.zig").uninstall();
-    var approver = Approver{ .io = io, .engine = &sess.engine };
+    var approver = Approver{ .io = io, .engine = &sess.engine, .cache = &sess.turn_cache };
     var setup_span = trace_mod.Span.begin(sess.trace, "turn.setup");
     var git_span = trace_mod.Span.begin(sess.trace, "turn.git");
-    const turn_git: ?git_mod.Git = blk: {
-        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const n = cwd.realPath(io, &path_buf) catch break :blk null;
-        const repo_path = arena.dupe(u8, path_buf[0..n]) catch break :blk null;
-        const g = git_mod.Git.init(io, repo_path);
-        if (!g.isRepo(arena)) break :blk null;
-        break :blk g;
-    };
-    git_span.end("");
+    const turn_git_lookup = sess.turn_cache.gitRepo(cwd) catch turn_cache_mod.Lookup(?git_mod.Git){ .value = null, .hit = false };
+    git_span.end(if (turn_git_lookup.hit) "cached" else "");
+    const turn_git = turn_git_lookup.value;
     var host = subagent_mod.Host{
         .io = io,
         .workspace = cwd,
@@ -553,59 +555,26 @@ fn submitTurn(
 const Approver = struct {
     io: std.Io,
     engine: *engine_mod.Engine,
+    /// Session-owned cache; the policy content hash is memoised there by
+    /// stat fingerprint (B-04).
+    cache: *turn_cache_mod.TurnCache,
     mutex: std.Io.Mutex = .init,
     /// SHA-256 of policy-relevant files at session start (G99/M0-T30).
     policy_hash: [32]u8 = [_]u8{0} ** 32,
     policy_hashed: bool = false,
 
-    fn policyFingerprint(self: *Approver, arena: std.mem.Allocator) ?[32]u8 {
-        const cwd = std.Io.Dir.cwd();
-        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-        const files = [_][]const u8{
-            ".ifnh/config.json",
-            ".ifnh/config.d",
-            ".ifnh/lifecycle",
-            ".ifnh/instructions",
-            ".ifnh/commands",
-            ".ifnh/skills",
-            "AGENTS.md",
-            "CLAUDE.md",
-        };
-        var any = false;
-        for (files) |f| {
-            const stat = cwd.statFile(self.io, f, .{}) catch continue;
-            any = true;
-            hasher.update(f);
-            if (stat.kind == .directory) {
-                // Hash directory entries (names only; content via children below).
-                var d = cwd.openDir(self.io, f, .{ .iterate = true }) catch continue;
-                defer d.close(self.io);
-                var it = d.iterate();
-                while (it.next(self.io) catch null) |entry| {
-                    hasher.update(entry.name);
-                    const child = std.fmt.allocPrint(arena, "{s}/{s}", .{ f, entry.name }) catch continue;
-                    if (fsutil.readSmallFile(cwd, self.io, arena, child, 1024 * 1024)) |content| {
-                        hasher.update(content);
-                    } else |_| {}
-                }
-            } else if (fsutil.readSmallFile(cwd, self.io, arena, f, 1024 * 1024)) |content| {
-                hasher.update(content);
-            } else |_| {}
-        }
-        if (!any) return null;
-        var digest: [32]u8 = undefined;
-        hasher.final(&digest);
-        return digest;
+    fn policyFingerprint(self: *Approver) ?[32]u8 {
+        return self.cache.policyHash(std.Io.Dir.cwd());
     }
 
     /// Fail-closed on policy tampering between session start and now (G99).
-    fn verifyPolicy(self: *Approver, arena: std.mem.Allocator) bool {
+    fn verifyPolicy(self: *Approver) bool {
         if (!self.policy_hashed) {
-            self.policy_hash = self.policyFingerprint(arena) orelse [_]u8{0} ** 32;
+            self.policy_hash = self.policyFingerprint() orelse [_]u8{0} ** 32;
             self.policy_hashed = true;
             return true;
         }
-        const current = self.policyFingerprint(arena) orelse [_]u8{0} ** 32;
+        const current = self.policyFingerprint() orelse [_]u8{0} ** 32;
         if (!std.mem.eql(u8, &current, &self.policy_hash)) {
             out(self.io, "\nPOLICY CHANGE DETECTED: .ifnh policy files changed since session start.\nApproval denied (fail-closed). Restart the session to adopt the new policy.\n", .{}) catch {};
             return false;
@@ -617,9 +586,7 @@ const Approver = struct {
         const self: *Approver = @ptrCast(@alignCast(ctx));
         self.mutex.lock(self.io) catch return .denied;
         defer self.mutex.unlock(self.io);
-        var fba: [4096]u8 = undefined;
-        var fba_state = std.heap.FixedBufferAllocator.init(&fba);
-        if (!self.verifyPolicy(fba_state.allocator())) return .denied;
+        if (!self.verifyPolicy()) return .denied;
         const head = std.fmt.allocPrint(std.heap.page_allocator, "\n{s}approval needed:{s} {s}\n  {s}\n[y] once  [s] session  [n] no: ", .{
             palette.warn("", std.heap.page_allocator), "\x1b[0m", req.title, req.detail,
         }) catch "approval needed: ";
@@ -1301,7 +1268,7 @@ fn handleCommand(
 
         // Build a host for lifecycle children (reuses the turn host pieces).
         var cancel2 = std.atomic.Value(bool).init(false);
-        var approver2 = Approver{ .io = io, .engine = &sess.engine };
+        var approver2 = Approver{ .io = io, .engine = &sess.engine, .cache = &sess.turn_cache };
         var host2 = subagent_mod.Host{
             .io = io,
             .workspace = cwd,
@@ -1739,6 +1706,7 @@ test "replay keeps assistant tool calls and tool results" {
         .store = try session_mod.Session.create(tmp.dir, io, arena, "sessions", "/tmp/proj"),
         .journal = try journal_mod.Journal.open(io, arena, tmp.dir),
         .engine = engine_mod.Engine.init(arena, .ask),
+        .turn_cache = turn_cache_mod.TurnCache.init(io, arena),
         .http = .{ .allocator = arena, .io = io },
     };
     defer s.http.deinit();
