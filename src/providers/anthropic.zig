@@ -10,6 +10,7 @@ const core_types = @import("../core/types.zig");
 const provider = @import("provider.zig");
 const sse = @import("sse.zig");
 const transport = @import("transport.zig");
+const trace_mod = @import("../core/trace.zig");
 
 const anthropic_version = "2023-06-01";
 const transfer_buffer_size: usize = 16 * 1024;
@@ -28,10 +29,16 @@ pub fn streamFn(
 
     const url = try std.fmt.allocPrint(arena, "{s}/v1/messages", .{trimSlash(req.base_url)});
     const uri = std.Uri.parse(url) catch return error.InvalidBaseUrl;
+    var build_span = trace_mod.Span.begin(req.trace, "provider.request_build");
     const body = try buildBody(arena, req);
+    build_span.end("");
 
-    var client: std.http.Client = .{ .allocator = alloc, .io = io };
-    defer client.deinit();
+    var fallback_client: std.http.Client = .{ .allocator = alloc, .io = io };
+    const client = req.client orelse &fallback_client;
+    defer if (req.client == null) fallback_client.deinit();
+
+    var stream_span = trace_mod.Span.begin(req.trace, "provider.stream");
+    defer stream_span.end("");
 
     var extra = [_]std.http.Header{
         .{ .name = "x-api-key", .value = req.api_key },
@@ -39,7 +46,7 @@ pub fn streamFn(
         .{ .name = "accept", .value = "text/event-stream" },
     };
 
-    const connection = transport.openConnection(&client, uri, transport.default_limits) catch |err| {
+    const connection = transport.openConnection(client, uri, transport.default_limits) catch |err| {
         sink.emit(.{ .failure = transport.failureFor(err, null) });
         return;
     };

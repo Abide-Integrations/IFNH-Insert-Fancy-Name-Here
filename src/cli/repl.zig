@@ -30,6 +30,7 @@ const tool_mod = @import("../tools/tool.zig");
 const core_types = @import("../core/types.zig");
 const openai = @import("../providers/openai.zig");
 const anthropic = @import("../providers/anthropic.zig");
+const trace_mod = @import("../core/trace.zig");
 
 const max_output_bytes: usize = 256 * 1024;
 
@@ -37,6 +38,8 @@ pub const Options = struct {
     resume_id: ?[]const u8 = null,
     json: bool = false,
     no_color: bool = false,
+    /// Startup trace owned by main, measured from process start (B-01).
+    trace: ?*trace_mod.Trace = null,
 };
 
 const Session = struct {
@@ -55,6 +58,10 @@ const Session = struct {
     last_blocked_stage: ?[]const u8 = null,
     /// Persistent key store (user env file) for /provider key.
     user_keys: ?*keys_mod.Keys = null,
+    /// Per-session timing trace (B-01).
+    trace: ?*trace_mod.Trace = null,
+    /// One long-lived HTTP client for all provider rounds (B-02).
+    http: std.http.Client,
 };
 
 var global_user_keys: keys_mod.Keys = undefined;
@@ -101,7 +108,12 @@ pub fn run(
     const cwd = std.Io.Dir.cwd();
 
     // ---- configuration ----
-    var cfg = try config_mod.load(arena, io, environ, cwd);
+    var config_span = trace_mod.Span.begin(opts.trace, "startup.config");
+    var cfg = config_mod.load(arena, io, environ, cwd) catch |err| {
+        config_span.end("error");
+        return err;
+    };
+    config_span.end("");
     defer cfg.deinit();
     for (cfg.errors.items) |err| {
         try out(io, "config error [{s}]: {s}\n", .{ err.path, err.message });
@@ -122,18 +134,21 @@ pub fn run(
     ensureIfnh(io, cwd) catch {};
     const sessions_dir_name = sessionsDir(arena, &cfg);
 
+    var http_client: std.http.Client = .{ .allocator = arena, .io = io };
+    defer http_client.deinit();
+
     var sess: Session = blk: {
         if (opts.resume_id) |id| {
             const store = try session_mod.Session.open(cwd, io, arena, sessions_dir_name, id);
             const j = try journal_mod.Journal.open(io, arena, store.dir);
-            var s = Session{ .io = io, .store = store, .journal = j, .engine = engineFromConfig(arena, &cfg) };
+            var s = Session{ .io = io, .store = store, .journal = j, .engine = engineFromConfig(arena, &cfg), .trace = opts.trace, .http = http_client };
             try rebuildHistory(arena, &s);
             break :blk s;
         } else {
             const cwd_copy: []const u8 = if (environ.get("PWD")) |pwd| pwd else ".";
             const store = try session_mod.Session.create(cwd, io, arena, sessions_dir_name, cwd_copy);
             const j = try journal_mod.Journal.open(io, arena, store.dir);
-            break :blk Session{ .io = io, .store = store, .journal = j, .engine = engineFromConfig(arena, &cfg) };
+            break :blk Session{ .io = io, .store = store, .journal = j, .engine = engineFromConfig(arena, &cfg), .trace = opts.trace, .http = http_client };
         }
     };
     sess.user_keys = &global_user_keys;
@@ -145,11 +160,13 @@ pub fn run(
     }
 
     // ---- skills catalog (K148/149) ----
+    var skills_span = trace_mod.Span.begin(opts.trace, "startup.skills");
     sess.skills = blk: {
         const user_dir = config_mod.userSkillsDir(arena, environ) orelse break :blk null;
         const catalog = skills_mod.discover(cwd, io, arena, user_dir) catch break :blk null;
         break :blk catalog;
     };
+    skills_span.end("");
 
     // ---- background executions (I123-125) ----
     sess.executions = blk: {
@@ -166,12 +183,14 @@ pub fn run(
     };
 
     // ---- provider ----
-    const pcfg = buildProviderConfig(&cfg, environ);
+    const pcfg = buildProviderConfig(&cfg, environ, &sess.http);
     const provider_name = cfg.getString("model.provider", "openai");
 
     // ---- instructions ----
     const builtin_prompt = system_prompt.system_prompt;
+    var instructions_span = trace_mod.Span.begin(opts.trace, "startup.instructions");
     const instr = try instructions_mod.assemble(cwd, io, arena, builtin_prompt, &.{});
+    instructions_span.end("");
 
     // ---- welcome ----
     {
@@ -192,6 +211,12 @@ pub fn run(
             key_note,
         });
         try out(io, "{s}type a message, or /help for commands{s}\n", .{ palette.dim("", arena), "\x1b[0m" });
+    }
+
+    // First paint is measured from process start, not from REPL setup.
+    if (opts.trace) |t| {
+        const first_paint = trace_mod.Span{ .trace = t, .name = "startup.first_paint", .start = t.t0 };
+        first_paint.end("");
     }
 
     // ---- input loop ----
@@ -218,7 +243,7 @@ pub fn run(
             switch (action) {
                 .quit => break,
                 .submit => |prompt| {
-                    try submitTurn(io, arena, environ, &sess, &cfg, buildProviderConfig(&cfg, environ), instr.text, prompt, cwd);
+                    try submitTurn(io, arena, environ, &sess, &cfg, buildProviderConfig(&cfg, environ, &sess.http), instr.text, prompt, cwd);
                 },
                 .none => {},
             }
@@ -232,11 +257,15 @@ pub fn run(
             cfg = fresh;
         }
         const focus = instructions_mod.focusDirsFromHistory(arena, sess.history.items, 8);
+        var turn_instructions_span = trace_mod.Span.begin(sess.trace, "turn.instructions");
         const turn_instr = instructions_mod.assemble(cwd, io, arena, system_prompt.system_prompt, focus) catch instr;
+        turn_instructions_span.end("");
         // Skills catalog appendix (budgeted, K148).
         const skill_prompt = blk: {
             if (sess.skills) |catalog| {
+                var skills_catalog_span = trace_mod.Span.begin(sess.trace, "turn.skills_catalog");
                 const rendered = skills_mod.renderCatalog(arena, catalog) catch "";
+                skills_catalog_span.end("");
                 if (rendered.len > 0) {
                     break :blk std.fmt.allocPrint(arena, "{s}\n\nAvailable skills (load with the skill tool):\n{s}", .{ turn_instr.text, rendered }) catch turn_instr.text;
                 }
@@ -244,7 +273,7 @@ pub fn run(
             break :blk turn_instr.text;
         };
 
-        try submitTurn(io, arena, environ, &sess, &cfg, buildProviderConfig(&cfg, environ), skill_prompt, line, cwd);
+        try submitTurn(io, arena, environ, &sess, &cfg, buildProviderConfig(&cfg, environ, &sess.http), skill_prompt, line, cwd);
     }
 }
 
@@ -277,11 +306,24 @@ fn submitTurn(
         try out(io, "note: no api key — run /provider key {s} <value> (or export it) before sending a message\n", .{key_env});
     }
 
+    var total_span = trace_mod.Span.begin(sess.trace, "turn.total");
+    defer total_span.end("");
     var cancel = std.atomic.Value(bool).init(false);
     // Ctrl-C sets `cancel` while the turn runs; a second one exits (A-06).
     @import("../core/interrupt.zig").install(&cancel);
     defer @import("../core/interrupt.zig").uninstall();
     var approver = Approver{ .io = io, .engine = &sess.engine };
+    var setup_span = trace_mod.Span.begin(sess.trace, "turn.setup");
+    var git_span = trace_mod.Span.begin(sess.trace, "turn.git");
+    const turn_git: ?git_mod.Git = blk: {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const n = cwd.realPath(io, &path_buf) catch break :blk null;
+        const repo_path = arena.dupe(u8, path_buf[0..n]) catch break :blk null;
+        const g = git_mod.Git.init(io, repo_path);
+        if (!g.isRepo(arena)) break :blk null;
+        break :blk g;
+    };
+    git_span.end("");
     var host = subagent_mod.Host{
         .io = io,
         .workspace = cwd,
@@ -290,6 +332,7 @@ fn submitTurn(
         .base_url = pcfg.base_url,
         .api_key = pcfg.api_key,
         .default_model = pcfg.model,
+        .client = &sess.http,
         .mode = sess.engine.mode,
         .read_globs = sess.engine.read_globs,
         .write_globs = sess.engine.write_globs,
@@ -311,14 +354,7 @@ fn submitTurn(
         .temperature = cfg.getOptionalF64("model.temperature"),
         .max_output_tokens = cfg.getOptionalU32("model.max_output_tokens"),
         .cancel = &cancel,
-        .git = blk: {
-            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-            const n = cwd.realPath(io, &path_buf) catch break :blk null;
-            const repo_path = arena.dupe(u8, path_buf[0..n]) catch break :blk null;
-            const g = git_mod.Git.init(io, repo_path);
-            if (!g.isRepo(arena)) break :blk null;
-            break :blk g;
-        },
+        .git = turn_git,
         .worktree_root = blk: {
             const state_root = config_mod.userStateDir(arena, environ) orelse break :blk null;
             const root = std.fmt.allocPrint(arena, "{s}/worktrees", .{state_root}) catch break :blk null;
@@ -353,6 +389,7 @@ fn submitTurn(
     };
     tool_ctx.approval_ctx = &approver;
     tool_ctx.approval_fn = Approver.approve;
+    setup_span.end("");
 
     const TurnUi = struct {
         io: std.Io,
@@ -395,8 +432,10 @@ fn submitTurn(
     };
     var ui = TurnUi{ .io = io, .store = &sess.store };
 
+    var hooks_span = trace_mod.Span.begin(sess.trace, "turn.hooks");
     var hook_engine = hooks_mod.Engine.init(io, cwd, try hooks_mod.Engine.fromConfig(arena, cfg.get("hooks")), arena);
     const pre = hook_engine.dispatch(.before_agent, "{}");
+    hooks_span.end("");
     if (pre.blocked) {
         try out(io, "before_agent hook blocked the turn: {s}\n", .{pre.output});
         return;
@@ -454,6 +493,7 @@ fn submitTurn(
         .max_retries = cfg.getU32("agents.max_retries", 3),
         .max_tool_rounds = cfg.getU32("agents.max_tool_rounds", 25),
         .redactions = redactionsFor(arena, cfg.getBool("debug.redact", true), pcfg.api_key),
+        .trace = sess.trace,
     }) catch |err| {
         rollbackTurn(sess, history_start);
         try out(io, "\nturn failed: {s}\n", .{@errorName(err)});
@@ -1075,7 +1115,7 @@ fn runFirstRunSetup(
     }
 }
 
-fn buildProviderConfig(cfg: *config_mod.Store, environ: *const std.process.Environ.Map) agent_engine.ProviderConfig {
+fn buildProviderConfig(cfg: *config_mod.Store, environ: *const std.process.Environ.Map, client: ?*std.http.Client) agent_engine.ProviderConfig {
     const provider_name = cfg.getString("model.provider", "openai");
     const is_anthropic = std.mem.eql(u8, provider_name, "anthropic");
     const base_url = cfg.getOptionalString("model.base_url") orelse
@@ -1096,6 +1136,7 @@ fn buildProviderConfig(cfg: *config_mod.Store, environ: *const std.process.Envir
         .model = model,
         .base_url = base_url,
         .api_key = api_key,
+        .client = client,
     };
 }
 
@@ -1254,10 +1295,11 @@ fn handleCommand(
             .io = io,
             .workspace = cwd,
             .base_system = instr.text,
-            .provider = buildProviderConfig(cfg, environ).provider,
-            .base_url = buildProviderConfig(cfg, environ).base_url,
-            .api_key = buildProviderConfig(cfg, environ).api_key,
-            .default_model = buildProviderConfig(cfg, environ).model,
+            .provider = buildProviderConfig(cfg, environ, &sess.http).provider,
+            .base_url = buildProviderConfig(cfg, environ, &sess.http).base_url,
+            .api_key = buildProviderConfig(cfg, environ, &sess.http).api_key,
+            .default_model = buildProviderConfig(cfg, environ, &sess.http).model,
+            .client = &sess.http,
             .mode = sess.engine.mode,
             .read_globs = sess.engine.read_globs,
             .write_globs = sess.engine.write_globs,
@@ -1335,7 +1377,7 @@ fn handleCommand(
             if (buf.items.len == 0) out(io, "no background executions\n", .{}) catch {} else out(io, "{s}", .{buf.items}) catch {};
         } else out(io, "background executions unavailable\n", .{}) catch {};
     } else if (std.mem.eql(u8, cmd, "provider")) {
-        const pcfg_now = buildProviderConfig(cfg, g_environ.?);
+        const pcfg_now = buildProviderConfig(cfg, g_environ.?, &sess.http);
         if (rest.len == 0 or std.mem.eql(u8, rest, "show")) {
             const key_state = if (pcfg_now.api_key.len > 0)
                 palette.success("found", arena)
@@ -1504,7 +1546,7 @@ fn handleCommand(
         }
         out(io, "session usage: {d} turns, {d} tokens in, {d} tokens out\n", .{ turns, total_in, total_out }) catch {};
     } else if (std.mem.eql(u8, cmd, "compact")) {
-        const pcfg2 = buildProviderConfig(cfg, environ);
+        const pcfg2 = buildProviderConfig(cfg, environ, &sess.http);
         out(io, "[compacting context...]\n", .{}) catch {};
         const res_opt: ?compaction_mod.Result = blk: {
             break :blk compaction_mod.compact(arena, io, pcfg2, &sess.history, &.{}) catch |err| {
@@ -1686,7 +1728,9 @@ test "replay keeps assistant tool calls and tool results" {
         .store = try session_mod.Session.create(tmp.dir, io, arena, "sessions", "/tmp/proj"),
         .journal = try journal_mod.Journal.open(io, arena, tmp.dir),
         .engine = engine_mod.Engine.init(arena, .ask),
+        .http = .{ .allocator = arena, .io = io },
     };
+    defer s.http.deinit();
     defer s.store.close();
 
     _ = try s.store.append(.{ .user = .{ .text = "read a" } });

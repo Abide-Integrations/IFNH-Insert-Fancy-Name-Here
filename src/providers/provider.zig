@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const core_types = @import("../core/types.zig");
+const trace_mod = @import("../core/trace.zig");
 
 pub const StreamEvent = core_types.StreamEvent;
 
@@ -35,6 +36,11 @@ pub const ModelRequest = struct {
     max_output_tokens: ?u32 = null,
     /// Opaque provider-specific options (JSON object text) or "".
     provider_options: []const u8 = "",
+    /// Optional timing trace owned by the session (B-01).
+    trace: ?*trace_mod.Trace = null,
+    /// Session-owned HTTP client; adapters fall back to a per-request
+    /// client when null and never deinit a caller-supplied one (B-02).
+    client: ?*std.http.Client = null,
     cancel: *std.atomic.Value(bool),
 };
 

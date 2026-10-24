@@ -180,6 +180,61 @@ test "openai adapter streams against fake HTTP server" {
     try std.testing.expect(collector.failure == null);
 }
 
+fn runOpenAiOnce(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    client: ?*std.http.Client,
+    srv: *FakeServer,
+    base: []const u8,
+) !Collector {
+    var cancel = std.atomic.Value(bool).init(false);
+    var collector = Collector{ .arena = arena };
+    try openai_adapter.streamFn(undefined, arena, io, .{
+        .model = "test-model",
+        .base_url = base,
+        .api_key = "test-key-1234567890",
+        .system = "",
+        .messages = &.{},
+        .cancel = &cancel,
+        .client = client,
+    }, .{ .ctx = &collector, .emit_fn = Collector.emit });
+    srv.wait();
+    return collector;
+}
+
+test "supplied HTTP client is reused across rounds; null falls back" {
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const body = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n" ++
+        "data: [DONE]\n\n";
+
+    var client: std.http.Client = .{ .allocator = arena, .io = io };
+    defer client.deinit();
+
+    // Two rounds through one supplied client.
+    const srv1 = try FakeServer.start(io, arena, body);
+    defer srv1.stop();
+    const base1 = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}", .{srv1.port});
+    const c1 = try runOpenAiOnce(io, arena, &client, srv1, base1);
+    try std.testing.expect(c1.done);
+
+    const srv2 = try FakeServer.start(io, arena, body);
+    defer srv2.stop();
+    const base2 = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}", .{srv2.port});
+    const c2 = try runOpenAiOnce(io, arena, &client, srv2, base2);
+    try std.testing.expect(c2.done);
+
+    // A null client takes the per-request fallback path.
+    const srv3 = try FakeServer.start(io, arena, body);
+    defer srv3.stop();
+    const base3 = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}", .{srv3.port});
+    const c3 = try runOpenAiOnce(io, arena, null, srv3, base3);
+    try std.testing.expect(c3.done);
+}
+
 test "openai adapter reports rate limit and Retry-After" {
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
