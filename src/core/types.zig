@@ -33,6 +33,11 @@ pub const ToolCall = struct {
 pub const Usage = struct {
     input_tokens: u64 = 0,
     output_tokens: u64 = 0,
+    /// Prompt-cache hits and writes reported by the provider (B-03).
+    /// Anthropic `cache_read_input_tokens`/`cache_creation_input_tokens`,
+    /// OpenAI `prompt_tokens_details.cached_tokens` (reads only).
+    cache_read_tokens: u64 = 0,
+    cache_write_tokens: u64 = 0,
 };
 
 pub const ProviderFailureKind = enum {

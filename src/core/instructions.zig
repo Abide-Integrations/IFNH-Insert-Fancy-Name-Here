@@ -18,6 +18,12 @@ pub const Source = struct {
 
 pub const Assembled = struct {
     text: []const u8,
+    /// Length of the byte-stable prefix of `text` (B-03): the built-in
+    /// prompt plus the project-level sources (AGENTS.md, CLAUDE.md,
+    /// .ifnh/instructions). Everything after it is volatile (focus-dir
+    /// nested instructions, and whatever the caller appends, e.g. the
+    /// skills catalog) and must not invalidate a cached prefix.
+    stable_len: usize,
     sources: []Source,
 };
 
@@ -77,6 +83,10 @@ pub fn assemble(
         } else |_| {}
     }
 
+    // Everything above this point is the byte-stable prefix: it depends
+    // only on the repository, never on the turn's focus directories.
+    const stable_len = parts.items.len;
+
     // Nested AGENTS.md for focus directories (deepest path wins duplicates).
     var seen_dirs: std.ArrayListUnmanaged([]const u8) = .empty;
     for (focus_dirs) |dir| {
@@ -100,7 +110,7 @@ pub fn assemble(
         } else |_| {}
     }
 
-    return .{ .text = parts.items, .sources = sources.items };
+    return .{ .text = parts.items, .stable_len = stable_len, .sources = sources.items };
 }
 
 /// Extract the directories referenced by tool calls in the history
@@ -184,10 +194,20 @@ test "focus dirs pull in nested AGENTS.md" {
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "src/core");
     try tmp.dir.writeFile(io, .{ .sub_path = "src/core/AGENTS.md", .data = "core rules" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = "repo rules" });
 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const asm2 = try assemble(tmp.dir, io, arena_state.allocator(), "builtin", &.{"src/core"});
     try std.testing.expect(std.mem.indexOf(u8, asm2.text, "core rules") != null);
-    try std.testing.expectEqual(@as(usize, 2), asm2.sources.len);
+    try std.testing.expectEqual(@as(usize, 3), asm2.sources.len);
+
+    // The stable prefix is the same with and without focus dirs: only the
+    // volatile tail changes (B-03).
+    const plain = try assemble(tmp.dir, io, arena_state.allocator(), "builtin", &.{});
+    try std.testing.expectEqual(plain.stable_len, asm2.stable_len);
+    try std.testing.expectEqual(plain.text.len, plain.stable_len);
+    try std.testing.expect(asm2.text.len > asm2.stable_len);
+    try std.testing.expectEqualStrings(plain.text, asm2.text[0..asm2.stable_len]);
+    try std.testing.expect(std.mem.indexOf(u8, asm2.text[0..asm2.stable_len], "core rules") == null);
 }
