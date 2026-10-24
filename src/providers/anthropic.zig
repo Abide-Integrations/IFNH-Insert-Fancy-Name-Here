@@ -33,8 +33,9 @@ pub fn streamFn(
     const body = try buildBody(arena, req);
     build_span.end("");
 
-    var client: std.http.Client = .{ .allocator = alloc, .io = io };
-    defer client.deinit();
+    var fallback_client: std.http.Client = .{ .allocator = alloc, .io = io };
+    const client = req.client orelse &fallback_client;
+    defer if (req.client == null) fallback_client.deinit();
 
     var stream_span = trace_mod.Span.begin(req.trace, "provider.stream");
     defer stream_span.end("");
@@ -45,7 +46,7 @@ pub fn streamFn(
         .{ .name = "accept", .value = "text/event-stream" },
     };
 
-    const connection = transport.openConnection(&client, uri, transport.default_limits) catch |err| {
+    const connection = transport.openConnection(client, uri, transport.default_limits) catch |err| {
         sink.emit(.{ .failure = transport.failureFor(err, null) });
         return;
     };

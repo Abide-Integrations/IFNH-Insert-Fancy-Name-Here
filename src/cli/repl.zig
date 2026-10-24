@@ -60,6 +60,8 @@ const Session = struct {
     user_keys: ?*keys_mod.Keys = null,
     /// Per-session timing trace (B-01).
     trace: ?*trace_mod.Trace = null,
+    /// One long-lived HTTP client for all provider rounds (B-02).
+    http: std.http.Client,
 };
 
 var global_user_keys: keys_mod.Keys = undefined;
@@ -132,18 +134,21 @@ pub fn run(
     ensureIfnh(io, cwd) catch {};
     const sessions_dir_name = sessionsDir(arena, &cfg);
 
+    var http_client: std.http.Client = .{ .allocator = arena, .io = io };
+    defer http_client.deinit();
+
     var sess: Session = blk: {
         if (opts.resume_id) |id| {
             const store = try session_mod.Session.open(cwd, io, arena, sessions_dir_name, id);
             const j = try journal_mod.Journal.open(io, arena, store.dir);
-            var s = Session{ .io = io, .store = store, .journal = j, .engine = engineFromConfig(arena, &cfg), .trace = opts.trace };
+            var s = Session{ .io = io, .store = store, .journal = j, .engine = engineFromConfig(arena, &cfg), .trace = opts.trace, .http = http_client };
             try rebuildHistory(arena, &s);
             break :blk s;
         } else {
             const cwd_copy: []const u8 = if (environ.get("PWD")) |pwd| pwd else ".";
             const store = try session_mod.Session.create(cwd, io, arena, sessions_dir_name, cwd_copy);
             const j = try journal_mod.Journal.open(io, arena, store.dir);
-            break :blk Session{ .io = io, .store = store, .journal = j, .engine = engineFromConfig(arena, &cfg), .trace = opts.trace };
+            break :blk Session{ .io = io, .store = store, .journal = j, .engine = engineFromConfig(arena, &cfg), .trace = opts.trace, .http = http_client };
         }
     };
     sess.user_keys = &global_user_keys;
@@ -178,7 +183,7 @@ pub fn run(
     };
 
     // ---- provider ----
-    const pcfg = buildProviderConfig(&cfg, environ);
+    const pcfg = buildProviderConfig(&cfg, environ, &sess.http);
     const provider_name = cfg.getString("model.provider", "openai");
 
     // ---- instructions ----
@@ -238,7 +243,7 @@ pub fn run(
             switch (action) {
                 .quit => break,
                 .submit => |prompt| {
-                    try submitTurn(io, arena, environ, &sess, &cfg, buildProviderConfig(&cfg, environ), instr.text, prompt, cwd);
+                    try submitTurn(io, arena, environ, &sess, &cfg, buildProviderConfig(&cfg, environ, &sess.http), instr.text, prompt, cwd);
                 },
                 .none => {},
             }
@@ -268,7 +273,7 @@ pub fn run(
             break :blk turn_instr.text;
         };
 
-        try submitTurn(io, arena, environ, &sess, &cfg, buildProviderConfig(&cfg, environ), skill_prompt, line, cwd);
+        try submitTurn(io, arena, environ, &sess, &cfg, buildProviderConfig(&cfg, environ, &sess.http), skill_prompt, line, cwd);
     }
 }
 
@@ -327,6 +332,7 @@ fn submitTurn(
         .base_url = pcfg.base_url,
         .api_key = pcfg.api_key,
         .default_model = pcfg.model,
+        .client = &sess.http,
         .mode = sess.engine.mode,
         .read_globs = sess.engine.read_globs,
         .write_globs = sess.engine.write_globs,
@@ -1109,7 +1115,7 @@ fn runFirstRunSetup(
     }
 }
 
-fn buildProviderConfig(cfg: *config_mod.Store, environ: *const std.process.Environ.Map) agent_engine.ProviderConfig {
+fn buildProviderConfig(cfg: *config_mod.Store, environ: *const std.process.Environ.Map, client: ?*std.http.Client) agent_engine.ProviderConfig {
     const provider_name = cfg.getString("model.provider", "openai");
     const is_anthropic = std.mem.eql(u8, provider_name, "anthropic");
     const base_url = cfg.getOptionalString("model.base_url") orelse
@@ -1130,6 +1136,7 @@ fn buildProviderConfig(cfg: *config_mod.Store, environ: *const std.process.Envir
         .model = model,
         .base_url = base_url,
         .api_key = api_key,
+        .client = client,
     };
 }
 
@@ -1288,10 +1295,11 @@ fn handleCommand(
             .io = io,
             .workspace = cwd,
             .base_system = instr.text,
-            .provider = buildProviderConfig(cfg, environ).provider,
-            .base_url = buildProviderConfig(cfg, environ).base_url,
-            .api_key = buildProviderConfig(cfg, environ).api_key,
-            .default_model = buildProviderConfig(cfg, environ).model,
+            .provider = buildProviderConfig(cfg, environ, &sess.http).provider,
+            .base_url = buildProviderConfig(cfg, environ, &sess.http).base_url,
+            .api_key = buildProviderConfig(cfg, environ, &sess.http).api_key,
+            .default_model = buildProviderConfig(cfg, environ, &sess.http).model,
+            .client = &sess.http,
             .mode = sess.engine.mode,
             .read_globs = sess.engine.read_globs,
             .write_globs = sess.engine.write_globs,
@@ -1369,7 +1377,7 @@ fn handleCommand(
             if (buf.items.len == 0) out(io, "no background executions\n", .{}) catch {} else out(io, "{s}", .{buf.items}) catch {};
         } else out(io, "background executions unavailable\n", .{}) catch {};
     } else if (std.mem.eql(u8, cmd, "provider")) {
-        const pcfg_now = buildProviderConfig(cfg, g_environ.?);
+        const pcfg_now = buildProviderConfig(cfg, g_environ.?, &sess.http);
         if (rest.len == 0 or std.mem.eql(u8, rest, "show")) {
             const key_state = if (pcfg_now.api_key.len > 0)
                 palette.success("found", arena)
@@ -1538,7 +1546,7 @@ fn handleCommand(
         }
         out(io, "session usage: {d} turns, {d} tokens in, {d} tokens out\n", .{ turns, total_in, total_out }) catch {};
     } else if (std.mem.eql(u8, cmd, "compact")) {
-        const pcfg2 = buildProviderConfig(cfg, environ);
+        const pcfg2 = buildProviderConfig(cfg, environ, &sess.http);
         out(io, "[compacting context...]\n", .{}) catch {};
         const res_opt: ?compaction_mod.Result = blk: {
             break :blk compaction_mod.compact(arena, io, pcfg2, &sess.history, &.{}) catch |err| {
@@ -1720,7 +1728,9 @@ test "replay keeps assistant tool calls and tool results" {
         .store = try session_mod.Session.create(tmp.dir, io, arena, "sessions", "/tmp/proj"),
         .journal = try journal_mod.Journal.open(io, arena, tmp.dir),
         .engine = engine_mod.Engine.init(arena, .ask),
+        .http = .{ .allocator = arena, .io = io },
     };
+    defer s.http.deinit();
     defer s.store.close();
 
     _ = try s.store.append(.{ .user = .{ .text = "read a" } });

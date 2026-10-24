@@ -32,6 +32,8 @@ pub const ProviderConfig = struct {
     model: []const u8,
     base_url: []const u8,
     api_key: []const u8,
+    /// Session-owned client shared by every round (B-02).
+    client: ?*std.http.Client = null,
 };
 
 pub const Callbacks = struct {
@@ -187,6 +189,7 @@ pub fn runTurn(p: RunParams) !Outcome {
                 .max_output_tokens = p.max_output_tokens,
                 .cancel = p.cancel,
                 .trace = p.trace,
+                .client = p.pcfg.client,
             }, .{ .ctx = &trace_sink, .emit_fn = TraceSink.emit });
             if (collector.failure) |f| {
                 if (core_types.isRetryable(f.kind) and attempt < p.max_retries and
