@@ -99,6 +99,22 @@ pub fn streamFn(
         id: []const u8 = "",
         name: []const u8 = "",
         args: std.ArrayListUnmanaged(u8) = .empty,
+        emitted: bool = false,
+
+        /// Emit this call once, when its block closes. The caller keeps the
+        /// emitted slices for the rest of the stream call, so the arguments
+        /// are copied out of the list that later deltas would grow. `id` and
+        /// `name` are already arena-owned from `content_block_start`.
+        fn emit(self: *@This(), arena_mem: std.mem.Allocator, event_sink: provider.Sink) !void {
+            if (self.emitted or self.name.len == 0) return;
+            const args = try arena_mem.dupe(u8, self.args.items);
+            self.emitted = true;
+            event_sink.emit(.{ .tool_call = .{
+                .id = self.id,
+                .name = self.name,
+                .arguments_json = args,
+            } });
+        }
     };
     var tools: [16]ToolAcc = undefined;
     var tool_count: usize = 0;
@@ -162,6 +178,11 @@ pub fn streamFn(
                     }
                 }
             }
+        } else if (std.mem.eql(u8, ev, "content_block_stop")) {
+            // A tool_use block is complete here. A text block's stop finds no
+            // named accumulator and emits nothing.
+            const index = intOf(o.get("index")) orelse continue;
+            if (index < tool_count) try tools[index].emit(arena, sink);
         } else if (std.mem.eql(u8, ev, "message_delta")) {
             if (o.get("usage")) |u| {
                 if (u == .object) usage.output_tokens = intOf(u.object.get("output_tokens")) orelse usage.output_tokens;
@@ -171,14 +192,9 @@ pub fn streamFn(
         }
     }
 
-    for (tools[0..tool_count]) |*t| {
-        if (t.name.len == 0) continue;
-        sink.emit(.{ .tool_call = .{
-            .id = t.id,
-            .name = t.name,
-            .arguments_json = t.args.items,
-        } });
-    }
+    // Fallback for tool blocks that never saw a content_block_stop (torn or
+    // interrupted stream): emit each one once, in index order.
+    for (tools[0..tool_count]) |*t| try t.emit(arena, sink);
 
     if (usage.input_tokens != 0 or usage.output_tokens != 0 or
         usage.cache_read_tokens != 0 or usage.cache_write_tokens != 0)
