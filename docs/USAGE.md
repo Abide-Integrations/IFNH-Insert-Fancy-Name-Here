@@ -12,7 +12,7 @@ Requires [Zig 0.16.0](https://ziglang.org/download/). No other toolchain.
 ```bash
 zig build -Doptimize=ReleaseSafe     # -> zig-out/bin/ifnh (~1.7 MiB)
 zig build test                       # unit tests
-./scripts/bench.sh                   # verify size + startup budgets
+./scripts/bench.sh                   # verify size, startup, TTFT, per-round overhead, RSS budgets
 ```
 
 Cross-compiling for distribution (any target, from any host):
@@ -270,8 +270,9 @@ curl -fsSL https://raw.githubusercontent.com/<org>/ifnh/main/uninstall.sh | sh
 ```
 
 CI is deliberately lean: `ci.yml` runs on ubuntu only (auto-cancel,
-docs-only changes skipped) — fmt, tests, ReleaseSafe build, size +
-startup budgets, integration harnesses. `release.yml` builds all five
+docs-only changes skipped) — fmt, tests, ReleaseSafe build,
+`scripts/bench.sh` budgets (size, startup, interactive cold start, TTFT,
+per-round overhead, peak RSS), integration harnesses. `release.yml` builds all five
 release targets cross-compiled on one ubuntu runner and attaches them to
 the GitHub release with sha256sums. For a single machine:
 

@@ -10,6 +10,7 @@ const core_types = @import("../core/types.zig");
 const provider = @import("provider.zig");
 const sse = @import("sse.zig");
 const transport = @import("transport.zig");
+const limits = @import("limits.zig");
 const trace_mod = @import("../core/trace.zig");
 
 const anthropic_version = "2023-06-01";
@@ -248,7 +249,7 @@ fn buildBody(arena: std.mem.Allocator, req: provider.ModelRequest) ![]u8 {
 
     try w.writeAll("{\"model\":");
     try std.json.Stringify.value(req.model, .{}, w);
-    try w.print(",\"max_tokens\":{d},\"stream\":true", .{req.max_output_tokens orelse 4096});
+    try w.print(",\"max_tokens\":{d},\"stream\":true", .{req.max_output_tokens orelse limits.defaultMaxOutputTokens(req.model) orelse 4096});
 
     if (req.system.len > 0) {
         // Prompt caching (B-03): when the caller reports a stable prefix,
@@ -534,6 +535,18 @@ test "wire golden anthropic body is byte-stable" {
         \\{"model":"claude-test","max_tokens":4096,"stream":true,"system":"sys","messages":[{"role":"user","content":"first"},{"role":"assistant","content":[{"type":"text","text":"checking"},{"type":"tool_use","id":"t1","name":"read","input":{"path":"a.txt"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"alpha"}]},{"role":"user","content":"second"}],"tools":[{"name":"read","description":"Read a file","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}}]}
     ;
     try std.testing.expectEqualStrings(expected, body);
+}
+
+test "body max_tokens uses the model default unless configured" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var req = testRequest(&.{.{ .role = .user, .content = "hi" }}, &.{});
+    req.model = "claude-sonnet-4-6";
+    try std.testing.expect(std.mem.indexOf(u8, try buildBody(arena, req), "\"max_tokens\":8192,") != null);
+    req.max_output_tokens = 1234;
+    try std.testing.expect(std.mem.indexOf(u8, try buildBody(arena, req), "\"max_tokens\":1234,") != null);
 }
 
 test "body splits a cacheable system prefix into two blocks" {
