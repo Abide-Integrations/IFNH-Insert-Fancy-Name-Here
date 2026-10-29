@@ -454,20 +454,139 @@ fn grepDir(
     }
 }
 
+/// Longest grep line that is buffered and matched. Longer lines are matched
+/// on this prefix and the remainder is discarded without being buffered.
+const max_grep_line_bytes: usize = 8 * 1024;
+
+fn grepLineHit(
+    ctx: *ToolContext,
+    rel: []const u8,
+    line_no: usize,
+    line: []const u8,
+    pattern: []const u8,
+    limits: *WalkLimits,
+    out: *std.ArrayListUnmanaged(u8),
+    file_hits: *usize,
+) bool {
+    if (file_hits.* >= 10 or limits.max_matches == 0) return false;
+    if (std.mem.indexOf(u8, line, pattern) != null) {
+        out.print(ctx.arena, "{s}:{d}: {s}\n", .{ rel, line_no + 1, std.mem.trimEnd(u8, line, "\r") }) catch return false;
+        file_hits.* += 1;
+        limits.max_matches -= 1;
+    }
+    return true;
+}
+
+/// Accept a valid UTF-8 buffer, or one whose final code point was cut by the
+/// line cap. Used only for truncated overlong lines.
+fn isTruncatedUtf8(data: []const u8) bool {
+    if (std.unicode.utf8ValidateSlice(data)) return true;
+    var end = data.len;
+    var trimmed: usize = 0;
+    while (trimmed < 3 and end > 0) : (trimmed += 1) {
+        end -= 1;
+        if (std.unicode.utf8ValidateSlice(data[0..end])) return true;
+    }
+    return false;
+}
+
+const DiscardResult = enum { newline, eof, failed };
+
+/// Discard the rest of an overlong line without buffering it.
+fn discardGrepLine(r: *std.Io.Reader) DiscardResult {
+    while (true) {
+        _ = r.takeDelimiterInclusive('\n') catch |err| switch (err) {
+            error.StreamTooLong => {
+                r.tossBuffered();
+                continue;
+            },
+            error.EndOfStream => {
+                r.tossBuffered();
+                return .eof;
+            },
+            error.ReadFailed => return .failed,
+        };
+        return .newline;
+    }
+}
+
+fn grepRollback(out: *std.ArrayListUnmanaged(u8), out_start: usize, limits: *WalkLimits, matches_start: usize) void {
+    out.shrinkRetainingCapacity(out_start);
+    limits.max_matches = matches_start;
+}
+
 fn grepFile(ctx: *ToolContext, rel: []const u8, pattern: []const u8, limits: *WalkLimits, out: *std.ArrayListUnmanaged(u8)) void {
     if (!ctx.engine.read_dotenv and isDotenvPath(rel)) return;
-    const data = ctx.workspace.readFileAlloc(ctx.io, rel, ctx.arena, .limited(max_file_size_bytes)) catch return;
-    if (!std.unicode.utf8ValidateSlice(data)) return; // skip binary
-    var lines = std.mem.splitScalar(u8, data, '\n');
-    var line_no: usize = 0;
+    const file = ctx.workspace.openFile(ctx.io, rel, .{}) catch return;
+    defer file.close(ctx.io);
+    const stat = file.stat(ctx.io) catch return;
+    if (stat.size > max_file_size_bytes) return;
+
+    const out_start = out.items.len;
+    const matches_start = limits.max_matches;
     var file_hits: usize = 0;
-    while (lines.next()) |line| : (line_no += 1) {
+    var line_no: usize = 0;
+    var saw_line = false;
+    var ended_newline = false;
+    var buf: [max_grep_line_bytes]u8 = undefined;
+    var file_reader = file.reader(ctx.io, &buf);
+    const r = &file_reader.interface;
+
+    while (true) {
         if (file_hits >= 10 or limits.max_matches == 0) return;
-        if (std.mem.indexOf(u8, line, pattern) != null) {
-            out.print(ctx.arena, "{s}:{d}: {s}\n", .{ rel, line_no + 1, std.mem.trimEnd(u8, line, "\r") }) catch return;
-            file_hits += 1;
-            limits.max_matches -= 1;
+        const maybe_line = r.takeDelimiterInclusive('\n') catch |err| switch (err) {
+            error.StreamTooLong => {
+                const buffered = r.buffered();
+                const line = buffered[0..@min(buffered.len, max_grep_line_bytes)];
+                r.tossBuffered();
+                if (!isTruncatedUtf8(line)) {
+                    grepRollback(out, out_start, limits, matches_start);
+                    return;
+                }
+                if (!grepLineHit(ctx, rel, line_no, line, pattern, limits, out, &file_hits)) return;
+                saw_line = true;
+                line_no += 1;
+                switch (discardGrepLine(r)) {
+                    .newline => {
+                        ended_newline = true;
+                        continue;
+                    },
+                    .eof => return,
+                    .failed => return,
+                }
+            },
+            error.EndOfStream => {
+                const rest = r.buffered();
+                if (rest.len == 0) {
+                    // splitScalar semantics: a file ending in a newline (or an
+                    // empty file) has one final empty line.
+                    if (!saw_line or ended_newline) {
+                        _ = grepLineHit(ctx, rel, line_no, "", pattern, limits, out, &file_hits);
+                    }
+                    return;
+                }
+                r.tossBuffered();
+                if (!std.unicode.utf8ValidateSlice(rest)) {
+                    grepRollback(out, out_start, limits, matches_start);
+                    return;
+                }
+                _ = grepLineHit(ctx, rel, line_no, rest, pattern, limits, out, &file_hits);
+                return;
+            },
+            error.ReadFailed => return,
+        };
+        const line = if (maybe_line.len > 0 and maybe_line[maybe_line.len - 1] == '\n')
+            maybe_line[0 .. maybe_line.len - 1]
+        else
+            maybe_line;
+        if (!std.unicode.utf8ValidateSlice(line)) {
+            grepRollback(out, out_start, limits, matches_start);
+            return;
         }
+        if (!grepLineHit(ctx, rel, line_no, line, pattern, limits, out, &file_hits)) return;
+        saw_line = true;
+        ended_newline = true;
+        line_no += 1;
     }
 }
 
@@ -1007,6 +1126,64 @@ test "grep skips dotenv files by default" {
     try std.testing.expectEqual(Status.ok, r.status);
     try std.testing.expect(std.mem.indexOf(u8, r.output, "ok.txt:1") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.output, ".env:1") == null);
+}
+
+test "grep finds a match late in a large file" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+
+    const line = "x" ** 1023 ++ "\n";
+    var data: std.ArrayListUnmanaged(u8) = .empty;
+    defer data.deinit(std.testing.allocator);
+    while (data.items.len < 900 * 1024) {
+        try data.appendSlice(std.testing.allocator, line);
+    }
+    try data.appendSlice(std.testing.allocator, "needle at the end\n");
+    try tmp.dir.writeFile(io, .{ .sub_path = "late.txt", .data = data.items });
+
+    var e = engine_mod.Engine.init(std.testing.allocator, .ask);
+    defer e.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ctx = testCtx(arena_state.allocator(), io, tmp.dir, &e);
+
+    const r = execute("grep", "{\"pattern\":\"needle\"}", &ctx);
+    try std.testing.expectEqual(Status.ok, r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "late.txt:901: needle at the end") != null);
+}
+
+test "grep discards overlong lines but keeps line numbers" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+    const data = "x" ** 9000 ++ "\nneedle\nafter\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "long.txt", .data = data });
+
+    var e = engine_mod.Engine.init(std.testing.allocator, .ask);
+    defer e.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ctx = testCtx(arena_state.allocator(), io, tmp.dir, &e);
+
+    const r = execute("grep", "{\"pattern\":\"needle\"}", &ctx);
+    try std.testing.expectEqualStrings("long.txt:2: needle\n", r.output);
+}
+
+test "grep trims CR and keeps line numbers" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "crlf.txt", .data = "first\r\nneedle\r\nlast needle" });
+
+    var e = engine_mod.Engine.init(std.testing.allocator, .ask);
+    defer e.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ctx = testCtx(arena_state.allocator(), io, tmp.dir, &e);
+
+    const r = execute("grep", "{\"pattern\":\"needle\"}", &ctx);
+    try std.testing.expectEqualStrings("crlf.txt:2: needle\ncrlf.txt:3: last needle\n", r.output);
 }
 
 test "git push is denied under the default ceilings" {

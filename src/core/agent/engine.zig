@@ -560,14 +560,34 @@ fn isAgentCall(tc: core_types.ToolCall) bool {
     return std.mem.eql(u8, tc.name, "agent");
 }
 
-fn executeOne(p: RunParams, tc: core_types.ToolCall) tool_mod.ToolResult {
+/// Run one tool call in its own scratch arena and copy the redacted output
+/// into `caller` before the scratch arena is deinited. `scratch_parent` must
+/// be an allocator that actually frees (not the caller's arena), otherwise
+/// the scratch memory would live as long as the caller.
+fn executeWithScratch(
+    p: RunParams,
+    tc: core_types.ToolCall,
+    caller: std.mem.Allocator,
+    scratch_parent: std.mem.Allocator,
+) tool_mod.ToolResult {
+    var scratch_state = std.heap.ArenaAllocator.init(scratch_parent);
+    defer scratch_state.deinit();
     var ctx = p.tool_ctx.*;
+    ctx.arena = scratch_state.allocator();
     ctx.cancel = p.cancel;
     const raw = tool_mod.execute(tc.name, tc.arguments_json, &ctx);
+
+    // Copy first, then redact in the caller: the raw slice belongs to the
+    // scratch arena and must not leak into ToolResult.
+    const copied = caller.dupe(u8, raw.output) catch "";
     return .{
-        .output = redact_mod.redact(p.arena, raw.output, p.redactions),
+        .output = redact_mod.redact(caller, copied, p.redactions),
         .status = raw.status,
     };
+}
+
+fn executeOne(p: RunParams, tc: core_types.ToolCall) tool_mod.ToolResult {
+    return executeWithScratch(p, tc, p.arena, std.heap.page_allocator);
 }
 
 /// Run consecutive agent calls on parallel threads, each with its own
@@ -585,11 +605,7 @@ fn runAgentBatch(p: RunParams, calls: []const core_types.ToolCall) ![]tool_mod.T
     const Worker = struct {
         fn run(params: RunParams, tc: core_types.ToolCall, slot: *Slot) void {
             var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-            var ctx = params.tool_ctx.*;
-            ctx.arena = arena_state.allocator();
-            ctx.cancel = params.cancel;
-            const raw = tool_mod.execute(tc.name, tc.arguments_json, &ctx);
-            slot.result = raw;
+            slot.result = executeWithScratch(params, tc, arena_state.allocator(), std.heap.page_allocator);
             slot.arena_state = arena_state; // handed back for ordered copy
             slot.done.store(true, .release);
         }
@@ -613,9 +629,7 @@ fn runAgentBatch(p: RunParams, calls: []const core_types.ToolCall) ![]tool_mod.T
     for (slots) |*slot| {
         if (slot.thread) |t| t.join();
         var arena_state = slot.arena_state orelse continue;
-        const output = arena_state.allocator().dupe(u8, slot.result.output) catch slot.result.output;
-        const out_copy = p.arena.dupe(u8, output) catch output;
-        slot.result.output = out_copy;
+        slot.result.output = p.arena.dupe(u8, slot.result.output) catch "";
         arena_state.deinit();
         slot.arena_state = null;
     }
@@ -789,4 +803,173 @@ test "partial stream failure is not retried" {
     try std.testing.expectEqual(Status.failed, outcome.status);
     try std.testing.expectEqualStrings("partial", outcome.reply);
     try std.testing.expectEqual(@as(usize, 1), fake.call_index);
+}
+
+/// Test-only allocator that tracks outstanding bytes and their peak.
+const CountingAllocator = struct {
+    parent: std.mem.Allocator,
+    current: usize = 0,
+    peak: usize = 0,
+
+    fn allocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = std.mem.Allocator.VTable{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn bump(self: *@This(), len: usize) void {
+        self.current += len;
+        if (self.current > self.peak) self.peak = self.current;
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        const ptr = self.parent.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.bump(len);
+        return ptr;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (!self.parent.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        self.current -= memory.len;
+        self.bump(new_len);
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        const ptr = self.parent.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+        self.current -= memory.len;
+        self.bump(new_len);
+        return ptr;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.parent.rawFree(memory, alignment, ret_addr);
+        self.current -= memory.len;
+    }
+};
+
+fn scratchTestParams(
+    tool_ctx: *tool_mod.ToolContext,
+    history: *std.ArrayListUnmanaged(core_types.ChatMessage),
+    cancel: *std.atomic.Value(bool),
+) RunParams {
+    return .{
+        .io = std.testing.io,
+        .arena = std.testing.allocator,
+        .pcfg = .{ .provider = undefined, .model = "", .base_url = "", .api_key = "" },
+        .system = "",
+        .history = history,
+        .tool_ctx = tool_ctx,
+        .callbacks = .{
+            .ctx = undefined,
+            .on_text = noopText,
+            .on_tool_start = noopStart,
+            .on_tool_result = noopResult,
+            .on_notice = noopNotice,
+        },
+        .cancel = cancel,
+    };
+}
+
+test "tool scratch arenas are deinited on every path" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "alpha needle\n" });
+    try tmp.dir.createDirPath(io, "src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/b.zig", .data = "needle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".env", .data = "SECRET=1\n" });
+
+    var perm_engine = @import("../permissions/engine.zig").Engine.init(std.testing.allocator, .ask);
+    defer perm_engine.deinit();
+    var cancel = std.atomic.Value(bool).init(false);
+    var tool_ctx: tool_mod.ToolContext = .{
+        .io = io,
+        .arena = std.testing.allocator,
+        .workspace = tmp.dir,
+        .engine = &perm_engine,
+        .journal = null,
+        .max_file_read_bytes = 64 * 1024,
+        .approval_ctx = undefined,
+        .approval_fn = undefined,
+    };
+    var history: std.ArrayListUnmanaged(core_types.ChatMessage) = .empty;
+    const p = scratchTestParams(&tool_ctx, &history, &cancel);
+
+    var caller_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer caller_state.deinit();
+    const caller = caller_state.allocator();
+
+    const calls = [_]core_types.ToolCall{
+        .{ .id = "1", .name = "read", .arguments_json = "{\"path\":\"a.txt\"}" },
+        .{ .id = "2", .name = "glob", .arguments_json = "{\"pattern\":\"**\"}" },
+        .{ .id = "3", .name = "grep", .arguments_json = "{\"pattern\":\"needle\"}" },
+        .{ .id = "4", .name = "read", .arguments_json = "{\"path\":\".env\"}" },
+        .{ .id = "5", .name = "read", .arguments_json = "{\"path\":\"missing.txt\"}" },
+    };
+    for (calls) |tc| {
+        const result = executeWithScratch(p, tc, caller, std.testing.allocator);
+        switch (tc.id[0]) {
+            '1', '2', '3' => try std.testing.expectEqual(tool_mod.Status.ok, result.status),
+            '4' => try std.testing.expectEqual(tool_mod.Status.denied, result.status),
+            '5' => try std.testing.expectEqual(tool_mod.Status.failed, result.status),
+            else => unreachable,
+        }
+    }
+}
+
+test "grep peak outstanding memory stays bounded on large files" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
+    defer tmp.cleanup();
+
+    const line = "x" ** 1023 ++ "\n";
+    var data: std.ArrayListUnmanaged(u8) = .empty;
+    defer data.deinit(std.testing.allocator);
+    while (data.items.len < 1000 * 1024) {
+        try data.appendSlice(std.testing.allocator, line);
+    }
+    try data.appendSlice(std.testing.allocator, "needle\n");
+    for ([_][]const u8{ "g1.txt", "g2.txt", "g3.txt" }) |name| {
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = data.items });
+    }
+
+    var perm_engine = @import("../permissions/engine.zig").Engine.init(std.testing.allocator, .auto);
+    defer perm_engine.deinit();
+    var cancel = std.atomic.Value(bool).init(false);
+    var tool_ctx: tool_mod.ToolContext = .{
+        .io = io,
+        .arena = std.testing.allocator,
+        .workspace = tmp.dir,
+        .engine = &perm_engine,
+        .journal = null,
+        .max_file_read_bytes = 64 * 1024,
+        .approval_ctx = undefined,
+        .approval_fn = undefined,
+    };
+    var history: std.ArrayListUnmanaged(core_types.ChatMessage) = .empty;
+    const p = scratchTestParams(&tool_ctx, &history, &cancel);
+
+    var counting = CountingAllocator{ .parent = std.testing.allocator };
+    var caller_state = std.heap.ArenaAllocator.init(counting.allocator());
+    defer caller_state.deinit();
+    const result = executeWithScratch(
+        p,
+        .{ .id = "g", .name = "grep", .arguments_json = "{\"pattern\":\"needle\"}" },
+        caller_state.allocator(),
+        counting.allocator(),
+    );
+    try std.testing.expectEqual(tool_mod.Status.ok, result.status);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "g1.txt:1001: needle") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "g3.txt:1001: needle") != null);
+    try std.testing.expect(counting.peak < 512 * 1024);
 }
