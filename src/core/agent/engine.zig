@@ -1193,6 +1193,7 @@ test "grep peak outstanding memory stays bounded on large files" {
         .max_file_read_bytes = 64 * 1024,
         .approval_ctx = undefined,
         .approval_fn = undefined,
+        .use_external_tools = false,
     };
     var history: std.ArrayListUnmanaged(core_types.ChatMessage) = .empty;
     const p = scratchTestParams(&tool_ctx, &history, &cancel);

@@ -458,8 +458,15 @@ fn sortPaths(items: [][]const u8) void {
     }.lt);
 }
 
+/// `fd` takes a regex by default, so it may only stand in for patterns that
+/// match root-level basenames; everything with a path component (and the
+/// recursive `**`) stays with the built-in walker.
+fn fdMayHandleGlob(pattern: []const u8) bool {
+    return std.mem.indexOfScalar(u8, pattern, '/') == null and !std.mem.eql(u8, pattern, "**");
+}
+
 fn toolGlob(pattern: []const u8, ctx: *ToolContext) ToolResult {
-    if (ctx.use_external_tools) {
+    if (ctx.use_external_tools and fdMayHandleGlob(pattern)) {
         if (ctx.external_cache.fd(ctx.io)) |prog| {
             if (externalGlob(prog, pattern, ctx)) |result| return result;
         }
@@ -508,11 +515,8 @@ fn externalGlob(prog: []const u8, pattern: []const u8, ctx: *ToolContext) ?ToolR
     var argv: std.ArrayListUnmanaged([]const u8) = .empty;
     argv.append(ctx.arena, prog) catch return null;
     argv.appendSlice(ctx.arena, &[_][]const u8{
-        "--color=never", "--type", "f", "--no-require-git", "--max-depth",
+        "--color=never", "--type", "f", "--no-require-git", "--max-depth", "1",
     }) catch return null;
-    const root_only = std.mem.indexOfScalar(u8, pattern, '/') == null and !std.mem.eql(u8, pattern, "**");
-    const max_depth: []const u8 = if (root_only) "1" else "16";
-    argv.append(ctx.arena, max_depth) catch return null;
     if (ctx.engine.read_dotenv) argv.append(ctx.arena, "--hidden") catch return null;
     for (skip_dirs) |sd| {
         argv.appendSlice(ctx.arena, &[_][]const u8{ "--exclude", sd }) catch return null;
@@ -591,18 +595,24 @@ fn externalGrep(prog: []const u8, pattern: []const u8, root: []const u8, ctx: *T
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     var count: usize = 0;
+    var last_path: ?[]const u8 = null;
+    var last_path_valid = false;
     var lines = std.mem.splitScalar(u8, run.stdout, '\n');
     while (lines.next()) |line| {
         if (line.len == 0) continue;
         if (std.mem.indexOfScalar(u8, line, 0) != null) return null;
-        var path = rgPath(line) orelse return null;
-        const tail = line[path.len..];
+        const match = parseRgMatch(line) orelse return null;
+        var path = match.path;
         if (std.mem.startsWith(u8, path, "./")) path = path[2..];
         if (path.len == 0 or path[0] == '/') return null;
         if (shouldFilterPath(ctx, path, false)) continue;
-        out.appendSlice(ctx.arena, path) catch return null;
-        out.appendSlice(ctx.arena, tail) catch return null;
-        out.append(ctx.arena, '\n') catch return null;
+        if (last_path == null or !std.mem.eql(u8, last_path.?, path)) {
+            last_path = path;
+            last_path_valid = fileIsValidUtf8(ctx, path);
+        }
+        if (!last_path_valid) continue;
+        const text = std.mem.trimEnd(u8, match.text, "\r");
+        out.print(ctx.arena, "{s}:{s}: {s}\n", .{ path, match.line_no, text }) catch return null;
         count += 1;
         if (count >= 200) break;
     }
@@ -610,20 +620,72 @@ fn externalGrep(prog: []const u8, pattern: []const u8, root: []const u8, ctx: *T
     return .{ .output = truncateUtf8(ctx.arena, out.items, "grep results") catch out.items, .status = .ok };
 }
 
-/// Extract the path from `rg`'s `path:line:text` output. A path may itself
-/// contain colons, so only a `:<digits>:` separator counts.
-fn rgPath(line: []const u8) ?[]const u8 {
+const RgMatch = struct {
+    path: []const u8,
+    line_no: []const u8,
+    text: []const u8,
+};
+
+/// Parse `rg`'s `path:line:text` output. A path may itself contain colons,
+/// so only a `:<digits>:` separator counts.
+fn parseRgMatch(line: []const u8) ?RgMatch {
     var from: usize = 0;
     while (std.mem.indexOfPos(u8, line, from, ":")) |colon| {
         var j = colon + 1;
+        const digits_start = j;
         while (j < line.len and std.ascii.isDigit(line[j])) j += 1;
-        if (j > colon + 1 and j < line.len and line[j] == ':') {
+        if (j > digits_start and j < line.len and line[j] == ':') {
             if (colon == 0) return null;
-            return line[0..colon];
+            return .{
+                .path = line[0..colon],
+                .line_no = line[digits_start..j],
+                .text = line[j + 1 ..],
+            };
         }
         from = colon + 1;
     }
     return null;
+}
+
+/// Apply the same file gates as the built-in walker before trusting an `rg`
+/// hit: stat-size cap first, then per-line UTF-8 validation (a bad line drops
+/// every hit from that file, as `grepFile` rolls them back).
+fn fileIsValidUtf8(ctx: *ToolContext, path: []const u8) bool {
+    const file = ctx.workspace.openFile(ctx.io, path, .{}) catch return false;
+    defer file.close(ctx.io);
+    const stat = file.stat(ctx.io) catch return false;
+    if (stat.size > max_file_size_bytes) return false;
+
+    var buf: [max_grep_line_bytes]u8 = undefined;
+    var file_reader = file.reader(ctx.io, &buf);
+    const r = &file_reader.interface;
+    while (true) {
+        const maybe_line = r.takeDelimiterInclusive('\n') catch |err| switch (err) {
+            error.StreamTooLong => {
+                const buffered = r.buffered();
+                const line = buffered[0..@min(buffered.len, max_grep_line_bytes)];
+                r.tossBuffered();
+                if (!isTruncatedUtf8(line)) return false;
+                switch (discardGrepLine(r)) {
+                    .newline => continue,
+                    .eof => return true,
+                    .failed => return false,
+                }
+            },
+            error.EndOfStream => {
+                const rest = r.buffered();
+                if (rest.len == 0) return true;
+                r.tossBuffered();
+                return std.unicode.utf8ValidateSlice(rest);
+            },
+            error.ReadFailed => return false,
+        };
+        const line = if (maybe_line.len > 0 and maybe_line[maybe_line.len - 1] == '\n')
+            maybe_line[0 .. maybe_line.len - 1]
+        else
+            maybe_line;
+        if (!std.unicode.utf8ValidateSlice(line)) return false;
+    }
 }
 
 /// Longest grep line that is buffered and matched. Longer lines are matched
@@ -1348,6 +1410,7 @@ test "grep finds a match late in a large file" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var ctx = testCtx(arena_state.allocator(), io, tmp.dir, &e);
+    ctx.use_external_tools = false;
 
     const r = execute("grep", "{\"pattern\":\"needle\"}", &ctx);
     try std.testing.expectEqual(Status.ok, r.status);
@@ -1404,7 +1467,7 @@ fn setupSearchParityTree(tmp: *std.testing.TmpDir) !void {
     try tmp.dir.writeFile(io, .{ .sub_path = "blob.bin", .data = "needle\xff\n" });
 }
 
-test "external and fallback search agree" {
+test "external rg grep agrees with fallback" {
     const io = std.testing.io;
     var tmp = try makeTmp();
     defer tmp.cleanup();
@@ -1427,25 +1490,61 @@ test "external and fallback search agree" {
         fallback_grep.output,
     );
 
-    const fallback_glob = execute("glob", "{\"pattern\":\"**\"}", &ctx);
-    try std.testing.expectEqual(Status.ok, fallback_glob.status);
-    try std.testing.expectEqualStrings(
-        "blob.bin\nsrc/a.zig\nsrc/deep/b.zig\nsrc/keep.log",
-        fallback_glob.output,
-    );
-
-    if (!search.programAvailable(io, "rg") or
-        (!search.programAvailable(io, "fd") and !search.programAvailable(io, "fdfind")))
-        return error.SkipZigTest;
+    if (!search.programAvailable(io, "rg")) return error.SkipZigTest;
 
     ctx.use_external_tools = true;
+    ctx.external_cache = .{};
     const external_grep = execute("grep", "{\"pattern\":\"needle\"}", &ctx);
     try std.testing.expectEqual(Status.ok, external_grep.status);
     try std.testing.expectEqualStrings(fallback_grep.output, external_grep.output);
+}
 
-    const external_glob = execute("glob", "{\"pattern\":\"**\"}", &ctx);
+test "external fd glob agrees with fallback for root-level patterns" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+    try setupSearchParityTree(&tmp);
+
+    var e = engine_mod.Engine.init(std.testing.allocator, .ask);
+    defer e.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ctx = testCtx(arena_state.allocator(), io, tmp.dir, &e);
+    ctx.use_external_tools = false;
+
+    const fallback_glob = execute("glob", "{\"pattern\":\"*.bin\"}", &ctx);
+    try std.testing.expectEqual(Status.ok, fallback_glob.status);
+    try std.testing.expectEqualStrings("blob.bin", fallback_glob.output);
+
+    if (!search.programAvailable(io, "fd") and !search.programAvailable(io, "fdfind"))
+        return error.SkipZigTest;
+
+    ctx.use_external_tools = true;
+    ctx.external_cache = .{};
+    const external_glob = execute("glob", "{\"pattern\":\"*.bin\"}", &ctx);
     try std.testing.expectEqual(Status.ok, external_glob.status);
     try std.testing.expectEqualStrings(fallback_glob.output, external_glob.output);
+}
+
+test "fd is never used for path glob patterns" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+    try setupSearchParityTree(&tmp);
+
+    var e = engine_mod.Engine.init(std.testing.allocator, .ask);
+    defer e.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ctx = testCtx(arena_state.allocator(), io, tmp.dir, &e);
+    ctx.use_external_tools = true;
+    // An fd that exits 0 with no output must not turn a path pattern into
+    // "no matches"; path patterns belong to the built-in walker.
+    ctx.external_cache = .{ .fd_checked = true, .fd_name = "/bin/true" };
+
+    const r = execute("glob", "{\"pattern\":\"src/**/*.zig\"}", &ctx);
+    try std.testing.expectEqual(Status.ok, r.status);
+    try std.testing.expectEqualStrings("src/a.zig\nsrc/deep/b.zig", r.output);
 }
 
 test "grep fallback regex subset and unsupported constructs" {
