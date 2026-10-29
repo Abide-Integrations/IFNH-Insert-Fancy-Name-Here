@@ -118,11 +118,11 @@ pub fn streamFn(
         /// emitted slices for the rest of the stream call, so the arguments
         /// are copied out of the list that later deltas would grow. `id` and
         /// `name` are already arena-owned from the delta that carried them.
-        fn emit(self: *@This(), arena: std.mem.Allocator, sink: provider.Sink) !void {
+        fn emit(self: *@This(), arena_mem: std.mem.Allocator, event_sink: provider.Sink) !void {
             if (self.emitted or self.name.len == 0) return;
-            const args = try arena.dupe(u8, self.args.items);
+            const args = try arena_mem.dupe(u8, self.args.items);
             self.emitted = true;
-            sink.emit(.{ .tool_call = .{
+            event_sink.emit(.{ .tool_call = .{
                 .id = self.id,
                 .name = self.name,
                 .arguments_json = args,
