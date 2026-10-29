@@ -267,8 +267,8 @@ pub fn runTurn(p: RunParams) !Outcome {
         });
         if (p.callbacks.on_assistant_message) |cb| cb(p.callbacks.ctx, reply, tc_json);
 
-        // Execute tool calls; consecutive `agent` calls run in parallel
-        // (E58), everything else sequentially, results appended in order.
+        // Execute tool calls; consecutive read-only or `agent` calls run in
+        // parallel (E58), everything else sequentially, results in call order.
         const calls = collector.tool_calls.items;
         const tools_span = trace_mod.Span.begin(p.trace, "turn.tools_round");
         const tool_start: ?std.Io.Timestamp = if (p.trace) |t|
@@ -280,7 +280,36 @@ pub fn runTurn(p: RunParams) !Outcome {
             if (p.cancel.load(.acquire)) {
                 return .{ .status = .cancelled, .reply = last_reply, .tool_rounds = rounds, .tool_calls = total_calls, .usage = total_usage };
             }
-            if (isAgentCall(calls[i])) {
+            if (tool_mod.isReadOnly(calls[i].name)) {
+                var j = i + 1;
+                while (j < calls.len and tool_mod.isReadOnly(calls[j].name)) j += 1;
+                const batch = calls[i..j];
+                // runBatch redacts inside each call's scratch arena (via
+                // executeWithScratch), so results need no second pass here.
+                const results = if (batch.len > 1)
+                    try runBatch(p, batch)
+                else blk: {
+                    const one = try p.arena.alloc(tool_mod.ToolResult, 1);
+                    one[0] = executeOne(p, batch[0]);
+                    break :blk one;
+                };
+                for (batch, results) |tc, result| {
+                    p.callbacks.on_tool_start(p.callbacks.ctx, tc.id, tc.name, tc.arguments_json);
+                    p.callbacks.on_tool_result(p.callbacks.ctx, tc.id, tc.name, result.status, result.output);
+                    if (result.status == .denied) {
+                        p.callbacks.on_notice(p.callbacks.ctx, result.output);
+                    }
+                    try p.history.append(p.arena, .{
+                        .role = .tool,
+                        .content = result.output,
+                        .tool_call_id = tc.id,
+                        .tool_name = tc.name,
+                        .is_error = result.status != .ok,
+                    });
+                }
+                total_calls += batch.len;
+                i = j;
+            } else if (isAgentCall(calls[i])) {
                 var j = i + 1;
                 while (j < calls.len and isAgentCall(calls[j])) j += 1;
                 const batch = calls[i..j];
@@ -590,14 +619,14 @@ fn executeOne(p: RunParams, tc: core_types.ToolCall) tool_mod.ToolResult {
     return executeWithScratch(p, tc, p.arena, std.heap.page_allocator);
 }
 
-/// Run consecutive agent calls on parallel threads, each with its own
-/// arena and ToolContext copy; results are ordered on return.
-fn runAgentBatch(p: RunParams, calls: []const core_types.ToolCall) ![]tool_mod.ToolResult {
+/// Run calls on parallel threads, each with its own arena and ToolContext
+/// copy; results are copied into the caller arena and returned in call order.
+/// A failed spawn runs that call inline.
+fn runBatch(p: RunParams, calls: []const core_types.ToolCall) ![]tool_mod.ToolResult {
     const Slot = struct {
         thread: ?std.Thread = null,
         arena_state: ?std.heap.ArenaAllocator = null,
         result: tool_mod.ToolResult = .{ .output = "", .status = .failed },
-        done: std.atomic.Value(bool) = .init(false),
     };
     const slots = try p.arena.alloc(Slot, calls.len);
     for (slots) |*s| s.* = .{};
@@ -607,23 +636,15 @@ fn runAgentBatch(p: RunParams, calls: []const core_types.ToolCall) ![]tool_mod.T
             var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             slot.result = executeWithScratch(params, tc, arena_state.allocator(), std.heap.page_allocator);
             slot.arena_state = arena_state; // handed back for ordered copy
-            slot.done.store(true, .release);
         }
     };
 
-    var spawned: usize = 0;
     for (calls, slots) |tc, *slot| {
-        slot.thread = std.Thread.spawn(.{}, Worker.run, .{ p, tc, slot }) catch {
-            slot.done.store(true, .release); // runs inline below
-            continue;
-        };
-        spawned += 1;
+        slot.thread = std.Thread.spawn(.{}, Worker.run, .{ p, tc, slot }) catch null;
     }
     // Inline any that failed to spawn.
     for (calls, slots) |tc, *slot| {
-        if (slot.thread == null and !slot.done.load(.acquire)) {
-            Worker.run(p, tc, slot);
-        }
+        if (slot.thread == null) Worker.run(p, tc, slot);
     }
     // Ordered copy-out.
     for (slots) |*slot| {
@@ -636,6 +657,12 @@ fn runAgentBatch(p: RunParams, calls: []const core_types.ToolCall) ![]tool_mod.T
     const results = try p.arena.alloc(tool_mod.ToolResult, calls.len);
     for (slots, 0..) |*slot, idx| results[idx] = slot.result;
     return results;
+}
+
+/// Run consecutive agent calls on parallel threads; results are ordered on
+/// return.
+fn runAgentBatch(p: RunParams, calls: []const core_types.ToolCall) ![]tool_mod.ToolResult {
+    return runBatch(p, calls);
 }
 
 fn sleepSeconds(io: std.Io, seconds: u64) !void {
@@ -739,6 +766,217 @@ test "consecutive agent calls run in parallel and append in order" {
     const r2 = history.items[3].content;
     try std.testing.expect(std.mem.indexOf(u8, r1, "child-one") != null);
     try std.testing.expect(std.mem.indexOf(u8, r2, "child-two") != null);
+}
+
+test "read-only batch preserves call order, callbacks and history" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "readme.txt", .data = "READ_MARKER_alpha\nsecond line\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.globbed", .data = "a\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.globbed", .data = "b\n" });
+    try tmp.dir.createDirPath(io, "tree");
+    var name_buf: [64]u8 = undefined;
+    for (0..300) |idx| {
+        const path = try std.fmt.bufPrint(&name_buf, "tree/f{d}.txt", .{idx});
+        try tmp.dir.writeFile(io, .{ .sub_path = path, .data = "GREP_NEEDLE in this file\nfiller\n" });
+    }
+
+    var fake = testing.Fake{ .script = &.{
+        &.{
+            .{ .tool_call = .{ .id = "r1", .name = "read", .arguments_json = "{\"path\":\"readme.txt\"}" } },
+            .{ .tool_call = .{ .id = "g1", .name = "glob", .arguments_json = "{\"pattern\":\"*.globbed\"}" } },
+            .{ .tool_call = .{ .id = "s1", .name = "grep", .arguments_json = "{\"pattern\":\"GREP_NEEDLE\"}" } },
+        },
+        &.{.{ .text = "done" }},
+    } };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var perm_engine = @import("../permissions/engine.zig").Engine.init(arena, .auto);
+    var tool_ctx: tool_mod.ToolContext = .{
+        .io = io,
+        .arena = arena,
+        .workspace = tmp.dir,
+        .engine = &perm_engine,
+        .journal = null,
+        .max_file_read_bytes = 64 * 1024,
+        .approval_ctx = undefined,
+        .approval_fn = undefined,
+    };
+    var history: std.ArrayListUnmanaged(core_types.ChatMessage) = .empty;
+    try history.append(arena, .{ .role = .user, .content = "inspect three ways" });
+
+    const Log = struct {
+        arena: std.mem.Allocator,
+        start_ids: std.ArrayListUnmanaged([]const u8) = .empty,
+        result_ids: std.ArrayListUnmanaged([]const u8) = .empty,
+        statuses: std.ArrayListUnmanaged(tool_mod.Status) = .empty,
+        notices: usize = 0,
+    };
+    var log = Log{ .arena = arena };
+    const cbs = Callbacks{
+        .ctx = &log,
+        .on_text = noopText,
+        .on_tool_start = struct {
+            fn f(ctx: *anyopaque, call_id: []const u8, name: []const u8, args_json: []const u8) void {
+                const l: *Log = @ptrCast(@alignCast(ctx));
+                l.start_ids.append(l.arena, call_id) catch {};
+                _ = name;
+                _ = args_json;
+            }
+        }.f,
+        .on_tool_result = struct {
+            fn f(ctx: *anyopaque, call_id: []const u8, name: []const u8, status: tool_mod.Status, output: []const u8) void {
+                const l: *Log = @ptrCast(@alignCast(ctx));
+                l.result_ids.append(l.arena, call_id) catch {};
+                l.statuses.append(l.arena, status) catch {};
+                _ = name;
+                _ = output;
+            }
+        }.f,
+        .on_notice = struct {
+            fn f(ctx: *anyopaque, text: []const u8) void {
+                const l: *Log = @ptrCast(@alignCast(ctx));
+                l.notices += 1;
+                _ = text;
+            }
+        }.f,
+    };
+
+    var cancel = std.atomic.Value(bool).init(false);
+    const outcome = try runTurn(.{
+        .io = io,
+        .arena = arena,
+        .pcfg = .{ .provider = fake.provider(), .model = "fake", .base_url = "", .api_key = "" },
+        .system = "",
+        .history = &history,
+        .tool_ctx = &tool_ctx,
+        .callbacks = cbs,
+        .cancel = &cancel,
+    });
+
+    try std.testing.expectEqual(Status.completed, outcome.status);
+    try std.testing.expectEqual(@as(usize, 3), outcome.tool_calls);
+    try std.testing.expectEqual(@as(usize, 0), log.notices);
+
+    // Callbacks fire in call order: start then result for each call.
+    try std.testing.expectEqual(@as(usize, 3), log.start_ids.items.len);
+    try std.testing.expectEqual(@as(usize, 3), log.result_ids.items.len);
+    for ([_][]const u8{ "r1", "g1", "s1" }, 0..) |want, idx| {
+        try std.testing.expectEqualStrings(want, log.start_ids.items[idx]);
+        try std.testing.expectEqualStrings(want, log.result_ids.items[idx]);
+        try std.testing.expectEqual(tool_mod.Status.ok, log.statuses.items[idx]);
+    }
+
+    // History holds exactly one result per call, in the same order.
+    try std.testing.expectEqual(@as(usize, 6), history.items.len); // user, assistant+tc, 3 tools, assistant
+    try std.testing.expectEqualStrings("r1", history.items[2].tool_call_id.?);
+    try std.testing.expectEqualStrings("read", history.items[2].tool_name.?);
+    try std.testing.expect(std.mem.indexOf(u8, history.items[2].content, "READ_MARKER_alpha") != null);
+    try std.testing.expectEqualStrings("g1", history.items[3].tool_call_id.?);
+    try std.testing.expectEqualStrings("glob", history.items[3].tool_name.?);
+    try std.testing.expect(std.mem.indexOf(u8, history.items[3].content, "a.globbed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, history.items[3].content, "b.globbed") != null);
+    try std.testing.expectEqualStrings("s1", history.items[4].tool_call_id.?);
+    try std.testing.expectEqualStrings("grep", history.items[4].tool_name.?);
+    try std.testing.expect(std.mem.indexOf(u8, history.items[4].content, "tree/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, history.items[4].content, "GREP_NEEDLE") != null);
+    for (history.items[2..5]) |msg| try std.testing.expect(!msg.is_error);
+}
+
+test "read-only batch beats sequential grep wall time" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
+    defer tmp.cleanup();
+
+    // A few hundred files, each with the needle only on the last line so every
+    // grep reads the whole file rather than stopping at an early hit.
+    try tmp.dir.createDirPath(io, "tree");
+    var content_buf: [16384]u8 = undefined;
+    var content_len: usize = 0;
+    for (0..200) |row| {
+        const line = try std.fmt.bufPrint(content_buf[content_len..], "filler line {d} 0123456789 abcdefghijklmnopqrstuvwxyz\n", .{row});
+        content_len += line.len;
+    }
+    const tail = "TIMING_NEEDLE\n";
+    @memcpy(content_buf[content_len .. content_len + tail.len], tail);
+    content_len += tail.len;
+    const content = content_buf[0..content_len];
+
+    var name_buf: [64]u8 = undefined;
+    for (0..400) |idx| {
+        const path = try std.fmt.bufPrint(&name_buf, "tree/f{d}.txt", .{idx});
+        try tmp.dir.writeFile(io, .{ .sub_path = path, .data = content });
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var perm_engine = @import("../permissions/engine.zig").Engine.init(arena, .auto);
+    var tool_ctx: tool_mod.ToolContext = .{
+        .io = io,
+        .arena = arena,
+        .workspace = tmp.dir,
+        .engine = &perm_engine,
+        .journal = null,
+        .max_file_read_bytes = 64 * 1024,
+        .approval_ctx = undefined,
+        .approval_fn = undefined,
+    };
+    var fake = testing.Fake{ .script = &.{} };
+    var history: std.ArrayListUnmanaged(core_types.ChatMessage) = .empty;
+    var cancel = std.atomic.Value(bool).init(false);
+    const p: RunParams = .{
+        .io = io,
+        .arena = arena,
+        .pcfg = .{ .provider = fake.provider(), .model = "fake", .base_url = "", .api_key = "" },
+        .system = "",
+        .history = &history,
+        .tool_ctx = &tool_ctx,
+        .callbacks = .{
+            .ctx = undefined,
+            .on_text = noopText,
+            .on_tool_start = noopStart,
+            .on_tool_result = noopResult,
+            .on_notice = noopNotice,
+        },
+        .cancel = &cancel,
+    };
+    const calls = [_]core_types.ToolCall{
+        .{ .id = "s1", .name = "grep", .arguments_json = "{\"pattern\":\"TIMING_NEEDLE\"}" },
+        .{ .id = "s2", .name = "grep", .arguments_json = "{\"pattern\":\"TIMING_NEEDLE\"}" },
+        .{ .id = "s3", .name = "grep", .arguments_json = "{\"pattern\":\"TIMING_NEEDLE\"}" },
+    };
+
+    // Sequential first, so both runs read the same warm page cache.
+    const seq_start = std.Io.Timestamp.now(io, .awake);
+    for (calls) |tc| {
+        const r = executeOne(p, tc);
+        try std.testing.expectEqual(tool_mod.Status.ok, r.status);
+        try std.testing.expect(std.mem.indexOf(u8, r.output, "tree/") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.output, "TIMING_NEEDLE") != null);
+    }
+    const seq_ns = std.Io.Timestamp.now(io, .awake).nanoseconds - seq_start.nanoseconds;
+
+    const batch_start = std.Io.Timestamp.now(io, .awake);
+    const results = try runBatch(p, &calls);
+    const batch_ns = std.Io.Timestamp.now(io, .awake).nanoseconds - batch_start.nanoseconds;
+
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    for (results) |r| {
+        try std.testing.expectEqual(tool_mod.Status.ok, r.status);
+        try std.testing.expect(std.mem.indexOf(u8, r.output, "tree/") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.output, "TIMING_NEEDLE") != null);
+    }
+
+    // Too fast to time reliably on a tiny fixture or the machine is busy.
+    if (seq_ns < 3 * std.time.ns_per_ms) return error.SkipZigTest;
+    try std.testing.expect(@as(f64, @floatFromInt(batch_ns)) < @as(f64, @floatFromInt(seq_ns)) * 0.7);
 }
 
 test "retry delay honors Retry-After and caps backoff" {
