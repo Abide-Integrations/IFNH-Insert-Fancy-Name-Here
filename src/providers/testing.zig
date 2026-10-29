@@ -118,14 +118,20 @@ pub const FakeServer = struct {
 
 // ---------------------------------------------------------------- tests
 
+const anthropic_adapter = @import("anthropic.zig");
 const openai_adapter = @import("openai.zig");
 const provider_mod = @import("provider.zig");
 const core_types = @import("../core/types.zig");
+
+/// Event kinds in arrival order, so tests can prove *when* a `tool_call`
+/// was emitted rather than only that it eventually was.
+const EventKind = enum { content_delta, reasoning_delta, tool_call, usage, done, failure };
 
 const Collector = struct {
     arena: std.mem.Allocator,
     text: std.ArrayListUnmanaged(u8) = .empty,
     tool_calls: std.ArrayListUnmanaged(core_types.ToolCall) = .empty,
+    events: std.ArrayListUnmanaged(EventKind) = .empty,
     failure: ?[]const u8 = null,
     failure_kind: ?core_types.ProviderFailureKind = null,
     retry_after_s: ?u32 = null,
@@ -133,6 +139,15 @@ const Collector = struct {
 
     fn emit(ctx: *anyopaque, ev: core_types.StreamEvent) void {
         const self: *Collector = @ptrCast(@alignCast(ctx));
+        const kind: EventKind = switch (ev) {
+            .content_delta => .content_delta,
+            .reasoning_delta => .reasoning_delta,
+            .tool_call => .tool_call,
+            .usage => .usage,
+            .done => .done,
+            .failure => .failure,
+        };
+        self.events.append(self.arena, kind) catch {};
         switch (ev) {
             .content_delta => |d| self.text.appendSlice(self.arena, d) catch {},
             .tool_call => |tc| {
@@ -146,6 +161,14 @@ const Collector = struct {
             .done => self.done = true,
             else => {},
         }
+    }
+
+    fn firstIndexOf(self: *const Collector, kind: EventKind) ?usize {
+        return std.mem.indexOfScalar(EventKind, self.events.items, kind);
+    }
+
+    fn lastIndexOf(self: *const Collector, kind: EventKind) ?usize {
+        return std.mem.lastIndexOfScalar(EventKind, self.events.items, kind);
     }
 };
 
