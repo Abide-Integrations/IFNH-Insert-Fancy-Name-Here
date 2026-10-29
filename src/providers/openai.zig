@@ -112,6 +112,22 @@ pub fn streamFn(
         id: []const u8 = "",
         name: []const u8 = "",
         args: std.ArrayListUnmanaged(u8) = .empty,
+        emitted: bool = false,
+
+        /// Emit this call once, when it is complete. The caller keeps the
+        /// emitted slices for the rest of the stream call, so the arguments
+        /// are copied out of the list that later deltas would grow. `id` and
+        /// `name` are already arena-owned from the delta that carried them.
+        fn emit(self: *@This(), arena: std.mem.Allocator, sink: provider.Sink) !void {
+            if (self.emitted or self.name.len == 0) return;
+            const args = try arena.dupe(u8, self.args.items);
+            self.emitted = true;
+            sink.emit(.{ .tool_call = .{
+                .id = self.id,
+                .name = self.name,
+                .arguments_json = args,
+            } });
+        }
     };
     var tools: [16]ToolAcc = undefined;
     var tool_count: usize = 0;
@@ -163,11 +179,13 @@ pub fn streamFn(
                         for (tc_v.array.items) |item| {
                             if (item != .object) continue;
                             const io_ = item.object;
-                            const index = intOf(io_.get("index")) orelse tool_count;
-                            while (tool_count <= index and tool_count < tools.len) : (tool_count += 1) {
+                            const index = std.math.cast(usize, intOf(io_.get("index")) orelse tool_count) orelse continue;
+                            if (index >= tools.len) continue;
+                            while (tool_count <= index) : (tool_count += 1) {
                                 tools[tool_count] = .{};
                             }
-                            if (index >= tools.len) continue;
+                            // A higher index means every lower call is complete.
+                            for (tools[0..index]) |*done| try done.emit(arena, sink);
                             const t = &tools[index];
                             if (io_.get("id")) |idv| {
                                 if (idv == .string and idv.string.len > 0) t.id = try arena.dupe(u8, idv.string);
@@ -189,29 +207,16 @@ pub fn streamFn(
         }
 
         const finish_v = co.get("finish_reason") orelse continue;
-        if (finish_v == .string and std.mem.eql(u8, finish_v.string, "tool_calls")) {
-            // Emit completed tool calls at finish.
-            for (tools[0..tool_count]) |*t| {
-                if (t.name.len == 0) continue;
-                sink.emit(.{ .tool_call = .{
-                    .id = t.id,
-                    .name = t.name,
-                    .arguments_json = t.args.items,
-                } });
-            }
-            tool_count = 0;
+        if (finish_v == .string) {
+            // The choice is finished: emit whatever is still pending, in
+            // index order.
+            for (tools[0..tool_count]) |*t| try t.emit(arena, sink);
         }
     }
 
-    // Emit any accumulated tool calls not flushed by finish_reason.
-    for (tools[0..tool_count]) |*t| {
-        if (t.name.len == 0) continue;
-        sink.emit(.{ .tool_call = .{
-            .id = t.id,
-            .name = t.name,
-            .arguments_json = t.args.items,
-        } });
-    }
+    // Fallback for a stream that ended without a finish_reason: emit each
+    // call that was never flushed.
+    for (tools[0..tool_count]) |*t| try t.emit(arena, sink);
 
     sink.emit(.done);
 }
