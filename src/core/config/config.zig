@@ -73,6 +73,9 @@ pub const default_config_json =
     \\    "timeout_tool_s": 120,
     \\    "timeout_turn_s": 600
     \\  },
+    \\  "tools": {
+    \\    "external": true
+    \\  },
     \\  "context": {
     \\    "auto_compact": true,
     \\    "compact_at_fraction": 0.8,
@@ -100,7 +103,7 @@ pub const default_config_json =
 /// Top-level sections recognized by the schema. Unknown keys produce
 /// warnings (DECISIONS B19); unknown values in security sections are errors.
 pub const known_sections = [_][]const u8{
-    "schema_version", "model",    "permissions", "git", "agents",
+    "schema_version", "model",    "permissions", "git", "agents", "tools",
     "context",        "planning", "sessions",    "ui",  "debug",
 };
 
@@ -129,10 +132,11 @@ pub const wired_defaults = [_][]const u8{
     "git.push",                    "git.force_push",
     "agents.max_depth",            "agents.max_concurrent",
     "agents.max_retries",          "agents.max_tool_rounds",
-    "agents.timeout_tool_s",       "context.auto_compact",
-    "context.compact_at_fraction", "context.max_file_read_bytes",
-    "sessions.dir",                "sessions.keep",
-    "ui.colors",                   "debug.redact",
+    "agents.timeout_tool_s",       "tools.external",
+    "context.auto_compact",        "context.compact_at_fraction",
+    "context.max_file_read_bytes", "sessions.dir",
+    "sessions.keep",               "ui.colors",
+    "debug.redact",
 };
 
 /// Defaults leaves deliberately not read yet: each would need a feature that
@@ -403,6 +407,9 @@ pub const Store = struct {
         if (!std.mem.eql(u8, provider, "openai") and !std.mem.eql(u8, provider, "anthropic")) {
             try self.addError("model.provider", "must be \"openai\" or \"anthropic\", got \"{s}\"", .{provider});
         }
+        if (self.get("tools.external")) |value| {
+            if (value != .bool) try self.addError("tools.external", "must be true or false", .{});
+        }
     }
 };
 
@@ -635,7 +642,17 @@ test "defaults parse and validate" {
     try std.testing.expectEqualStrings("openai", store.getString("model.provider", ""));
     try std.testing.expectEqualStrings("ask", store.getString("permissions.default_mode", ""));
     try std.testing.expectEqual(@as(u32, 120), store.getU32("agents.timeout_tool_s", 0));
+    try std.testing.expect(store.getBool("tools.external", false));
     try std.testing.expect(store.errors.items.len == 0);
+}
+
+test "tools.external must be a boolean" {
+    var store = try Store.init(std.testing.allocator);
+    defer store.deinit();
+    try store.applyOverride("tools.external", "\"yes\"", .{ .layer = .project, .origin = "test" });
+    try store.validate();
+    try std.testing.expect(store.errors.items.len == 1);
+    try std.testing.expectEqualStrings("tools.external", store.errors.items[0].path);
 }
 
 test "merge layers with source tracking" {

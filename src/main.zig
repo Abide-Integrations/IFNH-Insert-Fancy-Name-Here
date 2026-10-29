@@ -492,6 +492,7 @@ test {
     _ = @import("core/permissions/command_class.zig");
     _ = @import("core/permissions/engine.zig");
     _ = @import("tools/tool.zig");
+    _ = @import("tools/search.zig");
     _ = @import("providers/provider.zig");
     _ = @import("providers/transport.zig");
     _ = @import("providers/sse.zig");
