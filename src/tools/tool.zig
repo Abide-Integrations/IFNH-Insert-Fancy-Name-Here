@@ -459,7 +459,7 @@ fn sortPaths(items: [][]const u8) void {
     }.lt);
 }
 
-/// `fd` takes a regex by default, so it may only stand in for patterns that
+/// `fd` runs with `--glob -d 1`, so it may only stand in for patterns that
 /// match root-level basenames; everything with a path component (and the
 /// recursive `**`) stays with the built-in walker.
 fn fdMayHandleGlob(pattern: []const u8) bool {
@@ -528,7 +528,7 @@ fn externalGlob(prog: []const u8, pattern: []const u8, ctx: *ToolContext) ?ToolR
     var argv: std.ArrayListUnmanaged([]const u8) = .empty;
     argv.append(ctx.arena, prog) catch return null;
     argv.appendSlice(ctx.arena, &[_][]const u8{
-        "--color=never", "--type", "f", "--no-require-git", "--max-depth", "1",
+        "--color=never", "--type", "f", "--no-require-git", "--glob", "-d", "1",
     }) catch return null;
     if (ctx.engine.read_dotenv) argv.append(ctx.arena, "--hidden") catch return null;
     for (skip_dirs) |sd| {
