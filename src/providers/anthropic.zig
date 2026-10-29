@@ -15,6 +15,29 @@ const trace_mod = @import("../core/trace.zig");
 const anthropic_version = "2023-06-01";
 const transfer_buffer_size: usize = 16 * 1024;
 
+// Tool block accumulation keyed by content block index.
+const ToolAcc = struct {
+    id: []const u8 = "",
+    name: []const u8 = "",
+    args: std.ArrayListUnmanaged(u8) = .empty,
+    emitted: bool = false,
+};
+
+/// Emit one completed call, once. Arguments are copied so the emitted slice
+/// stays valid for the rest of the stream call.
+fn emitTool(alloc: std.mem.Allocator, sink: provider.Sink, t: *ToolAcc) void {
+    if (t.emitted or t.name.len == 0) return;
+    t.emitted = true;
+    const id = alloc.dupe(u8, t.id) catch t.id;
+    const name = alloc.dupe(u8, t.name) catch t.name;
+    const args = alloc.dupe(u8, t.args.items) catch t.args.items;
+    sink.emit(.{ .tool_call = .{
+        .id = id,
+        .name = name,
+        .arguments_json = args,
+    } });
+}
+
 pub fn streamFn(
     ctx: *anyopaque,
     alloc: std.mem.Allocator,
@@ -94,12 +117,6 @@ pub fn streamFn(
     const reader = response.reader(&transfer_buffer);
     var parser = sse.Parser{ .reader = reader };
 
-    // Tool block accumulation keyed by content block index.
-    const ToolAcc = struct {
-        id: []const u8 = "",
-        name: []const u8 = "",
-        args: std.ArrayListUnmanaged(u8) = .empty,
-    };
     var tools: [16]ToolAcc = undefined;
     var tool_count: usize = 0;
     var usage: core_types.Usage = .{};
@@ -162,6 +179,9 @@ pub fn streamFn(
                     }
                 }
             }
+        } else if (std.mem.eql(u8, ev, "content_block_stop")) {
+            const index = intOf(o.get("index")) orelse continue;
+            if (index < tool_count) emitTool(arena, sink, &tools[index]);
         } else if (std.mem.eql(u8, ev, "message_delta")) {
             if (o.get("usage")) |u| {
                 if (u == .object) usage.output_tokens = intOf(u.object.get("output_tokens")) orelse usage.output_tokens;
@@ -171,14 +191,8 @@ pub fn streamFn(
         }
     }
 
-    for (tools[0..tool_count]) |*t| {
-        if (t.name.len == 0) continue;
-        sink.emit(.{ .tool_call = .{
-            .id = t.id,
-            .name = t.name,
-            .arguments_json = t.args.items,
-        } });
-    }
+    // Fallback for blocks whose content_block_stop never arrived.
+    for (tools[0..tool_count]) |*t| emitTool(arena, sink, t);
 
     if (usage.input_tokens != 0 or usage.output_tokens != 0 or
         usage.cache_read_tokens != 0 or usage.cache_write_tokens != 0)

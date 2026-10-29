@@ -19,6 +19,29 @@ pub const Context = struct {};
 const max_response_bytes: usize = 32 * 1024 * 1024;
 const transfer_buffer_size: usize = 16 * 1024;
 
+// Tool call accumulation keyed by index.
+const ToolAcc = struct {
+    id: []const u8 = "",
+    name: []const u8 = "",
+    args: std.ArrayListUnmanaged(u8) = .empty,
+    emitted: bool = false,
+};
+
+/// Emit one completed call, once. Arguments are copied so the emitted slice
+/// stays valid for the rest of the stream call.
+fn emitTool(alloc: std.mem.Allocator, sink: provider.Sink, t: *ToolAcc) void {
+    if (t.emitted or t.name.len == 0) return;
+    t.emitted = true;
+    const id = alloc.dupe(u8, t.id) catch t.id;
+    const name = alloc.dupe(u8, t.name) catch t.name;
+    const args = alloc.dupe(u8, t.args.items) catch t.args.items;
+    sink.emit(.{ .tool_call = .{
+        .id = id,
+        .name = name,
+        .arguments_json = args,
+    } });
+}
+
 pub fn streamFn(
     ctx: *anyopaque,
     alloc: std.mem.Allocator,
@@ -107,12 +130,6 @@ pub fn streamFn(
     const reader = response.reader(&transfer_buffer);
     var parser = sse.Parser{ .reader = reader };
 
-    // Tool call accumulation keyed by index.
-    const ToolAcc = struct {
-        id: []const u8 = "",
-        name: []const u8 = "",
-        args: std.ArrayListUnmanaged(u8) = .empty,
-    };
     var tools: [16]ToolAcc = undefined;
     var tool_count: usize = 0;
 
@@ -164,6 +181,9 @@ pub fn streamFn(
                             if (item != .object) continue;
                             const io_ = item.object;
                             const index = intOf(io_.get("index")) orelse tool_count;
+                            // A higher index means every lower slot is complete.
+                            const flush_to = @min(index, tool_count);
+                            for (tools[0..flush_to]) |*t| emitTool(arena, sink, t);
                             while (tool_count <= index and tool_count < tools.len) : (tool_count += 1) {
                                 tools[tool_count] = .{};
                             }
@@ -189,29 +209,14 @@ pub fn streamFn(
         }
 
         const finish_v = co.get("finish_reason") orelse continue;
-        if (finish_v == .string and std.mem.eql(u8, finish_v.string, "tool_calls")) {
-            // Emit completed tool calls at finish.
-            for (tools[0..tool_count]) |*t| {
-                if (t.name.len == 0) continue;
-                sink.emit(.{ .tool_call = .{
-                    .id = t.id,
-                    .name = t.name,
-                    .arguments_json = t.args.items,
-                } });
-            }
-            tool_count = 0;
+        if (finish_v == .string) {
+            // The choice is complete: flush everything still pending.
+            for (tools[0..tool_count]) |*t| emitTool(arena, sink, t);
         }
     }
 
-    // Emit any accumulated tool calls not flushed by finish_reason.
-    for (tools[0..tool_count]) |*t| {
-        if (t.name.len == 0) continue;
-        sink.emit(.{ .tool_call = .{
-            .id = t.id,
-            .name = t.name,
-            .arguments_json = t.args.items,
-        } });
-    }
+    // Emit any accumulated tool calls not flushed earlier.
+    for (tools[0..tool_count]) |*t| emitTool(arena, sink, t);
 
     sink.emit(.done);
 }
