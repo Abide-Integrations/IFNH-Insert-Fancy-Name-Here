@@ -57,6 +57,8 @@ pub const Host = struct {
     git_push: engine_mod.GitPolicy = .never,
     git_force_push: engine_mod.GitPolicy = .never,
     read_dotenv: bool = false,
+    /// `tools.external`: let the child use `rg`/`fd` when present.
+    use_external_tools: bool = true,
     /// `agents.timeout_tool_s` for the child's captured commands.
     timeout_tool_s: u32 = 120,
     journal: ?*journal_mod.Journal,
@@ -230,6 +232,7 @@ fn runChild(
         .journal = host.journal,
         .max_file_read_bytes = 256 * 1024,
         .timeout_s = host.timeout_tool_s,
+        .use_external_tools = host.use_external_tools,
         .approval_ctx = host.approval_ctx,
         .approval_fn = host.approval_fn,
         .agent_spawn_fn = spawnHookFn,

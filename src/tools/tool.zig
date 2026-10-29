@@ -13,6 +13,7 @@ const core_types = @import("../core/types.zig");
 const engine_mod = @import("../core/permissions/engine.zig");
 const journal_mod = @import("../core/journal.zig");
 const globm = @import("../core/permissions/glob.zig");
+const search = @import("search.zig");
 
 pub const max_tool_output_bytes: usize = 64 * 1024;
 pub const max_file_size_bytes: usize = 1024 * 1024;
@@ -69,6 +70,10 @@ pub const ToolContext = struct {
     agent_depth: usize = 0,
     /// Display label for approval provenance ("parent", "research-1"...).
     agent_label: []const u8 = "",
+    /// `tools.external`: prefer `rg`/`fd` when the host allows it.
+    use_external_tools: bool = true,
+    /// Lazily resolved `rg`/`fd` probes for this context (single-threaded).
+    external_cache: search.ExternalCache = .{},
 
     pub fn requestApproval(self: *ToolContext, title: []const u8, detail: []const u8, grant: ApprovalRequest.Grant) bool {
         const resp = self.approval_fn(self.approval_ctx, .{ .title = title, .detail = detail, .grant = grant });
@@ -101,10 +106,10 @@ pub const specs = [_]Spec{
     .{ .name = "read", .description = "Read a text file with line numbers. Supports offset/limit for paging.", .parameters_json =
     \\{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","description":"0-based start line"},"limit":{"type":"integer"}},"required":["path"]}
     },
-    .{ .name = "glob", .description = "List files matching a glob pattern (** crosses directories, * stays within one).", .parameters_json =
+    .{ .name = "glob", .description = "List files matching a glob pattern (** crosses directories, * stays within one). Respects .gitignore and skips hidden entries.", .parameters_json =
     \\{"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"]}
     },
-    .{ .name = "grep", .description = "Literal substring search across repository text files.", .parameters_json =
+    .{ .name = "grep", .description = "Regex search across text files (literals, ., *, +, ?, [...], ^, $). Respects .gitignore; skips hidden and binary files.", .parameters_json =
     \\{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string","description":"subdirectory to search"}},"required":["pattern"]}
     },
     .{ .name = "edit", .description = "Replace exactly one occurrence of old_string with new_string in a file. Refuses if the text appears zero or multiple times.", .parameters_json =
@@ -366,48 +371,167 @@ const skip_dirs = [_][]const u8{
     ".ifnh/cache", "__pycache__",  "target",    "dist",    "build",
 };
 
-fn shouldSkipDir(rel: []const u8) bool {
+fn isInSkipDir(rel: []const u8) bool {
     for (skip_dirs) |sd| {
-        if (std.mem.eql(u8, rel, sd)) return true;
-        if (std.mem.endsWith(u8, rel, sd) and
-            (rel.len == sd.len or rel[rel.len - sd.len - 1] == '/')) return true;
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, rel, from, sd)) |pos| {
+            const before = pos == 0 or rel[pos - 1] == '/';
+            const after = pos + sd.len == rel.len or rel[pos + sd.len] == '/';
+            if (before and after) return true;
+            from = pos + 1;
+        }
     }
     return false;
 }
 
-fn collectMatching(
+fn isHiddenPath(rel: []const u8) bool {
+    var it = std.mem.splitScalar(u8, rel, '/');
+    while (it.next()) |part| {
+        if (part.len > 0 and part[0] == '.') return true;
+    }
+    return false;
+}
+
+/// Hidden dot entries are skipped. `.env` files are the exception when the
+/// policy allows reading them, but a hidden parent directory still wins.
+fn skipHidden(ctx: *ToolContext, rel: []const u8) bool {
+    if (!isHiddenPath(rel)) return false;
+    if (ctx.engine.read_dotenv and isDotenvPath(rel)) {
+        const slash = std.mem.lastIndexOfScalar(u8, rel, '/');
+        const parent = if (slash) |i| rel[0..i] else "";
+        return isHiddenPath(parent);
+    }
+    return true;
+}
+
+fn shouldFilterPath(ctx: *ToolContext, rel: []const u8, is_dir: bool) bool {
+    if (isInSkipDir(rel) or skipHidden(ctx, rel)) return true;
+    if (!is_dir and !ctx.engine.read_dotenv and isDotenvPath(rel)) return true;
+    return false;
+}
+
+fn collectFiles(
     ctx: *ToolContext,
     dir: std.Io.Dir,
     rel_prefix: []const u8,
     depth: usize,
     limits: *WalkLimits,
+    ignore: *search.IgnoreSet,
     out: *std.ArrayListUnmanaged([]const u8),
-    pattern: []const u8,
 ) void {
-    if (depth > limits.max_depth or out.items.len >= limits.max_matches or limits.max_files == 0) return;
+    if (depth > limits.max_depth or limits.max_files == 0) return;
+    ignore.push(ctx.io, dir, rel_prefix);
+    defer ignore.pop();
     var it = dir.iterate();
     while (it.next(ctx.io) catch null) |entry| {
-        if (out.items.len >= limits.max_matches or limits.max_files == 0) return;
-        const child_rel = std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ rel_prefix, entry.name }) catch return;
+        if (limits.max_files == 0) return;
+        const child_rel = if (rel_prefix.len == 0)
+            std.fmt.allocPrint(ctx.arena, "{s}", .{entry.name}) catch return
+        else
+            std.fmt.allocPrint(ctx.arena, "{s}/{s}", .{ rel_prefix, entry.name }) catch return;
         limits.max_files -|= 1;
-        if (entry.kind == .directory) {
-            if (shouldSkipDir(child_rel)) continue;
+        const is_dir = entry.kind == .directory;
+        if (shouldFilterPath(ctx, child_rel, is_dir) or ignore.isIgnored(child_rel, is_dir)) continue;
+        if (is_dir) {
             const sub = dir.openDir(ctx.io, entry.name, .{ .iterate = true }) catch continue;
             defer sub.close(ctx.io);
-            const next_prefix = std.fmt.allocPrint(ctx.arena, "{s}/", .{child_rel}) catch return;
-            collectMatching(ctx, sub, next_prefix, depth + 1, limits, out, pattern);
-        } else if (globm.match(pattern, child_rel)) {
+            collectFiles(ctx, sub, child_rel, depth + 1, limits, ignore, out);
+        } else {
             out.append(ctx.arena, child_rel) catch return;
         }
     }
 }
 
+fn sortPaths(items: [][]const u8) void {
+    std.mem.sort([]const u8, items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+}
+
 fn toolGlob(pattern: []const u8, ctx: *ToolContext) ToolResult {
-    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+    if (ctx.use_external_tools) {
+        if (ctx.external_cache.fd(ctx.io)) |prog| {
+            if (externalGlob(prog, pattern, ctx)) |result| return result;
+        }
+    }
+    return fallbackGlob(pattern, ctx);
+}
+
+fn fallbackGlob(pattern: []const u8, ctx: *ToolContext) ToolResult {
+    var files: std.ArrayListUnmanaged([]const u8) = .empty;
     var limits = WalkLimits{};
-    collectMatching(ctx, ctx.workspace, "", 0, &limits, &out, pattern);
-    if (out.items.len == 0) return .{ .output = "no matches", .status = .ok };
-    const body = std.mem.join(ctx.arena, "\n", out.items) catch return errResult(ctx.arena, "oom", .{});
+    var ignore = search.IgnoreSet.init(ctx.arena);
+    collectFiles(ctx, ctx.workspace, "", 0, &limits, &ignore, &files);
+
+    var matches: std.ArrayListUnmanaged([]const u8) = .empty;
+    for (files.items) |rel| {
+        if (globm.match(pattern, rel)) matches.append(ctx.arena, rel) catch return errResult(ctx.arena, "oom", .{});
+    }
+    if (matches.items.len == 0) return .{ .output = "no matches", .status = .ok };
+    sortPaths(matches.items);
+    const shown = matches.items[0..@min(matches.items.len, 500)];
+    const body = std.mem.join(ctx.arena, "\n", shown) catch return errResult(ctx.arena, "oom", .{});
+    return .{ .output = truncateUtf8(ctx.arena, body, "glob results") catch body, .status = .ok };
+}
+
+const ExternalRun = struct {
+    stdout: []const u8,
+    code: u8,
+};
+
+fn runExternal(ctx: *ToolContext, argv: []const []const u8) ?ExternalRun {
+    const run = std.process.run(ctx.arena, ctx.io, .{
+        .argv = argv,
+        .cwd = .{ .dir = ctx.workspace },
+        .stdout_limit = .limited(4 * 1024 * 1024),
+        .stderr_limit = .limited(16 * 1024),
+        .timeout = .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(if (ctx.timeout_s == 0) 120 else ctx.timeout_s) } },
+    }) catch return null;
+    const code = switch (run.term) {
+        .exited => |c| c,
+        else => return null,
+    };
+    return .{ .stdout = run.stdout, .code = code };
+}
+
+fn externalGlob(prog: []const u8, pattern: []const u8, ctx: *ToolContext) ?ToolResult {
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    argv.append(ctx.arena, prog) catch return null;
+    argv.appendSlice(ctx.arena, &[_][]const u8{
+        "--color=never", "--type", "f", "--no-require-git", "--max-depth",
+    }) catch return null;
+    const root_only = std.mem.indexOfScalar(u8, pattern, '/') == null and !std.mem.eql(u8, pattern, "**");
+    const max_depth: []const u8 = if (root_only) "1" else "16";
+    argv.append(ctx.arena, max_depth) catch return null;
+    if (ctx.engine.read_dotenv) argv.append(ctx.arena, "--hidden") catch return null;
+    for (skip_dirs) |sd| {
+        argv.appendSlice(ctx.arena, &[_][]const u8{ "--exclude", sd }) catch return null;
+    }
+    if (!ctx.engine.read_dotenv) {
+        argv.appendSlice(ctx.arena, &[_][]const u8{ "--exclude", ".env", "--exclude", ".env.*" }) catch return null;
+    }
+    argv.appendSlice(ctx.arena, &[_][]const u8{ "--", pattern }) catch return null;
+
+    const run = runExternal(ctx, argv.items) orelse return null;
+    if (run.code != 0) return null;
+
+    var matches: std.ArrayListUnmanaged([]const u8) = .empty;
+    var lines = std.mem.splitScalar(u8, run.stdout, '\n');
+    while (lines.next()) |raw| {
+        var line = std.mem.trimEnd(u8, raw, "\r");
+        if (line.len == 0) continue;
+        if (std.mem.indexOfScalar(u8, line, 0) != null) return null;
+        if (std.mem.startsWith(u8, line, "./")) line = line[2..];
+        if (line.len == 0 or line[0] == '/') return null;
+        if (shouldFilterPath(ctx, line, false)) continue;
+        matches.append(ctx.arena, line) catch return null;
+    }
+    if (matches.items.len == 0) return .{ .output = "no matches", .status = .ok };
+    sortPaths(matches.items);
+    const shown = matches.items[0..@min(matches.items.len, 500)];
+    const body = std.mem.join(ctx.arena, "\n", shown) catch return null;
     return .{ .output = truncateUtf8(ctx.arena, body, "glob results") catch body, .status = .ok };
 }
 
@@ -418,43 +542,114 @@ fn toolGrep(pattern: []const u8, root: []const u8, ctx: *ToolContext) ToolResult
         .allow => {},
         else => return deniedResult(ctx.arena, "grep under '{s}'", .{root}),
     }
+    var re = search.Regex.compile(ctx.arena, pattern) catch |err|
+        return errResult(ctx.arena, "grep: {s}", .{search.regexError(err)});
+    defer re.deinit();
+
+    if (ctx.use_external_tools) {
+        if (ctx.external_cache.rg(ctx.io)) |prog| {
+            if (externalGrep(prog, pattern, root, ctx)) |result| return result;
+        }
+    }
+    return fallbackGrep(&re, root, ctx);
+}
+
+fn externalGrep(prog: []const u8, pattern: []const u8, root: []const u8, ctx: *ToolContext) ?ToolResult {
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    argv.append(ctx.arena, prog) catch return null;
+    argv.appendSlice(ctx.arena, &[_][]const u8{
+        "--no-config",   "--color=never",    "--no-heading",
+        "--line-number", "--with-filename",  "--sort",
+        "path",          "--no-messages",    "--max-count",
+        "10",            "--no-require-git",
+    }) catch return null;
+    if (ctx.engine.read_dotenv) argv.append(ctx.arena, "--hidden") catch return null;
+    for (skip_dirs) |sd| {
+        const one = std.fmt.allocPrint(ctx.arena, "!{s}", .{sd}) catch return null;
+        const all = std.fmt.allocPrint(ctx.arena, "!**/{s}/**", .{sd}) catch return null;
+        argv.appendSlice(ctx.arena, &[_][]const u8{ "--glob", one, "--glob", all }) catch return null;
+    }
+    if (!ctx.engine.read_dotenv) {
+        argv.appendSlice(ctx.arena, &[_][]const u8{
+            "--glob", "!.env",   "--glob", "!**/.env",
+            "--glob", "!.env.*", "--glob", "!**/.env.*",
+        }) catch return null;
+    }
+    argv.appendSlice(ctx.arena, &[_][]const u8{ "--regexp", pattern, "--" }) catch return null;
+    argv.append(ctx.arena, if (root.len == 0) "." else root) catch return null;
+
+    const run = runExternal(ctx, argv.items) orelse return null;
+    if (run.code > 1) return null;
+
     var out: std.ArrayListUnmanaged(u8) = .empty;
-    var limits = WalkLimits{ .max_matches = 200 };
-    grepDir(ctx, ctx.workspace, root, pattern, &limits, &out, 0);
+    var count: usize = 0;
+    var lines = std.mem.splitScalar(u8, run.stdout, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        if (std.mem.indexOfScalar(u8, line, 0) != null) return null;
+        var path = rgPath(line) orelse return null;
+        const tail = line[path.len..];
+        if (std.mem.startsWith(u8, path, "./")) path = path[2..];
+        if (path.len == 0 or path[0] == '/') return null;
+        if (shouldFilterPath(ctx, path, false)) continue;
+        out.appendSlice(ctx.arena, path) catch return null;
+        out.appendSlice(ctx.arena, tail) catch return null;
+        out.append(ctx.arena, '\n') catch return null;
+        count += 1;
+        if (count >= 200) break;
+    }
     if (out.items.len == 0) return .{ .output = "no matches", .status = .ok };
     return .{ .output = truncateUtf8(ctx.arena, out.items, "grep results") catch out.items, .status = .ok };
 }
 
-fn grepDir(
-    ctx: *ToolContext,
-    dir: std.Io.Dir,
-    rel: []const u8,
-    pattern: []const u8,
-    limits: *WalkLimits,
-    out: *std.ArrayListUnmanaged(u8),
-    depth: usize,
-) void {
-    if (depth > limits.max_depth or limits.max_matches == 0 or limits.max_files == 0) return;
-    var it = dir.iterate();
-    while (it.next(ctx.io) catch null) |entry| {
-        if (limits.max_matches == 0 or limits.max_files == 0) return;
-        const child_rel = if (rel.len == 0)
-            std.fmt.allocPrint(ctx.arena, "{s}", .{entry.name}) catch return
-        else
-            std.fmt.allocPrint(ctx.arena, "{s}/{s}", .{ rel, entry.name }) catch return;
-        limits.max_files -|= 1;
-        if (entry.kind == .directory) {
-            if (shouldSkipDir(child_rel)) continue;
-            const sub = dir.openDir(ctx.io, entry.name, .{ .iterate = true }) catch continue;
-            defer sub.close(ctx.io);
-            grepDir(ctx, sub, child_rel, pattern, limits, out, depth + 1);
-        } else {
-            grepFile(ctx, child_rel, pattern, limits, out);
+/// Extract the path from `rg`'s `path:line:text` output. A path may itself
+/// contain colons, so only a `:<digits>:` separator counts.
+fn rgPath(line: []const u8) ?[]const u8 {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, line, from, ":")) |colon| {
+        var j = colon + 1;
+        while (j < line.len and std.ascii.isDigit(line[j])) j += 1;
+        if (j > colon + 1 and j < line.len and line[j] == ':') {
+            if (colon == 0) return null;
+            return line[0..colon];
         }
+        from = colon + 1;
     }
+    return null;
 }
 
-fn grepFile(ctx: *ToolContext, rel: []const u8, pattern: []const u8, limits: *WalkLimits, out: *std.ArrayListUnmanaged(u8)) void {
+fn fallbackGrep(re: *search.Regex, root: []const u8, ctx: *ToolContext) ToolResult {
+    var start_rel = std.mem.trim(u8, root, " \t\r\n");
+    start_rel = std.mem.trimEnd(u8, start_rel, "/");
+    if (std.mem.eql(u8, start_rel, ".")) start_rel = "";
+
+    var dir = ctx.workspace;
+    var opened: ?std.Io.Dir = null;
+    if (start_rel.len > 0) {
+        dir = ctx.workspace.openDir(ctx.io, start_rel, .{ .iterate = true }) catch
+            return .{ .output = "no matches", .status = .ok };
+        opened = dir;
+    }
+    defer if (opened) |d| d.close(ctx.io);
+
+    var files: std.ArrayListUnmanaged([]const u8) = .empty;
+    var limits = WalkLimits{ .max_matches = 200 };
+    var ignore = search.IgnoreSet.init(ctx.arena);
+    // A subdirectory search still inherits the workspace .gitignore.
+    if (start_rel.len > 0) ignore.push(ctx.io, ctx.workspace, "");
+    collectFiles(ctx, dir, start_rel, 0, &limits, &ignore, &files);
+    sortPaths(files.items);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    for (files.items) |rel| {
+        if (limits.max_matches == 0) break;
+        grepFile(ctx, rel, re, &limits, &out);
+    }
+    if (out.items.len == 0) return .{ .output = "no matches", .status = .ok };
+    return .{ .output = truncateUtf8(ctx.arena, out.items, "grep results") catch out.items, .status = .ok };
+}
+
+fn grepFile(ctx: *ToolContext, rel: []const u8, re: *search.Regex, limits: *WalkLimits, out: *std.ArrayListUnmanaged(u8)) void {
     if (!ctx.engine.read_dotenv and isDotenvPath(rel)) return;
     const data = ctx.workspace.readFileAlloc(ctx.io, rel, ctx.arena, .limited(max_file_size_bytes)) catch return;
     if (!std.unicode.utf8ValidateSlice(data)) return; // skip binary
@@ -463,8 +658,9 @@ fn grepFile(ctx: *ToolContext, rel: []const u8, pattern: []const u8, limits: *Wa
     var file_hits: usize = 0;
     while (lines.next()) |line| : (line_no += 1) {
         if (file_hits >= 10 or limits.max_matches == 0) return;
-        if (std.mem.indexOf(u8, line, pattern) != null) {
-            out.print(ctx.arena, "{s}:{d}: {s}\n", .{ rel, line_no + 1, std.mem.trimEnd(u8, line, "\r") }) catch return;
+        const text = std.mem.trimEnd(u8, line, "\r");
+        if (re.isMatch(text)) {
+            out.print(ctx.arena, "{s}:{d}: {s}\n", .{ rel, line_no + 1, text }) catch return;
             file_hits += 1;
             limits.max_matches -= 1;
         }
@@ -1007,6 +1203,113 @@ test "grep skips dotenv files by default" {
     try std.testing.expectEqual(Status.ok, r.status);
     try std.testing.expect(std.mem.indexOf(u8, r.output, "ok.txt:1") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.output, ".env:1") == null);
+}
+
+fn setupSearchParityTree(tmp: *std.testing.TmpDir) !void {
+    const io = std.testing.io;
+    try tmp.dir.createDirPath(io, ".git");
+    try tmp.dir.createDirPath(io, ".hidden");
+    try tmp.dir.createDirPath(io, "src/deep");
+    try tmp.dir.createDirPath(io, "build");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".gitignore", .data = "*.log\nbuild/\n*.tmp\n!keep.log\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/a.zig", .data = "needle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/deep/b.zig", .data = "needle twice\nnothing\nneedle again\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/keep.log", .data = "needle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "ignored.log", .data = "needle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "build/out.txt", .data = "needle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".hidden/secret.txt", .data = "needle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".env", .data = "needle=1\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "blob.bin", .data = "needle\xff\n" });
+}
+
+test "external and fallback search agree" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+    try setupSearchParityTree(&tmp);
+
+    var e = engine_mod.Engine.init(std.testing.allocator, .ask);
+    defer e.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ctx = testCtx(arena_state.allocator(), io, tmp.dir, &e);
+    ctx.use_external_tools = false;
+
+    const fallback_grep = execute("grep", "{\"pattern\":\"needle\"}", &ctx);
+    try std.testing.expectEqual(Status.ok, fallback_grep.status);
+    try std.testing.expectEqualStrings(
+        "src/a.zig:1: needle\n" ++
+            "src/deep/b.zig:1: needle twice\n" ++
+            "src/deep/b.zig:3: needle again\n" ++
+            "src/keep.log:1: needle\n",
+        fallback_grep.output,
+    );
+
+    const fallback_glob = execute("glob", "{\"pattern\":\"**\"}", &ctx);
+    try std.testing.expectEqual(Status.ok, fallback_glob.status);
+    try std.testing.expectEqualStrings(
+        "blob.bin\nsrc/a.zig\nsrc/deep/b.zig\nsrc/keep.log",
+        fallback_glob.output,
+    );
+
+    if (!search.programAvailable(io, "rg") or
+        (!search.programAvailable(io, "fd") and !search.programAvailable(io, "fdfind")))
+        return error.SkipZigTest;
+
+    ctx.use_external_tools = true;
+    const external_grep = execute("grep", "{\"pattern\":\"needle\"}", &ctx);
+    try std.testing.expectEqual(Status.ok, external_grep.status);
+    try std.testing.expectEqualStrings(fallback_grep.output, external_grep.output);
+
+    const external_glob = execute("glob", "{\"pattern\":\"**\"}", &ctx);
+    try std.testing.expectEqual(Status.ok, external_glob.status);
+    try std.testing.expectEqualStrings(fallback_glob.output, external_glob.output);
+}
+
+test "grep fallback regex subset and unsupported constructs" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data =
+        \\const abc = 12;
+        \\var x = 1;
+        \\literal.dot
+        \\foo123
+        \\end line
+        \\
+    });
+
+    var e = engine_mod.Engine.init(std.testing.allocator, .ask);
+    defer e.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ctx = testCtx(arena_state.allocator(), io, tmp.dir, &e);
+    ctx.use_external_tools = false;
+
+    const cases = [_]struct { args: []const u8, expected: []const u8 }{
+        .{ .args = "{\"pattern\":\"^const [a-z]+ = [0-9]+;$\"}", .expected = "f.txt:1: const abc = 12;\n" },
+        .{ .args = "{\"pattern\":\"a.c\"}", .expected = "f.txt:1: const abc = 12;\n" },
+        .{ .args = "{\"pattern\":\"foo[0-9]+\"}", .expected = "f.txt:4: foo123\n" },
+        .{ .args = "{\"pattern\":\"^var\"}", .expected = "f.txt:2: var x = 1;\n" },
+        .{ .args = "{\"pattern\":\"line$\"}", .expected = "f.txt:5: end line\n" },
+    };
+    for (cases) |case| {
+        const r = execute("grep", case.args, &ctx);
+        try std.testing.expectEqual(Status.ok, r.status);
+        try std.testing.expectEqualStrings(case.expected, r.output);
+    }
+
+    const unsupported = [_]struct { args: []const u8, message: []const u8 }{
+        .{ .args = "{\"pattern\":\"(foo)\"}", .message = "groups are unsupported" },
+        .{ .args = "{\"pattern\":\"a|b\"}", .message = "alternation is unsupported" },
+        .{ .args = "{\"pattern\":\"a{2}\"}", .message = "{m,n} repetition is unsupported" },
+        .{ .args = "{\"pattern\":\"a\\\\1\"}", .message = "backreferences are unsupported" },
+    };
+    for (unsupported) |case| {
+        const r = execute("grep", case.args, &ctx);
+        try std.testing.expectEqual(Status.failed, r.status);
+        try std.testing.expect(std.mem.indexOf(u8, r.output, case.message) != null);
+    }
 }
 
 test "git push is denied under the default ceilings" {
