@@ -19,6 +19,14 @@ pub const max_file_size_bytes: usize = 1024 * 1024;
 
 pub const Status = enum { ok, denied, failed, timeout };
 
+/// Tools that only read the workspace and never prompt for approval. These
+/// may run concurrently as one batch (DECISIONS #58 leadingParallelGroup).
+pub fn isReadOnly(name: []const u8) bool {
+    return std.mem.eql(u8, name, "read") or
+        std.mem.eql(u8, name, "glob") or
+        std.mem.eql(u8, name, "grep");
+}
+
 pub const ApprovalRequest = struct {
     pub const Grant = union(enum) {
         none,
@@ -1131,4 +1139,13 @@ test "bash per-call timeout only tightens the session ceiling" {
     // A 60 s request was clamped to the 1 s ceiling.
     try std.testing.expect(elapsed_ms < 4000);
     try std.testing.expect(std.mem.indexOf(u8, r.output, "timed out after 1s") != null);
+}
+
+test "isReadOnly classifies only workspace readers" {
+    try std.testing.expect(isReadOnly("read"));
+    try std.testing.expect(isReadOnly("glob"));
+    try std.testing.expect(isReadOnly("grep"));
+    try std.testing.expect(!isReadOnly("bash"));
+    try std.testing.expect(!isReadOnly("write"));
+    try std.testing.expect(!isReadOnly("agent"));
 }
