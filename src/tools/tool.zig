@@ -78,9 +78,10 @@ pub const ToolContext = struct {
     agent_depth: usize = 0,
     /// Display label for approval provenance ("parent", "research-1"...).
     agent_label: []const u8 = "",
-    /// `tools.external`: prefer `rg`/`fd` when the host allows it.
-    use_external_tools: bool = true,
-    /// Lazily resolved `rg`/`fd` probes for this context (single-threaded).
+    /// `tools.external`: prefer `rg`/`fd` when the host allows it. `null`
+    /// follows the process-global probe; an explicit value overrides it.
+    use_external_tools: ?bool = null,
+    /// Per-context view of the process-global `rg`/`fd` probe.
     external_cache: search.ExternalCache = .{},
 
     pub fn requestApproval(self: *ToolContext, title: []const u8, detail: []const u8, grant: ApprovalRequest.Grant) bool {
@@ -465,9 +466,21 @@ fn fdMayHandleGlob(pattern: []const u8) bool {
     return std.mem.indexOfScalar(u8, pattern, '/') == null and !std.mem.eql(u8, pattern, "**");
 }
 
+/// Resolve an external program, honouring an explicit `tools.external`
+/// override and otherwise following the process-global availability cache.
+fn externalProgram(ctx: *ToolContext, which: enum { rg, fd }) ?[]const u8 {
+    if (ctx.use_external_tools) |enabled| {
+        if (!enabled) return null;
+    }
+    return switch (which) {
+        .rg => ctx.external_cache.rg(ctx.io),
+        .fd => ctx.external_cache.fd(ctx.io),
+    };
+}
+
 fn toolGlob(pattern: []const u8, ctx: *ToolContext) ToolResult {
-    if (ctx.use_external_tools and fdMayHandleGlob(pattern)) {
-        if (ctx.external_cache.fd(ctx.io)) |prog| {
+    if (fdMayHandleGlob(pattern)) {
+        if (externalProgram(ctx, .fd)) |prog| {
             if (externalGlob(prog, pattern, ctx)) |result| return result;
         }
     }
@@ -558,10 +571,8 @@ fn toolGrep(pattern: []const u8, root: []const u8, ctx: *ToolContext) ToolResult
         return errResult(ctx.arena, "grep: {s}", .{search.regexError(err)});
     defer re.deinit();
 
-    if (ctx.use_external_tools) {
-        if (ctx.external_cache.rg(ctx.io)) |prog| {
-            if (externalGrep(prog, pattern, root, ctx)) |result| return result;
-        }
+    if (externalProgram(ctx, .rg)) |prog| {
+        if (externalGrep(prog, pattern, root, ctx)) |result| return result;
     }
     return fallbackGrep(&re, root, ctx);
 }
