@@ -406,8 +406,31 @@ pub const IgnoreSet = struct {
     }
 };
 
-/// Lazily probes `rg`/`fd` once per ToolContext (the context is per turn,
-/// so this is single-threaded in the call sites that use it).
+/// Process-global result of the one `rg`/`fd` availability probe. Tool
+/// contexts are copied per call (and per parallel batch worker), so the probe
+/// must live outside them or `--version` would run on every call.
+var probe_state = std.atomic.Value(u8).init(0); // 0 = unchecked, 1 = probing, 2 = ready
+var probe_rg_available: bool = false;
+var probe_fd_name: ?[]const u8 = null;
+
+fn probePrograms(io: std.Io) void {
+    if (probe_state.load(.acquire) == 2) return;
+    if (probe_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) == null) {
+        probe_rg_available = programAvailable(io, "rg");
+        probe_fd_name = if (programAvailable(io, "fd"))
+            "fd"
+        else if (programAvailable(io, "fdfind"))
+            "fdfind"
+        else
+            null;
+        probe_state.store(2, .release);
+        return;
+    }
+    while (probe_state.load(.acquire) != 2) std.atomic.spinLoopHint();
+}
+
+/// Cached `rg`/`fd` probe. An explicit checked field (tests) wins over the
+/// process-global cache; otherwise a context reads the shared result.
 pub const ExternalCache = struct {
     rg_checked: bool = false,
     rg_available: bool = false,
@@ -415,23 +438,18 @@ pub const ExternalCache = struct {
     fd_name: ?[]const u8 = null,
 
     pub fn rg(self: *ExternalCache, io: std.Io) ?[]const u8 {
-        if (!self.rg_checked) {
-            self.rg_available = programAvailable(io, "rg");
-            self.rg_checked = true;
-        }
+        if (self.rg_checked) return if (self.rg_available) "rg" else null;
+        probePrograms(io);
+        self.rg_checked = true;
+        self.rg_available = probe_rg_available;
         return if (self.rg_available) "rg" else null;
     }
 
     pub fn fd(self: *ExternalCache, io: std.Io) ?[]const u8 {
-        if (!self.fd_checked) {
-            self.fd_name = if (programAvailable(io, "fd"))
-                "fd"
-            else if (programAvailable(io, "fdfind"))
-                "fdfind"
-            else
-                null;
-            self.fd_checked = true;
-        }
+        if (self.fd_checked) return self.fd_name;
+        probePrograms(io);
+        self.fd_checked = true;
+        self.fd_name = probe_fd_name;
         return self.fd_name;
     }
 };
