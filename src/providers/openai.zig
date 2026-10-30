@@ -512,6 +512,17 @@ test "wire golden openai body is byte-stable" {
     try std.testing.expectEqualStrings(expected, body);
 }
 
+test "body emits max_tokens only when configured" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var req = testRequest(&.{.{ .role = .user, .content = "hi" }}, &.{});
+    try std.testing.expect(std.mem.indexOf(u8, try buildBody(arena, req), "max_tokens") == null);
+    req.max_output_tokens = 1234;
+    try std.testing.expect(std.mem.indexOf(u8, try buildBody(arena, req), "\"max_tokens\":1234") != null);
+}
+
 test "usage parses prompt_tokens_details.cached_tokens" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

@@ -498,6 +498,7 @@ test {
     _ = @import("providers/sse.zig");
     _ = @import("providers/openai.zig");
     _ = @import("providers/anthropic.zig");
+    _ = @import("providers/limits.zig");
     _ = @import("core/instructions.zig");
     _ = @import("core/trace.zig");
     _ = @import("core/turn_cache.zig");
