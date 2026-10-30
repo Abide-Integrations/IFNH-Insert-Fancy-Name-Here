@@ -103,7 +103,7 @@ Wall-clock in an agent harness is dominated by model round-trips and per-round o
 
 | ID | Task | Status | Verify | Notes |
 |---|---|---|---|---|
-| C-01 | Extract `core/agent/session_runtime.zig` from `repl.zig` (1,545 lines); remove module globals | `[ ]` | full `zig build test`; manual REPL smoke | Prerequisite for C-02 and E-06 |
+| C-01 | Extract `core/agent/session_runtime.zig` from `repl.zig` (1,545 lines); remove module globals | `[?]` | full `zig build test`; manual REPL smoke | Prerequisite for C-02 and E-06 |
 | C-02 | Headless: `ifnh ask`/`-p`, `--json` NDJSON events, `--yes`/`--deny-all`/`--policy`, stdin, exit codes | `[ ]` | scripted `ifnh ask` in shell | fx parity |
 | C-03 | Line editor: history, arrows, Ctrl-R, multiline, paste, Tab-complete, `@file`, `!cmd` | `[ ]` | manual | |
 | C-04 | Live footer: model, context %, tokens, cost, elapsed | `[ ]` | manual | |

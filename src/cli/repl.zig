@@ -16,8 +16,6 @@ const system_prompt = @import("../core/agent/system_prompt.zig");
 const subagent_mod = @import("../core/agent/subagent.zig");
 const session_runtime = @import("../core/agent/session_runtime.zig");
 const git_mod = @import("../core/git.zig");
-const mcp_mod = @import("../core/mcp.zig");
-const skills_mod = @import("../core/skills.zig");
 const compaction_mod = @import("../core/compaction.zig");
 const lifecycle_mod = @import("../core/lifecycle.zig");
 const style_mod = @import("../ui/style.zig");
@@ -69,8 +67,8 @@ const Ui = struct {
         const self: *Ui = @ptrCast(@alignCast(ctx));
         switch (level) {
             .plain => out(self.io, "{s}", .{text}) catch {},
-            .warn => out(self.io, "{s}{s}{s}", .{ self.palette.warn("", std.heap.page_allocator), text, "\x1b[0m" }) catch {},
-            .err => out(self.io, "{s}{s}{s}", .{ self.palette.err("", std.heap.page_allocator), text, "\x1b[0m" }) catch {},
+            .warn => out(self.io, "{s}", .{self.palette.warn(text, std.heap.page_allocator)}) catch {},
+            .err => out(self.io, "{s}", .{self.palette.err(text, std.heap.page_allocator)}) catch {},
         }
     }
 
@@ -301,9 +299,10 @@ fn renderTurn(io: std.Io, arena: std.mem.Allocator, ui: *const Ui, res: session_
     switch (res.status) {
         .completed => {},
         .failed => {
-            try out(io, "{s}provider error: {s}{s}\n", .{ ui.palette.err("", arena), res.error_message, "\x1b[0m" });
+            const line = try std.fmt.allocPrint(arena, "provider error: {s}", .{res.error_message});
+            try out(io, "{s}\n", .{ui.palette.err(line, arena)});
             if (@import("../providers/probe.zig").looksLikeToolRejection(res.error_message)) {
-                try out(io, "{s}hint: this model may not support tool calling. Set it up as chat-only with /provider tools off{s}\n", .{ ui.palette.warn("", arena), "\x1b[0m" });
+                try out(io, "{s}\n", .{ui.palette.warn("hint: this model may not support tool calling. Set it up as chat-only with /provider tools off", arena)});
             }
         },
         .cancelled => try out(io, "(interrupted)\n", .{}),

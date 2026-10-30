@@ -465,8 +465,11 @@ pub const SessionRuntime = struct {
             .trace = self.trace,
         }) catch |err| {
             self.rollbackTurn(history_start);
-            statusFmt(events, .plain, "\nturn failed: {s}\n", .{@errorName(err)});
-            return .{ .ran = true, .status = .failed };
+            // Report the failure once, through the outcome: the caller renders
+            // `error_message` (the REPL as a provider-error line, headless as an
+            // NDJSON error event). Printing here too produced a second, empty
+            // error line on the caller side.
+            return .{ .ran = true, .status = .failed, .error_message = @errorName(err) };
         };
 
         _ = hook_engine.dispatch(.after_agent, "{}");
