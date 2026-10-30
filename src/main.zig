@@ -502,6 +502,7 @@ test {
     _ = @import("core/agent/engine.zig");
     _ = @import("core/agent/testing.zig");
     _ = @import("core/agent/subagent.zig");
+    _ = @import("core/agent/session_runtime.zig");
     _ = @import("core/git.zig");
     _ = @import("core/mcp.zig");
     _ = @import("core/skills.zig");
