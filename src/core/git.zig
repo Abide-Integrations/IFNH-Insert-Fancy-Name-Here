@@ -94,6 +94,61 @@ pub const Git = struct {
     }
 };
 
+/// What `discover` learns about a directory.
+pub const Workspace = struct {
+    /// Absolute, resolved path of the directory the caller passed.
+    repo_path: []const u8,
+    /// Absolute path of the `.git` directory when one was found
+    /// (worktree/submodule `gitdir:` indirection resolved), else null.
+    git_dir: ?[]const u8,
+    /// Ready-to-use handle when `git_dir` is present, else null.
+    git: ?Git,
+};
+
+/// Resolve `dir` and look for a repository above it. A found `.git` is
+/// trusted: no `git` process is spawned. Null when `dir` cannot be resolved.
+/// Results are allocated from `arena`.
+pub fn discover(io: std.Io, arena: std.mem.Allocator, dir: std.Io.Dir) ?Workspace {
+    // `Dir.realPath` fails on `.cwd()` in Zig 0.16 (AT_FDCWD has no /proc
+    // entry); resolving "." works for every handle.
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = dir.realPathFile(io, ".", &path_buf) catch return null;
+    const repo_path = arena.dupe(u8, path_buf[0..n]) catch return null;
+    const git_dir = findGitDir(io, arena, repo_path) catch return null;
+    return .{
+        .repo_path = repo_path,
+        .git_dir = git_dir,
+        .git = if (git_dir != null) Git.init(io, repo_path) else null,
+    };
+}
+
+/// Walk up from `start` looking for `.git`. Handles the worktree/submodule
+/// case where `.git` is a file pointing at the real git dir.
+fn findGitDir(io: std.Io, arena: std.mem.Allocator, start: []const u8) !?[]const u8 {
+    const cwd = std.Io.Dir.cwd();
+    var current = start;
+    var depth: usize = 0;
+    while (depth < 64) : (depth += 1) {
+        const candidate = try std.fmt.allocPrint(arena, "{s}/.git", .{current});
+        const st = cwd.statFile(io, candidate, .{}) catch null;
+        if (st) |stat| {
+            if (stat.kind == .directory) return candidate;
+            if (stat.kind == .file) {
+                const text = cwd.readFileAlloc(io, candidate, arena, .limited(4096)) catch return candidate;
+                const line = std.mem.trim(u8, text, " \t\r\n");
+                if (std.mem.startsWith(u8, line, "gitdir:")) {
+                    const target = std.mem.trim(u8, line["gitdir:".len..], " \t");
+                    if (std.fs.path.isAbsolute(target)) return try arena.dupe(u8, target);
+                    return try std.fs.path.resolve(arena, &.{ current, target });
+                }
+                return candidate;
+            }
+        }
+        current = std.fs.path.dirname(current) orelse return null;
+    }
+    return null;
+}
+
 // ---------------------------------------------------------------- tests
 
 fn gitAvailable() bool {
@@ -160,4 +215,70 @@ test "non-git dir is not a repo" {
     var g = Git.init(io, dir_path);
     g.env = &env;
     try std.testing.expect(!g.isRepo(arena_state.allocator()));
+}
+
+test "discover trusts a bare .git directory without spawning git" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Only HEAD: not a valid repo, so any `git rev-parse` would say no.
+    try tmp.dir.createDirPath(io, ".git");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".git/HEAD", .data = "ref: refs/heads/main\n" });
+
+    const ws = discover(io, arena, tmp.dir).?;
+    try std.testing.expect(ws.git != null);
+    const want = try std.fmt.allocPrint(arena, "{s}/.git", .{ws.repo_path});
+    try std.testing.expectEqualStrings(want, ws.git_dir.?);
+    try std.testing.expectEqualStrings(ws.repo_path, ws.git.?.dir_path);
+}
+
+test "discover resolves a gitdir: file relative to its directory" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try tmp.dir.createDirPath(io, "real/gitdata");
+    try tmp.dir.createDirPath(io, "real/wt");
+    try tmp.dir.writeFile(io, .{ .sub_path = "real/wt/.git", .data = "gitdir: ../gitdata\n" });
+
+    var wt = try tmp.dir.openDir(io, "real/wt", .{});
+    defer wt.close(io);
+    const ws = discover(io, arena, wt).?;
+    const want = try std.fmt.allocPrint(arena, "{s}/gitdata", .{std.fs.path.dirname(ws.repo_path).?});
+    try std.testing.expectEqualStrings(want, ws.git_dir.?);
+    try std.testing.expect(ws.git != null);
+}
+
+test "discover works on the process cwd handle" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const ws = discover(std.testing.io, arena_state.allocator(), std.Io.Dir.cwd()).?;
+    try std.testing.expect(std.fs.path.isAbsolute(ws.repo_path));
+}
+
+test "discover reports no repo when no .git exists above" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ws = discover(io, arena, tmp.dir).?;
+    // The tmp root may itself sit inside a repository; the assertion only
+    // holds when nothing above it has a `.git`.
+    var cur: ?[]const u8 = ws.repo_path;
+    while (cur) |c| : (cur = std.fs.path.dirname(c)) {
+        const probe = try std.fmt.allocPrint(arena, "{s}/.git", .{c});
+        if (std.Io.Dir.cwd().statFile(io, probe, .{})) |_| return error.SkipZigTest else |_| {}
+    }
+    try std.testing.expect(ws.git_dir == null);
+    try std.testing.expect(ws.git == null);
 }

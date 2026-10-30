@@ -186,16 +186,10 @@ pub const TurnCache = struct {
     /// Git repo handle for `cwd`, re-probed only when HEAD, the index or the
     /// packed refs change.
     pub fn gitRepo(self: *TurnCache, cwd: std.Io.Dir) !Lookup(?git_mod.Git) {
-        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        // `Dir.realPath` on `.cwd()` fails in Zig 0.16 (the AT_FDCWD
-        // sentinel has no /proc entry), so this returns null in the REPL
-        // exactly as the code it replaced did. Resolving "." through
-        // `realPathFile` makes the probe work, but that also switches on
-        // subagent worktree isolation and costs one `git rev-parse` on turn
-        // one; see B-11 in ACTIVE_PLAN.md.
-        const n = cwd.realPath(self.io, &path_buf) catch return .{ .value = null, .hit = false };
-        const repo_path = try self.arena.dupe(u8, path_buf[0..n]);
-        const git_dir = try findGitDir(self.io, self.arena, repo_path);
+        // Resolves via `realPathFile` and trusts a found `.git` (no git spawn); see B-11.
+        const ws = git_mod.discover(self.io, self.arena, cwd) orelse return .{ .value = null, .hit = false };
+        const repo_path = ws.repo_path;
+        const git_dir = ws.git_dir;
 
         var h = Hasher.init();
         h.hash.update(repo_path);
@@ -211,13 +205,8 @@ pub const TurnCache = struct {
         if (self.git) |entry| {
             if (std.mem.eql(u8, &entry.fp, &fp)) return .{ .value = entry.value, .hit = true };
         }
-        // No `.git` above us: no repo, and no reason to spawn git.
-        const value: ?git_mod.Git = if (git_dir == null) null else blk: {
-            const g = git_mod.Git.init(self.io, repo_path);
-            break :blk if (g.isRepo(self.arena)) g else null;
-        };
-        self.git = .{ .fp = fp, .value = value };
-        return .{ .value = value, .hit = false };
+        self.git = .{ .fp = fp, .value = ws.git };
+        return .{ .value = ws.git, .hit = false };
     }
 
     /// SHA-256 over the content of the policy-relevant files (G99/M0-T30),
@@ -243,33 +232,6 @@ pub const TurnCache = struct {
         return digest;
     }
 };
-
-/// Walk up from `start` looking for `.git`. Handles the worktree/submodule
-/// case where `.git` is a file pointing at the real git dir.
-fn findGitDir(io: std.Io, arena: std.mem.Allocator, start: []const u8) !?[]const u8 {
-    const cwd = std.Io.Dir.cwd();
-    var current = start;
-    var depth: usize = 0;
-    while (depth < 64) : (depth += 1) {
-        const candidate = try std.fmt.allocPrint(arena, "{s}/.git", .{current});
-        const st = cwd.statFile(io, candidate, .{}) catch null;
-        if (st) |stat| {
-            if (stat.kind == .directory) return candidate;
-            if (stat.kind == .file) {
-                const text = cwd.readFileAlloc(io, candidate, arena, .limited(4096)) catch return candidate;
-                const line = std.mem.trim(u8, text, " \t\r\n");
-                if (std.mem.startsWith(u8, line, "gitdir:")) {
-                    const target = std.mem.trim(u8, line["gitdir:".len..], " \t");
-                    if (std.fs.path.isAbsolute(target)) return try arena.dupe(u8, target);
-                    return try std.fs.path.resolve(arena, &.{ current, target });
-                }
-                return candidate;
-            }
-        }
-        current = std.fs.path.dirname(current) orelse return null;
-    }
-    return null;
-}
 
 /// Content hash of the policy-relevant files (same set the approval gate
 /// checks in `cli/repl.zig`). Null when none of them exist.
@@ -429,6 +391,7 @@ test "turn cache git signature tracks head and index" {
 
     const first = try cache.gitRepo(tmp.dir);
     try std.testing.expect(!first.hit);
+    try std.testing.expect(first.value != null);
     try std.testing.expect((try cache.gitRepo(tmp.dir)).hit);
 
     // Moving HEAD (same size) invalidates.
