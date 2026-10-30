@@ -600,7 +600,7 @@ test "worktree isolation: child edits land in its own tree" {
         .max_rounds = 10,
         .redactions = &.{},
         .cancel = &cancel,
-        .git = git_mod.Git.init(io, repo_path),
+        .git = git_mod.discover(io, arena, tmp.dir).?.git,
         .worktree_root = wt_root,
         .session_hint = "stest",
     };

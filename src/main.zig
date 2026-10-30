@@ -367,11 +367,8 @@ fn runDoctor(io: std.Io, arena: std.mem.Allocator, environ: *const std.process.E
     }
 
     // Git.
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const n = cwd.realPath(io, &path_buf) catch 0;
-    if (n > 0) {
-        const g = git_mod.Git.init(io, arena.dupe(u8, path_buf[0..n]) catch "");
-        if (g.isRepo(arena)) {
+    if (git_mod.discover(io, arena, cwd)) |ws| {
+        if (ws.git) |g| {
             const dirty = g.dirtyCount(arena);
             try printOut(io, arena, "  git: repository, branch {s}, {d} uncommitted changes\n", .{ g.currentBranch(arena), dirty });
         } else {

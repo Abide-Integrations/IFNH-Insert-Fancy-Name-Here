@@ -1300,14 +1300,7 @@ fn handleCommand(
             .max_rounds = cfg.getU32("agents.max_tool_rounds", 25),
             .redactions = &.{},
             .cancel = &cancel2,
-            .git = blk: {
-                var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-                const n = cwd.realPath(io, &path_buf) catch break :blk null;
-                const repo_path = arena.dupe(u8, path_buf[0..n]) catch break :blk null;
-                const g = git_mod.Git.init(io, repo_path);
-                if (!g.isRepo(arena)) break :blk null;
-                break :blk g;
-            },
+            .git = if (git_mod.discover(io, arena, cwd)) |ws| ws.git else null,
             .worktree_root = blk: {
                 const state_root = config_mod.userStateDir(arena, environ) orelse break :blk null;
                 const root2 = std.fmt.allocPrint(arena, "{s}/worktrees", .{state_root}) catch break :blk null;
