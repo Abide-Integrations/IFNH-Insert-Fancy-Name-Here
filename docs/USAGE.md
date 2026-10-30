@@ -95,7 +95,74 @@ Custom commands: drop a Markdown file into `.ifnh/commands/<name>.md`
 (optional `---` frontmatter); `$ARGS` in the body is replaced by what you
 type after the command.
 
-## 4. Configuration
+## 4. Headless: `ifnh ask`
+
+`ask` runs exactly one turn, prints the assistant text, and exits. It never
+starts the REPL.
+
+```bash
+ifnh ask "summarise src/core/journal.zig"
+ifnh ask -p "same prompt"          # -p also works before: ifnh -p "same prompt"
+printf 'summarise this' | ifnh ask
+ifnh ask -                         # explicit stdin
+```
+
+The positional prompt and `-p` are equivalent; give at most one. With no
+prompt (or `-`), the whole of stdin is read until EOF. Trailing newlines are
+trimmed. An empty or whitespace-only prompt is a usage error (exit 2).
+
+Plain mode writes only assistant text to stdout; diagnostics go to stderr.
+`--json` (global or after `ask`) writes NDJSON to stdout and nothing else, with
+no styling or ANSI escapes.
+
+### Approvals
+
+| Flag | Effect |
+|---|---|
+| `--yes` | approve every permission ask as `approved_once` |
+| `--deny-all` | deny every permission ask |
+| `--policy ask` | prompt on `/dev/tty` when stdin is a TTY; otherwise deny (default) |
+| `--policy allow` | approve every permission ask (same as `--yes`) |
+| `--policy deny` | deny every permission ask (same as `--deny-all`) |
+
+`--yes`, `--deny-all` and `--policy` are mutually exclusive; more than one is
+a usage error. Approvals are never read from stdin, because stdin may carry the
+prompt. A piped prompt with the default `--policy ask` therefore fails closed.
+
+### NDJSON events (`--json`)
+
+One object per line, no pretty printing, no carriage returns, no trailing
+commas. Every run emits exactly one `start` and one final `end`:
+
+```json
+{"type":"start","session":"s_abc123","model":"claude-sonnet-4-6"}
+{"type":"text","text":"Let me read that file."}
+{"type":"tool","name":"read","phase":"start"}
+{"type":"tool","name":"read","phase":"end","ok":true}
+{"type":"approval","tool":"bash","detail":"touch .ifnh/out.txt","decision":"approved_once"}
+{"type":"error","message":"provider error: boom"}
+{"type":"end","status":"failed"}
+```
+
+- `text` appears once per streamed assistant delta.
+- `tool` emits a `start` and `end` pair; `ok` is false for denied or failed calls.
+- `approval` records `approved_once`, `approved_session` or `denied`.
+- `error` appears only on failure, before `end`.
+- `end.status` is `ok`, `failed`, `denied` or `interrupted`.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | success: the turn completed with no denial |
+| 1 | failure: provider error, tool error that ended the turn, or other turn failure |
+| 2 | usage error: unknown flag, bad/missing flag value, missing/empty prompt, bad `--policy`, conflicting approval flags |
+| 3 | denied: at least one tool call was denied during the turn (includes `--deny-all`) |
+| 130 | interrupted: SIGINT during the turn (the interrupted outcome is emitted first) |
+
+When several apply, precedence is `130 > 1 > 3 > 0`.
+
+## 5. Configuration
 
 Precedence (low to high): **built-in defaults < user < project < session <
 env < CLI**. Inspect any key:
@@ -142,7 +209,7 @@ The full annotated default lives in `src/core/config/config.zig`
 
 `NO_COLOR` / `--no-color` disable styling.
 
-## 5. What the agent can do (tool kernel)
+## 6. What the agent can do (tool kernel)
 
 `read` `glob` `grep` `edit` `write` `bash` `git` — plus:
 
@@ -163,7 +230,7 @@ Policies in this section are enforced by the permission engine, never by
 the model's judgment. `.ifnh/` policy files are agent-write-denied; a
 mid-session policy change fails approvals closed.
 
-## 6. Sessions, undo, forks
+## 7. Sessions, undo, forks
 
 - Everything is event-sourced under `.ifnh/sessions/<id>/`
   (`events.jsonl`, `journal.jsonl`, `usage.jsonl`).
@@ -173,7 +240,7 @@ mid-session policy change fails approvals closed.
   `ifnh fork <id>` branches from the current state; `ifnh fork diff <a> <b>`
   compares; `ifnh cleanup [--yes]` enforces `sessions.keep` retention.
 
-## 7. MCP
+## 8. MCP
 
 ```jsonc
 {
@@ -190,7 +257,7 @@ Servers spawn lazily on first use and are killed at session end. Tool
 calls pass the permission engine (`mcp.<server>.<tool>`, default ask).
 Inspect with `/mcp`; the agent uses `mcp_list`/`mcp_call`.
 
-## 8. Skills
+## 9. Skills
 
 Agent Skills format (`SKILL.md` with `name`/`description` frontmatter):
 
@@ -202,7 +269,7 @@ The agent sees a budgeted catalog each turn and loads bodies with the
 `skill` tool. First-party examples ship in this repo under `skills/`
 (reconnaissance, create-skill) — copy them into a skills directory to use.
 
-## 9. Hooks
+## 10. Hooks
 
 ```jsonc
 { "hooks": {
@@ -215,7 +282,7 @@ Events: `session_start/end`, `before/after_tool`, `before/after_agent`,
 `before/after_merge`. `before_*` hooks block on non-zero exit; everything
 runs under `/bin/sh` with a 30s timeout.
 
-## 10. Lifecycles
+## 11. Lifecycles
 
 ```jsonc
 // .ifnh/lifecycle/ship.json
@@ -233,14 +300,14 @@ Run with `/lifecycle run .ifnh/lifecycle/ship.json` (resume with
 `--from <stage-index>`). Failed reviews stop the pipeline (D008); only
 `/review override <reason>` — recorded as an audit artifact — bypasses.
 
-## 11. Observability
+## 12. Observability
 
 - `ifnh doctor` — environment health.
 - `/usage` — session token totals; per-turn records in the session dir.
 - Logs: `--log-level err|info|debug|trace` (debug/trace redact secrets at
   write time).
 
-## 12. Distribution
+## 13. Distribution
 
 One-liner (after the repo is on GitHub and a tag is released):
 
@@ -280,7 +347,7 @@ the GitHub release with sha256sums. For a single machine:
 zig build -Doptimize=ReleaseSafe && scripts/install.sh
 ```
 
-## 13. Project layout inside `.ifnh/`
+## 14. Project layout inside `.ifnh/`
 
 ```
 .ifnh/

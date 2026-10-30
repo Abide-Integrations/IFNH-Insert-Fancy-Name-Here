@@ -39,7 +39,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const parsed = cli_args.parse(argv.items) catch |err| {
-        try printOut(io, arena, "error: bad arguments: {s}\n(run `ifnh help` for usage)\n", .{@errorName(err)});
+        try printErr(io, arena, "error: bad arguments: {s}\n(run `ifnh help` for usage)\n", .{@errorName(err)});
         std.process.exit(2);
     };
 
@@ -56,12 +56,12 @@ pub fn main(init: std.process.Init) !void {
     // code is the driver's own (0/1/2/3/130), not the generic failure path.
     if (parsed.subcommand == .ask or (parsed.subcommand == .none and parsed.flags.prompt != null)) {
         var ask = cli_args.parseAsk(parsed.args) catch |err| {
-            try printOut(io, arena, "error: bad arguments: {s}\n(run `ifnh help` for usage)\n", .{@errorName(err)});
+            try printErr(io, arena, "error: bad arguments: {s}\n(run `ifnh help` for usage)\n", .{@errorName(err)});
             std.process.exit(2);
         };
         // A `-p` before the subcommand is the prompt when `ask` did not give
-        // one (or gave `-` for stdin); the subcommand-level prompt wins.
-        if (ask.prompt == null and parsed.args.len == 0) ask.prompt = parsed.flags.prompt;
+        // one; an explicit `ask -` still means stdin.
+        ask.prompt = cli_args.resolveAskPrompt(parsed.flags.prompt, ask);
         std.process.exit(ask_mod.run(io, arena, init.environ_map, parsed.flags, ask));
     }
 
@@ -464,6 +464,14 @@ fn printOut(io: std.Io, alloc: std.mem.Allocator, comptime fmt: []const u8, args
     const text = std.fmt.bufPrint(&stack_buf, fmt, args) catch
         try std.fmt.allocPrint(alloc, fmt, args); // arena-owned; freed at process exit
     try std.Io.File.stdout().writeStreamingAll(io, text);
+}
+
+/// Usage/config errors must never pollute `--json` stdout.
+fn printErr(io: std.Io, alloc: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
+    var stack_buf: [4096]u8 = undefined;
+    const text = std.fmt.bufPrint(&stack_buf, fmt, args) catch
+        try std.fmt.allocPrint(alloc, fmt, args); // arena-owned; freed at process exit
+    try std.Io.File.stderr().writeStreamingAll(io, text);
 }
 
 const help_text =

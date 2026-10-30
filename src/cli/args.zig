@@ -59,6 +59,8 @@ pub const ApprovalPolicy = enum { ask, allow, deny };
 pub const AskArgs = struct {
     /// The prompt; null means "read stdin until EOF" (also spelled `-`).
     prompt: ?[]const u8 = null,
+    /// The prompt was explicitly `-`, so a global `-p` must not override it.
+    stdin: bool = false,
     /// NDJSON events on stdout instead of plain assistant text.
     json: bool = false,
     /// Auto-approve every permission ask (approved_once semantics).
@@ -191,13 +193,26 @@ pub fn parseAsk(args: []const []const u8) ParseError!AskArgs {
     }
     // A literal "-" (or no prompt at all) means the prompt arrives on stdin.
     if (out.prompt) |p| {
-        if (std.mem.eql(u8, p, "-")) out.prompt = null;
+        if (std.mem.eql(u8, p, "-")) {
+            out.prompt = null;
+            out.stdin = true;
+        }
     }
     const approval_flags = @as(u8, @intFromBool(out.yes)) +
         @as(u8, @intFromBool(out.deny_all)) +
         @as(u8, @intFromBool(out.policy != null));
     if (approval_flags > 1) return error.ConflictingFlags;
     return out;
+}
+
+/// Resolve the effective `ask` prompt: a subcommand prompt wins, an explicit
+/// `-` suppresses the global `-p`, and otherwise the global shorthand applies.
+pub fn resolveAskPrompt(global: ?[]const u8, ask: AskArgs) ?[]const u8 {
+    if (ask.prompt) |p| return p;
+    if (ask.stdin) return null;
+    const g = global orelse return null;
+    if (std.mem.eql(u8, g, "-")) return null;
+    return g;
 }
 
 test "parse bare invocation" {
@@ -288,4 +303,13 @@ test "no prompt and '-' both mean stdin" {
     try std.testing.expect((try parseAsk(&.{})).prompt == null);
     try std.testing.expect((try parseAsk(&.{"-"})).prompt == null);
     try std.testing.expect((try parseAsk(&.{ "-p", "-" })).prompt == null);
+    try std.testing.expect((try parseAsk(&.{"-"})).stdin);
+    try std.testing.expect((try parseAsk(&.{ "-p", "-" })).stdin);
+}
+
+test "global -p applies unless ask names stdin" {
+    try std.testing.expectEqualStrings("hi", resolveAskPrompt("hi", try parseAsk(&.{"--json"})).?);
+    try std.testing.expect(resolveAskPrompt("hi", try parseAsk(&.{"-"})) == null);
+    try std.testing.expect(resolveAskPrompt("hi", try parseAsk(&.{ "-p", "-" })) == null);
+    try std.testing.expect(resolveAskPrompt("-", try parseAsk(&.{})) == null);
 }

@@ -16,8 +16,10 @@ const system_prompt = @import("../core/agent/system_prompt.zig");
 const session_runtime = @import("../core/agent/session_runtime.zig");
 const tool_mod = @import("../tools/tool.zig");
 
+pub const Exit = enum(u8) { ok = 0, failed = 1, usage = 2, denied = 3, interrupted = 130 };
+
 /// Usage errors (bad flag, missing/empty prompt, conflicting approvals).
-pub const exit_usage: u8 = 2;
+pub const exit_usage: u8 = @intFromEnum(Exit.usage);
 
 /// Facts about a finished run. Several may hold at once; `runStatus` applies
 /// the documented precedence.
@@ -37,14 +39,19 @@ pub fn runStatus(facts: Facts) RunStatus {
     return .ok;
 }
 
-/// Exit code for a finished run: 0 ok, 1 failed, 3 denied, 130 interrupted.
+/// Exit code for a finished run (`null` is a usage error).
+pub fn exitCodeFor(status: ?RunStatus) u8 {
+    const s = status orelse return @intFromEnum(Exit.usage);
+    return @intFromEnum(switch (s) {
+        .ok => Exit.ok,
+        .failed => Exit.failed,
+        .denied => Exit.denied,
+        .interrupted => Exit.interrupted,
+    });
+}
+
 pub fn exitCode(status: RunStatus) u8 {
-    return switch (status) {
-        .ok => 0,
-        .failed => 1,
-        .denied => 3,
-        .interrupted => 130,
-    };
+    return exitCodeFor(status);
 }
 
 /// One NDJSON event. `writeEvent` is the single place the wire shape lives.
@@ -249,15 +256,13 @@ const Sink = struct {
     fn finish(self: *Sink, facts: Facts, message: []const u8) void {
         const status = runStatus(facts);
         if (self.json) {
-            if (facts.failed and message.len > 0) self.emit(.{ .err = message });
+            if (facts.failed) self.emit(.{ .err = if (message.len > 0) message else "turn failed" });
             self.emit(.{ .end = status });
             return;
         }
         switch (status) {
             .interrupted => self.diag("(interrupted)\n", .{}),
-            .failed => {
-                if (message.len > 0) self.diag("error: {s}\n", .{message});
-            },
+            .failed => self.diag("error: {s}\n", .{if (message.len > 0) message else "turn failed"}),
             .denied, .ok => {},
         }
     }
@@ -365,15 +370,17 @@ fn stderrPrint(io: std.Io, comptime fmt: []const u8, args: anytype) void {
 
 // ---------------------------------------------------------------- tests
 
-test "exit codes map from run status" {
-    const cases = [_]struct { status: RunStatus, code: u8 }{
+test "exit-code mapping table covers usage and every run status" {
+    const cases = [_]struct { status: ?RunStatus, code: u8 }{
+        .{ .status = null, .code = 2 },
         .{ .status = .ok, .code = 0 },
         .{ .status = .failed, .code = 1 },
         .{ .status = .denied, .code = 3 },
         .{ .status = .interrupted, .code = 130 },
     };
-    for (cases) |c| try std.testing.expectEqual(c.code, exitCode(c.status));
+    for (cases) |c| try std.testing.expectEqual(c.code, exitCodeFor(c.status));
     try std.testing.expectEqual(@as(u8, 2), exit_usage);
+    try std.testing.expectEqual(@as(u8, 130), @intFromEnum(Exit.interrupted));
 }
 
 test "run status precedence: interrupted > failed > denied > ok" {

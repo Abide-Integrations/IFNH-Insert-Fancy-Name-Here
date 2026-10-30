@@ -11,15 +11,45 @@ def chunk(choices, **extra):
 
 
 USAGE = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+TEXT_REPLY = "bench"
+TOOL_FILE = ".ifnh/ask-smoke.txt"
+DONE = "x"
 
 
-def turn_text(text):
+def text_stream(text):
     return (
         chunk([{"index": 0, "delta": {"role": "assistant", "content": text}}])
         + chunk([{"index": 0, "delta": {}, "finish_reason": "stop"}])
         + chunk([], usage=USAGE)
         + DONE
     )
+
+
+def tool_stream():
+    # A state-changing command so the permission engine asks; `touch` actually
+    # runs in the workspace, so the shell check can verify the tool ran.
+    args = json.dumps({"command": "touch " + TOOL_FILE})
+    return (
+        chunk([{"index": 0, "delta": {"role": "assistant", "content": ""}}])
+        + chunk([{"index": 0, "delta": {"tool_calls": [{
+            "index": 0,
+            "id": "call_fake_1",
+            "type": "function",
+            "function": {"name": "bash", "arguments": args},
+        }]}}])
+        + chunk([{"index": 0, "delta": {}, "finish_reason": "tool_calls"}])
+        + chunk([], usage=USAGE)
+        + DONE
+    )
+
+
+def has_tool_result(raw):
+    """True when the request already carries a tool result (round 2+)."""
+    try:
+        request = json.loads(raw or b"{}")
+    except (TypeError, ValueError):
+        return False
+    return any(m.get("role") == "tool" for m in request.get("messages", []))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -45,12 +75,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
         self.end_headers()
-        body = (
-            chunk([{"index": 0, "delta": {"role": "assistant", "content": "bench"}}])
-            + chunk([{"index": 0, "delta": {}, "finish_reason": "stop"}])
-            + chunk([], usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})
-            + "data: [DONE]\n\n"
-        )
+        body = text_stream(TEXT_REPLY)
+        if self.server.mode == "tool" and not has_tool_result(raw):
+            body = tool_stream()
         self.wfile.write(body.encode())
 
     def log_message(self, *args):
@@ -62,10 +89,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=0)
     ap.add_argument("--port-file")
+    ap.add_argument("--mode", choices=("text", "tool", "error"), default="text")
     ap.add_argument("--delay", type=float, default=0.03)
     a = ap.parse_args()
     srv = HTTPServer(("127.0.0.1", a.port), Handler)
     srv.delay = a.delay
+    srv.mode = a.mode
     if a.port_file:
         with open(a.port_file, "w") as f:
             f.write("127.0.0.1:%d\n" % srv.server_address[1])
