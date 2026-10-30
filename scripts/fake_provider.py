@@ -10,15 +10,36 @@ def chunk(choices, **extra):
     return "data: " + json.dumps({"id": "bench", "choices": choices, **extra}) + "\n\n"
 
 
+USAGE = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+
+
+def turn_text(text):
+    return (
+        chunk([{"index": 0, "delta": {"role": "assistant", "content": text}}])
+        + chunk([{"index": 0, "delta": {}, "finish_reason": "stop"}])
+        + chunk([], usage=USAGE)
+        + DONE
+    )
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"  # close-delimited body
 
     def do_POST(self):
-        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
         if not self.path.endswith("/chat/completions"):
             self.send_error(404)
             return
         time.sleep(self.server.delay)
+        # --mode error: a hard provider failure (HTTP 500).
+        if self.server.mode == "error":
+            body = json.dumps({"error": {"message": "fake provider: boom"}}).encode()
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -33,6 +54,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body.encode())
 
     def log_message(self, *args):
+
         pass
 
 

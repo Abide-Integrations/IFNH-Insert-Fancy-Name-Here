@@ -10,6 +10,7 @@ const version = @import("version.zig");
 const cli_args = @import("cli/args.zig");
 const fsutil = @import("core/fsutil.zig");
 const repl = @import("cli/repl.zig");
+const ask_mod = @import("cli/ask.zig");
 const session_mod = @import("core/session/store.zig");
 const config_mod = @import("core/config/config.zig");
 const trace_mod = @import("core/trace.zig");
@@ -50,6 +51,20 @@ pub fn main(init: std.process.Init) !void {
         try printOut(io, arena, help_text, .{version.version});
         return;
     }
+    // Headless one-shot: `ifnh ask "<prompt>"` or the `-p` shorthand
+    // (`ifnh -p "<prompt>"`). Both land in the same driver, and the exit
+    // code is the driver's own (0/1/2/3/130), not the generic failure path.
+    if (parsed.subcommand == .ask or (parsed.subcommand == .none and parsed.flags.prompt != null)) {
+        var ask = cli_args.parseAsk(parsed.args) catch |err| {
+            try printOut(io, arena, "error: bad arguments: {s}\n(run `ifnh help` for usage)\n", .{@errorName(err)});
+            std.process.exit(2);
+        };
+        // A `-p` before the subcommand is the prompt when `ask` did not give
+        // one (or gave `-` for stdin); the subcommand-level prompt wins.
+        if (ask.prompt == null and parsed.args.len == 0) ask.prompt = parsed.flags.prompt;
+        std.process.exit(ask_mod.run(io, arena, init.environ_map, parsed.flags, ask));
+    }
+
     if (parsed.subcommand == .none) {
         repl.run(io, arena, init.environ_map, .{ .no_color = parsed.flags.no_color, .trace = &startup_trace }) catch |err| {
             if (err == error.AccessDenied) {
@@ -464,6 +479,7 @@ const help_text =
     \\  fork        branch a session (ifnh fork <id>); 'ifnh fork diff <a> <b>' compares
     \\  cleanup     enforce retention, list/remove worktrees
     \\  resume      resume a previous session (M0)
+    \\  ask         run one headless turn (prompt arg or stdin; --json NDJSON)
     \\  doctor      check environment health (M1)
     \\  help        show this text
     \\  version     print version
@@ -472,8 +488,17 @@ const help_text =
     \\  --json                  machine-readable output
     \\  --no-color              disable color
     \\  --log-level <level>     err | info | debug | trace
+    \\  -p <prompt>             headless one-shot prompt (same as 'ask -p')
     \\  -h, --help              show help
     \\  -V, --version           print version
+    \\
+    \\ask flags:
+    \\  --json                  NDJSON events on stdout, nothing else
+    \\  --yes                   approve every permission ask (once)
+    \\  --deny-all              deny every permission ask
+    \\  --policy <ask|allow|deny>  default: ask (/dev/tty when stdin is a tty)
+    \\  -p <prompt>             prompt text; '-' or omitted reads stdin
+    \\  (exit: 0 ok, 1 failed, 2 usage, 3 denied, 130 interrupted)
     \\
 ;
 
@@ -518,6 +543,7 @@ test {
     _ = @import("core/config/keys.zig");
     _ = @import("core/agent/system_prompt.zig");
     _ = @import("cli/repl.zig");
+    _ = @import("cli/ask.zig");
     _ = @import("core/redact.zig");
     _ = @import("providers/testing.zig");
 }
