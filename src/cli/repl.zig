@@ -28,6 +28,7 @@ const trace_mod = @import("../core/trace.zig");
 const turn_cache_mod = @import("../core/turn_cache.zig");
 const budget_mod = @import("../core/budget.zig");
 const footer_mod = @import("../ui/footer.zig");
+const render_mod = @import("../ui/render.zig");
 const line_editor = @import("../ui/line_editor.zig");
 const interrupt_mod = @import("../core/interrupt.zig");
 const pricing = @import("../providers/pricing.zig");
@@ -51,6 +52,10 @@ const Ui = struct {
     palette: style_mod.Palette,
     /// Status line on stderr (C-04); every writer below clears it first.
     footer: footer_mod.Footer,
+    /// Markdown renderer for assistant text (C-07). Used only on a TTY;
+    /// piped stdout keeps the raw deltas so scripts stay byte-exact.
+    renderer: render_mod.Renderer,
+    render_enabled: bool,
     /// Prompt + output tokens of the last request, for the footer's ctx %.
     ctx_used: u64 = 0,
 
@@ -75,6 +80,10 @@ const Ui = struct {
     }
 
     fn endTurn(self: *Ui, rt: *const session_runtime.SessionRuntime, cfg: *const config_mod.Store, res: session_runtime.TurnOutcome) void {
+        // Flush any tail left without a newline, then start the next turn
+        // from a clean fence/buffer state.
+        self.flushText();
+        self.renderer.reset();
         if (!res.ran) return self.footer.abandon();
         const anthropic_wire = std.mem.eql(u8, cfg.getString("model.provider", "openai"), "anthropic");
         self.ctx_used = footer_mod.contextTokens(res.last_round, anthropic_wire);
@@ -94,16 +103,34 @@ const Ui = struct {
         };
     }
 
-    /// Assistant text deltas go straight to stdout, byte for byte.
+    /// Assistant text deltas are rendered line by line on a TTY, and go
+    /// straight to stdout byte for byte otherwise.
     fn onText(ctx: *anyopaque, text: []const u8) void {
         const self: *Ui = @ptrCast(@alignCast(ctx));
         self.footer.clear();
-        std.Io.File.stdout().writeStreamingAll(self.io, text) catch {};
+        if (!self.render_enabled) {
+            std.Io.File.stdout().writeStreamingAll(self.io, text) catch {};
+            return;
+        }
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.File.stdout().writerStreaming(self.io, &buf);
+        self.renderer.push(text, &w.interface) catch {};
+        w.interface.flush() catch {};
+    }
+
+    /// Emit a buffered partial line before any other output or at turn end.
+    fn flushText(self: *Ui) void {
+        if (!self.render_enabled) return;
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.File.stdout().writerStreaming(self.io, &buf);
+        self.renderer.finish(&w.interface) catch {};
+        w.interface.flush() catch {};
     }
 
     fn onStatus(ctx: *anyopaque, level: session_runtime.Level, text: []const u8) void {
         const self: *Ui = @ptrCast(@alignCast(ctx));
         self.footer.clear();
+        self.flushText();
         switch (level) {
             .plain => out(self.io, "{s}", .{text}) catch {},
             .warn => out(self.io, "{s}", .{self.palette.warn(text, std.heap.page_allocator)}) catch {},
@@ -115,6 +142,7 @@ const Ui = struct {
         _ = call_id;
         const self: *Ui = @ptrCast(@alignCast(ctx));
         self.footer.clear();
+        self.flushText();
         out(self.io, "\n[tool] {s} {s}\n", .{ name, arguments_json }) catch {};
     }
 
@@ -123,6 +151,7 @@ const Ui = struct {
         _ = name;
         const self: *Ui = @ptrCast(@alignCast(ctx));
         self.footer.clear();
+        self.flushText();
         const max_show: usize = 400;
         const shown = if (output.len > max_show) output[0..max_show] else output;
         var scratch: [64]u8 = undefined;
@@ -140,6 +169,7 @@ const Ui = struct {
     fn onNotice(ctx: *anyopaque, text: []const u8) void {
         const self: *Ui = @ptrCast(@alignCast(ctx));
         self.footer.clear();
+        self.flushText();
         out(self.io, "! {s}\n", .{text}) catch {};
     }
 
@@ -156,6 +186,7 @@ const Ui = struct {
     fn promptApproval(ctx: *anyopaque, req: tool_mod.ApprovalRequest) tool_mod.ApprovalResponse {
         const self: *Ui = @ptrCast(@alignCast(ctx));
         self.footer.clear();
+        self.flushText();
         const offer_project = req.grant == .path_write;
         var aw: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
         defer aw.deinit();
@@ -258,11 +289,18 @@ pub fn run(
     // The palette needs the merged environment (the user env file may set
     // NO_COLOR), so it is detected after the runtime exists.
     const palette0 = detectPalette(io, rt.environ, cfg.getBool("ui.colors", true), opts.no_color);
+    const render_enabled = std.Io.File.stdout().isTty(io) catch false;
     var ui = Ui{
         .io = io,
         .palette = palette0,
         .footer = footer_mod.Footer.init(io, footerEnabled(io, rt.environ, &cfg), palette0),
+        .renderer = render_mod.Renderer.init(arena, .{
+            .width = if (render_enabled) render_mod.wrapWidth(rt.environ) else 80,
+            .palette = palette0,
+        }),
+        .render_enabled = render_enabled,
     };
+    defer ui.renderer.deinit();
     const events = ui.events();
     const palette = ui.palette;
 
@@ -463,7 +501,9 @@ fn runShellEscape(io: std.Io, arena: std.mem.Allocator, cwd: std.Io.Dir, rt: *se
 
 /// Render what the runtime reports after a turn. The runtime never touches
 /// the terminal; everything user-visible is drawn here.
-fn renderTurn(io: std.Io, arena: std.mem.Allocator, ui: *const Ui, res: session_runtime.TurnOutcome) !void {
+fn renderTurn(io: std.Io, arena: std.mem.Allocator, ui: *Ui, res: session_runtime.TurnOutcome) !void {
+    // The reply may end without a newline; flush it before the summary.
+    ui.flushText();
     if (!res.ran) return;
     try out(io, "\n", .{});
     switch (res.status) {
