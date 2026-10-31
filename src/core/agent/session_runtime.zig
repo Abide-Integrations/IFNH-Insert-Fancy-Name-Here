@@ -137,7 +137,8 @@ pub const SessionRuntime = struct {
         else
             try session_mod.Session.create(cwd, io, arena, opts.sessions_dir, opts.cwd_label);
         errdefer store.close();
-        const j = try journal_mod.Journal.open(io, arena, store.dir);
+        // Records live with the session; mutations resolve against the workspace.
+        const j = try journal_mod.Journal.open(io, arena, store.dir, cwd);
         errdefer j.close();
 
         var self = SessionRuntime{
@@ -744,7 +745,7 @@ test "replay keeps assistant tool calls and tool results" {
     var rt = SessionRuntime{
         .io = io,
         .store = try session_mod.Session.create(tmp.dir, io, arena, "sessions", "/tmp/proj"),
-        .journal = try journal_mod.Journal.open(io, arena, tmp.dir),
+        .journal = try journal_mod.Journal.open(io, arena, tmp.dir, tmp.dir),
         .engine = engine_mod.Engine.init(arena, .ask),
         .user_keys = keys_mod.Keys.init(arena),
         .turn_cache = turn_cache_mod.TurnCache.init(io, arena),

@@ -229,7 +229,10 @@ fn runChild(
         .arena = child_arena,
         .workspace = child_workspace,
         .engine = &child_engine,
-        .journal = host.journal,
+        // The shared journal is rooted at the parent workspace; journaling a
+        // worktree edit through it would write the parent's tree instead.
+        // Isolated children use the direct-write path (as in the worktree test).
+        .journal = if (wt.path == null) host.journal else null,
         .max_file_read_bytes = 256 * 1024,
         .timeout_s = host.timeout_tool_s,
         .use_external_tools = host.use_external_tools,
@@ -570,6 +573,14 @@ test "worktree isolation: child edits land in its own tree" {
     _ = std.process.run(arena, io, .{ .argv = &.{ "git", "add", "." }, .cwd = .{ .path = repo_path } }) catch {};
     _ = std.process.run(arena, io, .{ .argv = &.{ "git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "seed" }, .cwd = .{ .path = repo_path } }) catch {};
 
+    // A journal rooted at the parent workspace must not receive the worktree
+    // edit (that would write the parent's code.txt).
+    try tmp.dir.createDirPath(io, "records");
+    var records = try tmp.dir.openDir(io, "records", .{});
+    defer records.close(io);
+    var j = try journal_mod.Journal.open(io, arena, records, tmp.dir);
+    defer j.close();
+
     // Child is an implement role that overwrites code.txt in its worktree.
     var child_fake = testing.Fake{ .script = &.{
         &.{.{ .tool_call = .{ .id = "w1", .name = "write", .arguments_json = "{\"path\":\"code.txt\",\"content\":\"edited by child\"}" } }},
@@ -592,7 +603,7 @@ test "worktree isolation: child edits land in its own tree" {
         .command_allow = &.{},
         .command_deny = &.{},
         .env_allow = &.{},
-        .journal = null,
+        .journal = &j,
         .approval_ctx = undefined,
         .approval_fn = undefined,
         .max_depth = 1,
@@ -612,4 +623,5 @@ test "worktree isolation: child edits land in its own tree" {
     // Main tree untouched; worktree has the edit.
     const main_data = try tmp.dir.readFileAlloc(io, "code.txt", arena, .limited(1024));
     try std.testing.expectEqualStrings("original\n", main_data);
+    try std.testing.expect(!j.canUndo());
 }
