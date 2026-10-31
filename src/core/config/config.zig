@@ -71,7 +71,8 @@ pub const default_config_json =
     \\    "max_retries": 3,
     \\    "max_tool_rounds": 25,
     \\    "timeout_tool_s": 120,
-    \\    "timeout_turn_s": 600
+    \\    "timeout_turn_s": 600,
+    \\    "budget_usd": null
     \\  },
     \\  "tools": {
     \\    "external": true
@@ -90,6 +91,7 @@ pub const default_config_json =
     \\  },
     \\  "ui": {
     \\    "colors": true,
+    \\    "footer": true,
     \\    "symbols": "unicode",
     \\    "verbosity": "normal"
     \\  },
@@ -132,10 +134,11 @@ pub const wired_defaults = [_][]const u8{
     "git.push",                    "git.force_push",
     "agents.max_depth",            "agents.max_concurrent",
     "agents.max_retries",          "agents.max_tool_rounds",
-    "agents.timeout_tool_s",       "tools.external",
-    "context.auto_compact",        "context.compact_at_fraction",
-    "context.max_file_read_bytes", "sessions.dir",
-    "sessions.keep",               "ui.colors",
+    "agents.timeout_tool_s",       "agents.budget_usd",
+    "tools.external",              "context.auto_compact",
+    "context.compact_at_fraction", "context.max_file_read_bytes",
+    "sessions.dir",                "sessions.keep",
+    "ui.colors",                   "ui.footer",
     "debug.redact",
 };
 

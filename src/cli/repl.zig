@@ -26,6 +26,7 @@ const openai = @import("../providers/openai.zig");
 const anthropic = @import("../providers/anthropic.zig");
 const trace_mod = @import("../core/trace.zig");
 const turn_cache_mod = @import("../core/turn_cache.zig");
+const budget_mod = @import("../core/budget.zig");
 
 const max_output_bytes: usize = 256 * 1024;
 
@@ -987,24 +988,9 @@ fn handleCommand(
         }
         return .{ .submit = payload.items };
     } else if (std.mem.eql(u8, cmd, "usage")) {
-        var total_in: u64 = 0;
-        var total_out: u64 = 0;
-        var turns: usize = 0;
         const raw = fsutil.readSmallFile(rt.store.dir, io, arena, "usage.jsonl", 1024 * 1024) catch "";
-        var it = std.mem.splitScalar(u8, raw, '\n');
-        while (it.next()) |line| {
-            if (line.len == 0) continue;
-            const v = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch continue;
-            if (v != .object) continue;
-            if (v.object.get("input_tokens")) |ti| {
-                if (ti == .integer) total_in += @intCast(ti.integer);
-            }
-            if (v.object.get("output_tokens")) |to| {
-                if (to == .integer) total_out += @intCast(to.integer);
-            }
-            turns += 1;
-        }
-        out(io, "session usage: {d} turns, {d} tokens in, {d} tokens out\n", .{ turns, total_in, total_out }) catch {};
+        const text = budget_mod.formatSummary(arena, budget_mod.summarize(arena, raw), cfg.getOptionalF64("agents.budget_usd")) catch "usage unavailable\n";
+        out(io, "{s}", .{text}) catch {};
     } else if (std.mem.eql(u8, cmd, "compact")) {
         const pcfg2 = rt.providerConfig(cfg);
         out(io, "[compacting context...]\n", .{}) catch {};

@@ -529,6 +529,8 @@ test {
     _ = @import("providers/openai.zig");
     _ = @import("providers/anthropic.zig");
     _ = @import("providers/limits.zig");
+    _ = @import("providers/pricing.zig");
+    _ = @import("core/budget.zig");
     _ = @import("core/instructions.zig");
     _ = @import("core/trace.zig");
     _ = @import("core/turn_cache.zig");

@@ -16,7 +16,7 @@ const system_prompt = @import("../core/agent/system_prompt.zig");
 const session_runtime = @import("../core/agent/session_runtime.zig");
 const tool_mod = @import("../tools/tool.zig");
 
-pub const Exit = enum(u8) { ok = 0, failed = 1, usage = 2, denied = 3, interrupted = 130 };
+pub const Exit = enum(u8) { ok = 0, failed = 1, usage = 2, denied = 3, budget = 4, interrupted = 130 };
 
 /// Usage errors (bad flag, missing/empty prompt, conflicting approvals).
 pub const exit_usage: u8 = @intFromEnum(Exit.usage);
@@ -25,15 +25,19 @@ pub const exit_usage: u8 = @intFromEnum(Exit.usage);
 /// the documented precedence.
 pub const Facts = struct {
     interrupted: bool = false,
+    /// `agents.budget_usd` was already spent; the turn was refused (C-06).
+    budget: bool = false,
     failed: bool = false,
     denied: bool = false,
 };
 
-pub const RunStatus = enum { ok, failed, denied, interrupted };
+pub const RunStatus = enum { ok, failed, denied, budget, interrupted };
 
-/// Precedence when several conditions hold: interrupted > failed > denied > ok.
+/// Precedence when several conditions hold: interrupted > budget > failed >
+/// denied > ok (exit codes 130 > 4 > 1 > 3 > 0).
 pub fn runStatus(facts: Facts) RunStatus {
     if (facts.interrupted) return .interrupted;
+    if (facts.budget) return .budget;
     if (facts.failed) return .failed;
     if (facts.denied) return .denied;
     return .ok;
@@ -46,6 +50,7 @@ pub fn exitCodeFor(status: ?RunStatus) u8 {
         .ok => Exit.ok,
         .failed => Exit.failed,
         .denied => Exit.denied,
+        .budget => Exit.budget,
         .interrupted => Exit.interrupted,
     });
 }
@@ -256,14 +261,15 @@ const Sink = struct {
     fn finish(self: *Sink, facts: Facts, message: []const u8) void {
         const status = runStatus(facts);
         if (self.json) {
-            if (facts.failed) self.emit(.{ .err = if (message.len > 0) message else "turn failed" });
+            if (facts.failed or facts.budget) self.emit(.{ .err = if (message.len > 0) message else "turn failed" });
             self.emit(.{ .end = status });
             return;
         }
         switch (status) {
             .interrupted => self.diag("(interrupted)\n", .{}),
             .failed => self.diag("error: {s}\n", .{if (message.len > 0) message else "turn failed"}),
-            .denied, .ok => {},
+            // The runtime already told stderr (`[budget] ...`).
+            .budget, .denied, .ok => {},
         }
     }
 };
@@ -349,11 +355,14 @@ pub fn run(
 
     const facts = Facts{
         .interrupted = outcome.status == .cancelled,
+        .budget = outcome.budget_exceeded,
         .failed = outcome.status == .failed or !outcome.ran,
         .denied = sink.denied,
     };
     const message = if (outcome.error_message.len > 0)
         outcome.error_message
+    else if (outcome.budget_exceeded)
+        "budget exceeded (agents.budget_usd)"
     else if (!outcome.ran)
         "turn did not run"
     else
@@ -376,6 +385,7 @@ test "exit-code mapping table covers usage and every run status" {
         .{ .status = .ok, .code = 0 },
         .{ .status = .failed, .code = 1 },
         .{ .status = .denied, .code = 3 },
+        .{ .status = .budget, .code = 4 },
         .{ .status = .interrupted, .code = 130 },
     };
     for (cases) |c| try std.testing.expectEqual(c.code, exitCodeFor(c.status));
@@ -383,7 +393,7 @@ test "exit-code mapping table covers usage and every run status" {
     try std.testing.expectEqual(@as(u8, 130), @intFromEnum(Exit.interrupted));
 }
 
-test "run status precedence: interrupted > failed > denied > ok" {
+test "run status precedence: interrupted > budget > failed > denied > ok" {
     try std.testing.expectEqual(RunStatus.ok, runStatus(.{}));
     try std.testing.expectEqual(RunStatus.denied, runStatus(.{ .denied = true }));
     // A hard failure outranks a denial in the same turn.
@@ -391,6 +401,10 @@ test "run status precedence: interrupted > failed > denied > ok" {
     // An interrupt outranks everything.
     try std.testing.expectEqual(RunStatus.interrupted, runStatus(.{ .denied = true, .failed = true, .interrupted = true }));
     try std.testing.expectEqual(@as(u8, 130), exitCode(runStatus(.{ .failed = true, .interrupted = true })));
+    // budget: 130 > 4 > 1 > 3 > 0
+    try std.testing.expectEqual(@as(u8, 4), exitCode(runStatus(.{ .budget = true, .failed = true, .denied = true })));
+    try std.testing.expectEqual(@as(u8, 130), exitCode(runStatus(.{ .budget = true, .interrupted = true })));
+    try std.testing.expectEqual(@as(u8, 4), exitCode(runStatus(.{ .budget = true })));
     try std.testing.expectEqual(@as(u8, 1), exitCode(runStatus(.{ .denied = true, .failed = true })));
 }
 
