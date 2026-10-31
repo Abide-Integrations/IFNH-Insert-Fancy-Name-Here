@@ -924,7 +924,10 @@ fn toolWrite(path: []const u8, content: []const u8, ctx: *ToolContext) ToolResul
 /// Journal-integrated file mutation: intent → write → commit.
 fn commitMutation(ctx: *ToolContext, path: []const u8, before: []const u8, after: []const u8) !void {
     const j = ctx.journal orelse {
-        // No journal (e.g. outside a session): write directly.
+        // No journal (e.g. outside a session): write directly, but through the
+        // same path validation `Journal.apply` enforces (A-11) so a journal-less
+        // child cannot write outside its workspace.
+        try journal_mod.validateRelPath(path);
         if (std.mem.lastIndexOfScalar(u8, path, '/')) |slash| {
             try ctx.workspace.createDirPath(ctx.io, path[0..slash]);
         }
@@ -1301,6 +1304,42 @@ test "edit and write with journal integration" {
     const stale = execute("edit", "{\"path\":\"code.zig\",\"old_string\":\"const x = 1;\",\"new_string\":\"zz\"}", &ctx);
     try std.testing.expectEqual(Status.failed, stale.status);
     try std.testing.expect(std.mem.indexOf(u8, stale.output, "not found") != null);
+}
+
+test "journal-less write refuses paths outside the workspace" {
+    const io = std.testing.io;
+    // Outer dir holds the workspace, so an escaping write is visible next to it.
+    var outer = try makeTmp();
+    defer outer.cleanup();
+    try outer.dir.createDirPath(io, "ws");
+    var ws = try outer.dir.openDir(io, "ws", .{ .access_sub_paths = true });
+    defer ws.close(io);
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try outer.dir.realPath(io, &path_buf);
+    const abs_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/abs-evil.txt", .{path_buf[0..n]});
+    defer std.testing.allocator.free(abs_path);
+
+    var e = engine_mod.Engine.init(std.testing.allocator, .auto);
+    defer e.deinit();
+    e.write_globs = &.{"**"};
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ctx = testCtx(arena_state.allocator(), io, ws, &e);
+    try std.testing.expect(ctx.journal == null);
+
+    const rel = execute("write", "{\"path\":\"../evil.txt\",\"content\":\"pwn\"}", &ctx);
+    try std.testing.expectEqual(Status.failed, rel.status);
+    try std.testing.expect(std.mem.indexOf(u8, rel.output, "PathUnsafe") != null);
+
+    const abs_args = try std.fmt.allocPrint(arena_state.allocator(), "{{\"path\":\"{s}\",\"content\":\"pwn\"}}", .{abs_path});
+    const abs = execute("write", abs_args, &ctx);
+    try std.testing.expectEqual(Status.failed, abs.status);
+    try std.testing.expect(std.mem.indexOf(u8, abs.output, "PathUnsafe") != null);
+
+    // Nothing escaped the workspace dir.
+    try std.testing.expectError(error.FileNotFound, outer.dir.statFile(io, "evil.txt", .{}));
+    try std.testing.expectError(error.FileNotFound, outer.dir.statFile(io, "abs-evil.txt", .{}));
 }
 
 test "write denied on protected path without approval escape" {

@@ -13,6 +13,8 @@ def chunk(choices, **extra):
 USAGE = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
 TEXT_REPLY = "bench"
 TOOL_FILE = ".ifnh/ask-smoke.txt"
+TOOL_FILE_WRITE = "smoke.txt"
+TOOL_WRITE_TEXT = "hello from ifnh\n"
 DONE = "x"
 
 
@@ -36,6 +38,24 @@ def tool_stream():
             "id": "call_fake_1",
             "type": "function",
             "function": {"name": "bash", "arguments": args},
+        }]}}])
+        + chunk([{"index": 0, "delta": {}, "finish_reason": "tool_calls"}])
+        + chunk([], usage=USAGE)
+        + DONE
+    )
+
+
+def write_stream():
+    # A `write` tool call, so the P0 workspace-vs-session-dir regression can be
+    # driven end-to-end through `ifnh ask`.
+    args = json.dumps({"path": TOOL_FILE_WRITE, "content": TOOL_WRITE_TEXT})
+    return (
+        chunk([{"index": 0, "delta": {"role": "assistant", "content": ""}}])
+        + chunk([{"index": 0, "delta": {"tool_calls": [{
+            "index": 0,
+            "id": "call_fake_write",
+            "type": "function",
+            "function": {"name": "write", "arguments": args},
         }]}}])
         + chunk([{"index": 0, "delta": {}, "finish_reason": "tool_calls"}])
         + chunk([], usage=USAGE)
@@ -78,6 +98,8 @@ class Handler(BaseHTTPRequestHandler):
         body = text_stream(TEXT_REPLY)
         if self.server.mode == "tool" and not has_tool_result(raw):
             body = tool_stream()
+        if self.server.mode == "write" and not has_tool_result(raw):
+            body = write_stream()
         self.wfile.write(body.encode())
 
     def log_message(self, *args):
@@ -89,7 +111,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=0)
     ap.add_argument("--port-file")
-    ap.add_argument("--mode", choices=("text", "tool", "error"), default="text")
+    ap.add_argument("--mode", choices=("text", "tool", "write", "error"), default="text")
     ap.add_argument("--delay", type=float, default=0.03)
     a = ap.parse_args()
     srv = HTTPServer(("127.0.0.1", a.port), Handler)
