@@ -332,6 +332,7 @@ pub fn run(
         return exitCode(.failed);
     };
     defer rt.deinit();
+    if (rt.local_grants_warning) |warning| stderrPrint(io, "{s}", .{warning});
 
     const instr = instructions_mod.assemble(cwd, io, arena, system_prompt.system_prompt, &.{}) catch |err| {
         stderrPrint(io, "error: cannot assemble instructions: {s}\n", .{@errorName(err)});

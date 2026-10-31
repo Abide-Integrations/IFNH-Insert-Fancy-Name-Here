@@ -521,6 +521,7 @@ test {
     _ = @import("core/permissions/glob.zig");
     _ = @import("core/permissions/command_class.zig");
     _ = @import("core/permissions/engine.zig");
+    _ = @import("core/permissions/local_grants.zig");
     _ = @import("tools/tool.zig");
     _ = @import("tools/search.zig");
     _ = @import("providers/provider.zig");
@@ -531,6 +532,7 @@ test {
     _ = @import("providers/limits.zig");
     _ = @import("providers/pricing.zig");
     _ = @import("core/budget.zig");
+    _ = @import("core/diff.zig");
     _ = @import("core/instructions.zig");
     _ = @import("core/trace.zig");
     _ = @import("core/turn_cache.zig");

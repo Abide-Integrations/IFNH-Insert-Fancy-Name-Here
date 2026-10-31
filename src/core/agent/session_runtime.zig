@@ -33,6 +33,7 @@ const trace_mod = @import("../trace.zig");
 const fsutil = @import("../fsutil.zig");
 const turn_cache_mod = @import("../turn_cache.zig");
 const budget_mod = @import("../budget.zig");
+const local_grants = @import("../permissions/local_grants.zig");
 const pricing = @import("../../providers/pricing.zig");
 
 /// Severity of an informational status line. The caller picks the styling.
@@ -119,6 +120,9 @@ pub const SessionRuntime = struct {
     usage_total: core_types.Usage = .{},
     /// Turns that reached the provider in this session so far (footer).
     turns_run: u32 = 0,
+    /// Set when `.ifnh/permissions.local.json` exists but could not be used;
+    /// the caller prints it (the runtime never writes to the terminal).
+    local_grants_warning: ?[]const u8 = null,
 
     /// Build a runtime: load provider keys, create or open the session
     /// store, and discover skills, background executions and MCP servers.
@@ -168,6 +172,16 @@ pub const SessionRuntime = struct {
             .process_environ = process_environ,
             .environ = merged_env,
         };
+
+        switch (local_grants.load(arena, io, cwd)) {
+            .absent => {},
+            .grants => |g| local_grants.apply(&self.engine, g) catch {},
+            .invalid => |why| self.local_grants_warning = std.fmt.allocPrint(
+                arena,
+                "warning: ignoring {s} ({s}); fix or delete it. Project grants are not loaded and the file will not be overwritten.\n",
+                .{ local_grants.path, why },
+            ) catch null,
+        }
 
         if (opts.resume_id != null) {
             const raw = fsutil.readSmallFile(self.store.dir, io, arena, "usage.jsonl", 1024 * 1024) catch "";
@@ -644,6 +658,24 @@ pub const Gate = struct {
                     .none => {},
                 }
                 return .approved_session;
+            },
+            .approved_project => {
+                const kind: local_grants.Kind, const pattern: []const u8 = switch (req.grant) {
+                    .command_prefix => |p| .{ .command_prefix, p },
+                    .path_write => |p| .{ .path_write, p },
+                    .none => return .approved_once,
+                };
+                const engine = &self.rt.engine;
+                switch (kind) {
+                    .command_prefix => engine.commandPrefixGrant(pattern, .project) catch {},
+                    .path_write => engine.pathWriteGrant(pattern, .project) catch {},
+                }
+                local_grants.add(engine.alloc, self.rt.io, std.Io.Dir.cwd(), kind, pattern) catch |err| {
+                    var buf: [256]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&buf, "could not save {s} ({s}); '{s}' is allowed for this session only", .{ local_grants.path, @errorName(err), pattern }) catch "could not save project grant";
+                    self.events.on_notice(self.events.ctx, msg);
+                };
+                return .approved_project;
             },
             .denied => return .denied,
         }

@@ -27,6 +27,7 @@ const anthropic = @import("../providers/anthropic.zig");
 const trace_mod = @import("../core/trace.zig");
 const turn_cache_mod = @import("../core/turn_cache.zig");
 const budget_mod = @import("../core/budget.zig");
+const local_grants_mod = @import("../core/permissions/local_grants.zig");
 
 const max_output_bytes: usize = 256 * 1024;
 
@@ -108,13 +109,23 @@ const Ui = struct {
         _ = tool_calls_json;
     }
 
-    /// Interactive approval prompt. Session grants are applied by the runtime.
+    /// Interactive approval prompt. Session and project grants are applied
+    /// by the runtime. `p` (always for this project) is offered for file
+    /// writes only; typing it for anything else denies.
     fn promptApproval(ctx: *anyopaque, req: tool_mod.ApprovalRequest) tool_mod.ApprovalResponse {
         const self: *Ui = @ptrCast(@alignCast(ctx));
-        const head = std.fmt.allocPrint(std.heap.page_allocator, "\n{s}approval needed:{s} {s}\n  {s}\n[y] once  [s] session  [n] no: ", .{
-            self.palette.warn("", std.heap.page_allocator), "\x1b[0m", req.title, req.detail,
-        }) catch "approval needed: ";
-        out(self.io, "{s}", .{head}) catch return .denied;
+        const offer_project = req.grant == .path_write;
+        var aw: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+        defer aw.deinit();
+        const w = &aw.writer;
+        w.print("\n{s}approval needed:{s} {s}\n  {s}\n", .{ self.palette.warn("", std.heap.page_allocator), "\x1b[0m", req.title, req.detail }) catch return .denied;
+        writePreview(w, self.palette, req.preview) catch return .denied;
+        if (offer_project) {
+            w.print("  (p saves this grant to {s})\n[y] once  [s] session  [p] always for this project  [n] no: ", .{local_grants_mod.path}) catch return .denied;
+        } else {
+            w.writeAll("[y] once  [s] session  [n] no: ") catch return .denied;
+        }
+        std.Io.File.stdout().writeStreamingAll(self.io, aw.written()) catch return .denied;
         var buf: [64]u8 = undefined;
         var stdin_r = std.Io.File.stdin().reader(self.io, &buf);
         const line = stdin_r.interface.takeDelimiterInclusive('\n') catch return .denied;
@@ -123,10 +134,31 @@ const Ui = struct {
             return .approved_once;
         } else if (std.ascii.eqlIgnoreCase(answer, "s")) {
             return .approved_session;
+        } else if (offer_project and std.ascii.eqlIgnoreCase(answer, "p")) {
+            return .approved_project;
         }
         return .denied;
     }
 };
+
+/// Print a unified diff indented and dimmed. File content is untrusted, so
+/// control bytes (escape sequences, a bare CR) are shown as visible marks.
+fn writePreview(w: *std.Io.Writer, palette: style_mod.Palette, preview: []const u8) !void {
+    if (preview.len == 0) return;
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, preview, "\n"), '\n');
+    while (lines.next()) |line| {
+        try w.writeAll(if (palette.enabled) "    \x1b[2m" else "    ");
+        for (line) |c| {
+            switch (c) {
+                '\r' => try w.writeAll("\u{240D}"),
+                '\t' => try w.writeByte(c),
+                0...8, 10...12, 14...31, 127 => try w.writeByte('?'),
+                else => try w.writeByte(c),
+            }
+        }
+        try w.writeAll(if (palette.enabled) "\x1b[0m\n" else "\n");
+    }
+}
 
 /// Palette detection needs the merged environment (the user env file may set
 /// NO_COLOR), so the lookup is inlined rather than kept in file-scope state.
@@ -171,6 +203,7 @@ pub fn run(
         .trace = opts.trace,
     });
     defer rt.deinit();
+    if (rt.local_grants_warning) |warning| try out(io, "{s}", .{warning});
 
     // The palette needs the merged environment (the user env file may set
     // NO_COLOR), so it is detected after the runtime exists.
@@ -637,8 +670,16 @@ fn sessionsDir(arena: std.mem.Allocator, cfg: *const config_mod.Store) []const u
 fn ensureIfnh(io: std.Io, cwd: std.Io.Dir) !void {
     const dirs = [_][]const u8{ ".ifnh", ".ifnh/sessions", ".ifnh/plans" };
     for (dirs) |d| try cwd.createDirPath(io, d);
-    if (!isFile(cwd, io, ".ifnh/.gitignore")) {
-        try cwd.writeFile(io, .{ .sub_path = ".ifnh/.gitignore", .data = "sessions/\ncache/\ndebug/\nreports/\n" });
+    // The grants file is per-user state, never shared through the repository.
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    const current: ?[]const u8 = if (isFile(cwd, io, ".ifnh/.gitignore"))
+        try fsutil.readSmallFile(cwd, io, arena, ".ifnh/.gitignore", 64 * 1024)
+    else
+        null;
+    if (try local_grants_mod.gitignoreUpdate(arena, current, "sessions/\ncache/\ndebug/\nreports/\n")) |text| {
+        try fsutil.atomicWriteFile(cwd, io, arena, ".ifnh/.gitignore", text);
     }
 }
 
