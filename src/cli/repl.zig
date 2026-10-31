@@ -28,6 +28,8 @@ const trace_mod = @import("../core/trace.zig");
 const turn_cache_mod = @import("../core/turn_cache.zig");
 const budget_mod = @import("../core/budget.zig");
 const footer_mod = @import("../ui/footer.zig");
+const line_editor = @import("../ui/line_editor.zig");
+const interrupt_mod = @import("../core/interrupt.zig");
 const pricing = @import("../providers/pricing.zig");
 const local_grants_mod = @import("../core/permissions/local_grants.zig");
 
@@ -314,17 +316,42 @@ pub fn run(
     var stdin_buf: [4096]u8 = undefined;
     var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buf);
 
+    // The line editor (C-03) only on a real terminal; piped input keeps the
+    // plain line reader below, byte for byte.
+    var editor: ?line_editor.Editor = null;
+    if (line_editor.usable(io, rt.environ)) {
+        const history_path = if (config_mod.userStateDir(arena, rt.process_environ)) |dir|
+            std.fmt.allocPrint(arena, "{s}/history", .{dir}) catch null
+        else
+            null;
+        editor = line_editor.Editor.init(io, arena, history_path, .{ .commands = &commands });
+    }
+    defer if (editor) |*ed| ed.deinit();
+
     while (true) {
-        try out(io, "> ", .{});
-        const line_raw = stdin_reader.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
-            error.EndOfStream => {
-                try out(io, "\n", .{});
-                break;
-            },
-            else => break,
-        };
+        var line_raw: []const u8 = undefined;
+        if (editor) |*ed| {
+            line_raw = (ed.readLine("> ") catch break) orelse break;
+        } else {
+            try out(io, "> ", .{});
+            line_raw = stdin_reader.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
+                error.EndOfStream => {
+                    try out(io, "\n", .{});
+                    break;
+                },
+                else => break,
+            };
+        }
         var line = std.mem.trim(u8, line_raw, " \t\r\n");
         if (line.len == 0) continue;
+
+        // `!cmd` runs locally and never reaches the model (editor only).
+        if (editor != null) {
+            if (line_editor.parseShellEscape(line)) |shell_cmd| {
+                runShellEscape(io, arena, cwd, &rt, &cfg, shell_cmd);
+                continue;
+            }
+        }
 
         if (line[0] == '/') {
             const cmd_end = std.mem.indexOfScalar(u8, line, ' ') orelse line.len;
@@ -342,6 +369,18 @@ pub fn run(
                 .none => {},
             }
             continue;
+        }
+
+        // `@path` mentions become attached file blocks (editor only).
+        if (editor != null) {
+            const max_attach = cfg.getU32("context.max_file_read_bytes", 262144);
+            switch (try line_editor.expandAtMentions(arena, io, cwd, line, max_attach)) {
+                .ok => |expanded| line = expanded,
+                .failed => |f| {
+                    try out(io, "cannot attach {s}: {s}\n", .{ f.path, f.reason });
+                    continue;
+                },
+            }
         }
 
         // ---- policy boundary (D029): re-read disk config only when its
@@ -380,6 +419,46 @@ pub fn run(
         try renderTurn(io, arena, &ui, res);
         ui.endTurn(&rt, &cfg, res);
     }
+}
+
+/// `!cmd`: run a shell command for the human, in the workspace, under the
+/// bash tool's timeout and Ctrl-C handling. No approval, no model, no session event.
+fn runShellEscape(io: std.Io, arena: std.mem.Allocator, cwd: std.Io.Dir, rt: *session_runtime.SessionRuntime, cfg: *const config_mod.Store, command: []const u8) void {
+    if (command.len == 0) {
+        out(io, "usage: !<shell command>\n", .{}) catch {};
+        return;
+    }
+    const Deny = struct {
+        fn approve(_: *anyopaque, _: tool_mod.ApprovalRequest) tool_mod.ApprovalResponse {
+            return .denied;
+        }
+    };
+    var cancel = std.atomic.Value(bool).init(false);
+    interrupt_mod.install(&cancel);
+    defer interrupt_mod.uninstall();
+    var unused: u8 = 0;
+    var ctx = tool_mod.ToolContext{
+        .io = io,
+        .arena = arena,
+        .workspace = cwd,
+        .engine = &rt.engine,
+        .journal = null,
+        .max_file_read_bytes = cfg.getU32("context.max_file_read_bytes", 262144),
+        .approval_ctx = &unused,
+        .approval_fn = Deny.approve,
+        .cancel = &cancel,
+        .timeout_s = cfg.getU32("agents.timeout_tool_s", 120),
+    };
+    const res = tool_mod.runShell(&ctx, command);
+    var lines = std.mem.splitScalar(u8, res.output, '\n');
+    while (lines.next()) |l| {
+        // The capture wraps streams in tags for the model; a person does not need them.
+        if (std.mem.eql(u8, l, "<stdout>") or std.mem.eql(u8, l, "</stdout>") or
+            std.mem.eql(u8, l, "<stderr>") or std.mem.eql(u8, l, "</stderr>")) continue;
+        if (l.len == 0 and (lines.peek() == null or std.mem.startsWith(u8, lines.peek().?, "</std"))) continue;
+        out(io, "{s}\n", .{l}) catch {};
+    }
+    if (res.status == .ok) out(io, "[exit 0]\n", .{}) catch {} else out(io, "[{s}]\n", .{@tagName(res.status)}) catch {};
 }
 
 /// Render what the runtime reports after a turn. The runtime never touches
@@ -748,6 +827,16 @@ fn isFile(cwd: std.Io.Dir, io: std.Io, path: []const u8) bool {
 // ---------------------------------------------------------------- slash commands
 
 const CommandAction = union(enum) { none, quit, submit: []const u8 };
+
+/// Built-in slash commands, for Tab completion. Every name must be handled in
+/// `handleCommand` (a test checks the source); disk commands in
+/// `.ifnh/commands/` are not listed.
+pub const commands = [_][]const u8{
+    "help",      "quit",      "model", "config",  "context",  "undo",
+    "redo",      "diff",      "plan",  "agents",  "mcp",      "exec",
+    "review",    "reconcile", "usage", "compact", "sessions", "provider",
+    "lifecycle", "skills",
+};
 
 fn handleCommand(
     io: std.Io,
@@ -1230,6 +1319,18 @@ fn out(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
 }
 
 // ---------------------------------------------------------------- tests
+
+test "every completable command is dispatched by handleCommand" {
+    const source = @embedFile("repl.zig");
+    for (commands) |name| {
+        const needle = std.fmt.allocPrint(std.testing.allocator, "std.mem.eql(u8, cmd, \"{s}\")", .{name}) catch return error.OutOfMemory;
+        defer std.testing.allocator.free(needle);
+        if (std.mem.indexOf(u8, source, needle) == null) {
+            std.debug.print("command '{s}' is listed in `commands` but not dispatched\n", .{name});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
 
 test "default config denies git push and gates dotenv" {
     var cfg = try config_mod.Store.init(std.testing.allocator);

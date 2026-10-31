@@ -1211,6 +1211,13 @@ fn toolBash(command: []const u8, background: bool, timeout_s: u32, ctx: *ToolCon
     return runCaptured(&local, &argv, "");
 }
 
+/// Run `command` under `/bin/sh -c` with the bash tool's capture, cancel and
+/// timeout handling, without any permission check. For the human at the
+/// keyboard (the REPL's `!cmd`), never for model-issued commands.
+pub fn runShell(ctx: *ToolContext, command: []const u8) ToolResult {
+    return runCaptured(ctx, &.{ "/bin/sh", "-c", command }, "");
+}
+
 /// "git commit -m x" -> "git commit"; "ls" -> "ls".
 fn commandPrefixOf(command: []const u8) []const u8 {
     var it = std.mem.tokenizeAny(u8, command, " \t");
