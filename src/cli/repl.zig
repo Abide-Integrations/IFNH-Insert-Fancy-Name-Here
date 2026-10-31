@@ -27,6 +27,8 @@ const anthropic = @import("../providers/anthropic.zig");
 const trace_mod = @import("../core/trace.zig");
 const turn_cache_mod = @import("../core/turn_cache.zig");
 const budget_mod = @import("../core/budget.zig");
+const footer_mod = @import("../ui/footer.zig");
+const pricing = @import("../providers/pricing.zig");
 const local_grants_mod = @import("../core/permissions/local_grants.zig");
 
 const max_output_bytes: usize = 256 * 1024;
@@ -45,6 +47,37 @@ pub const Options = struct {
 const Ui = struct {
     io: std.Io,
     palette: style_mod.Palette,
+    /// Status line on stderr (C-04); every writer below clears it first.
+    footer: footer_mod.Footer,
+    /// Prompt + output tokens of the last request, for the footer's ctx %.
+    ctx_used: u64 = 0,
+
+    fn footerStats(self: *const Ui, rt: *const session_runtime.SessionRuntime, cfg: *const config_mod.Store) footer_mod.Stats {
+        const model = cfg.getString("model.model", "");
+        return .{
+            .model = model,
+            .tokens_in = rt.usage_total.input_tokens,
+            .tokens_out = rt.usage_total.output_tokens,
+            .cache_read = rt.usage_total.cache_read_tokens,
+            .cache_write = rt.usage_total.cache_write_tokens,
+            .ctx_used = self.ctx_used,
+            .window = if (cfg.getOptionalU32("context.max_context_tokens")) |w| w else null,
+            .cost_usd = rt.spent_usd,
+            .priced = pricing.lookup(model) != null,
+            .turn_index = rt.turns_run + 1,
+        };
+    }
+
+    fn beginTurn(self: *Ui, rt: *const session_runtime.SessionRuntime, cfg: *const config_mod.Store) void {
+        self.footer.beginTurn(self.footerStats(rt, cfg));
+    }
+
+    fn endTurn(self: *Ui, rt: *const session_runtime.SessionRuntime, cfg: *const config_mod.Store, res: session_runtime.TurnOutcome) void {
+        if (!res.ran) return self.footer.abandon();
+        const anthropic_wire = std.mem.eql(u8, cfg.getString("model.provider", "openai"), "anthropic");
+        self.ctx_used = footer_mod.contextTokens(res.last_round, anthropic_wire);
+        self.footer.finish(self.footerStats(rt, cfg));
+    }
 
     fn events(self: *Ui) session_runtime.Events {
         return .{
@@ -62,11 +95,13 @@ const Ui = struct {
     /// Assistant text deltas go straight to stdout, byte for byte.
     fn onText(ctx: *anyopaque, text: []const u8) void {
         const self: *Ui = @ptrCast(@alignCast(ctx));
+        self.footer.clear();
         std.Io.File.stdout().writeStreamingAll(self.io, text) catch {};
     }
 
     fn onStatus(ctx: *anyopaque, level: session_runtime.Level, text: []const u8) void {
         const self: *Ui = @ptrCast(@alignCast(ctx));
+        self.footer.clear();
         switch (level) {
             .plain => out(self.io, "{s}", .{text}) catch {},
             .warn => out(self.io, "{s}", .{self.palette.warn(text, std.heap.page_allocator)}) catch {},
@@ -77,6 +112,7 @@ const Ui = struct {
     fn onToolStart(ctx: *anyopaque, call_id: []const u8, name: []const u8, arguments_json: []const u8) void {
         _ = call_id;
         const self: *Ui = @ptrCast(@alignCast(ctx));
+        self.footer.clear();
         out(self.io, "\n[tool] {s} {s}\n", .{ name, arguments_json }) catch {};
     }
 
@@ -84,6 +120,7 @@ const Ui = struct {
         _ = call_id;
         _ = name;
         const self: *Ui = @ptrCast(@alignCast(ctx));
+        self.footer.clear();
         const max_show: usize = 400;
         const shown = if (output.len > max_show) output[0..max_show] else output;
         var scratch: [64]u8 = undefined;
@@ -95,10 +132,12 @@ const Ui = struct {
             else => pa.red(tag, std.heap.page_allocator),
         };
         out(self.io, "{s} {s}{s}\n", .{ colored, shown, if (output.len > max_show) "..." else "" }) catch {};
+        self.footer.tick();
     }
 
     fn onNotice(ctx: *anyopaque, text: []const u8) void {
         const self: *Ui = @ptrCast(@alignCast(ctx));
+        self.footer.clear();
         out(self.io, "! {s}\n", .{text}) catch {};
     }
 
@@ -114,6 +153,7 @@ const Ui = struct {
     /// writes only; typing it for anything else denies.
     fn promptApproval(ctx: *anyopaque, req: tool_mod.ApprovalRequest) tool_mod.ApprovalResponse {
         const self: *Ui = @ptrCast(@alignCast(ctx));
+        self.footer.clear();
         const offer_project = req.grant == .path_write;
         var aw: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
         defer aw.deinit();
@@ -158,6 +198,14 @@ fn writePreview(w: *std.Io.Writer, palette: style_mod.Palette, preview: []const 
         }
         try w.writeAll(if (palette.enabled) "\x1b[0m\n" else "\n");
     }
+}
+
+/// The footer draws escape codes on stderr: only for a real, non-dumb terminal.
+fn footerEnabled(io: std.Io, environ: *const std.process.Environ.Map, cfg: *const config_mod.Store) bool {
+    if (!cfg.getBool("ui.footer", true)) return false;
+    const term = environ.get("TERM") orelse return false;
+    if (term.len == 0 or std.mem.eql(u8, term, "dumb")) return false;
+    return std.Io.File.stderr().isTty(io) catch false;
 }
 
 /// Palette detection needs the merged environment (the user env file may set
@@ -207,7 +255,12 @@ pub fn run(
 
     // The palette needs the merged environment (the user env file may set
     // NO_COLOR), so it is detected after the runtime exists.
-    var ui = Ui{ .io = io, .palette = detectPalette(io, rt.environ, cfg.getBool("ui.colors", true), opts.no_color) };
+    const palette0 = detectPalette(io, rt.environ, cfg.getBool("ui.colors", true), opts.no_color);
+    var ui = Ui{
+        .io = io,
+        .palette = palette0,
+        .footer = footer_mod.Footer.init(io, footerEnabled(io, rt.environ, &cfg), palette0),
+    };
     const events = ui.events();
     const palette = ui.palette;
 
@@ -281,8 +334,10 @@ pub fn run(
             switch (action) {
                 .quit => break,
                 .submit => |prompt| {
+                    ui.beginTurn(&rt, &cfg);
                     const res = try rt.submitTurn(arena, &cfg, rt.providerConfig(&cfg), instr.text, instr.stable_len, prompt, cwd, &events);
                     try renderTurn(io, arena, &ui, res);
+                    ui.endTurn(&rt, &cfg, res);
                 },
                 .none => {},
             }
@@ -320,8 +375,10 @@ pub fn run(
             break :blk Prompt{ .text = turn_instr.text, .stable_len = turn_instr.stable_len };
         };
 
+        ui.beginTurn(&rt, &cfg);
         const res = try rt.submitTurn(arena, &cfg, rt.providerConfig(&cfg), skill_prompt.text, skill_prompt.stable_len, line, cwd, &events);
         try renderTurn(io, arena, &ui, res);
+        ui.endTurn(&rt, &cfg, res);
     }
 }
 

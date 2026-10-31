@@ -550,6 +550,7 @@ test {
     _ = @import("core/interrupt.zig");
     _ = @import("ui/style.zig");
     _ = @import("ui/secret.zig");
+    _ = @import("ui/footer.zig");
     _ = @import("providers/models.zig");
     _ = @import("providers/probe.zig");
     _ = @import("core/config/keys.zig");
