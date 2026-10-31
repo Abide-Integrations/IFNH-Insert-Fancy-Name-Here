@@ -551,6 +551,7 @@ test {
     _ = @import("ui/style.zig");
     _ = @import("ui/secret.zig");
     _ = @import("ui/footer.zig");
+    _ = @import("ui/render.zig");
     _ = @import("ui/line_editor.zig");
     _ = @import("providers/models.zig");
     _ = @import("providers/probe.zig");
