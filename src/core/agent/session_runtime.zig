@@ -569,7 +569,7 @@ fn usageRecord(arena: std.mem.Allocator, ts_ms: i64, model: []const u8, outcome:
         outcome.tool_calls,
     });
     try std.json.Stringify.value(model, .{}, w);
-    try w.print(",\"cost_usd\":{d:.6},\"priced\":{s}}}\n", .{ cost.usd, if (cost.priced) "true" else "false" });
+    try w.print(",\"cost_usd\":{d},\"priced\":{s}}}\n", .{ cost.usd, if (cost.priced) "true" else "false" });
     return aw.written();
 }
 

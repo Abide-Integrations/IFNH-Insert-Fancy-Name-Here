@@ -15,7 +15,10 @@ pub fn exceeded(spent: f64, budget: ?f64) bool {
 
 /// The one line shown when the breaker trips (REPL and `ifnh ask` share it).
 pub fn blockedMessage(buf: []u8, spent: f64, budget: f64) []const u8 {
-    return std.fmt.bufPrint(buf, "[budget] ${d:.4} of ${d:.4} spent; raise agents.budget_usd or /usage to inspect\n", .{ spent, budget }) catch "[budget] budget spent\n";
+    // Four decimals would print a tiny budget as $0.0000; show more digits then.
+    const smallest = @min(spent, budget);
+    const digits: usize = if (smallest > 0 and smallest < 0.01) 8 else 4;
+    return std.fmt.bufPrint(buf, "[budget] ${d:.[2]} of ${d:.[2]} spent; raise agents.budget_usd or /usage to inspect\n", .{ spent, budget, digits }) catch "[budget] budget spent\n";
 }
 
 pub const ModelTotal = struct {
@@ -121,6 +124,10 @@ test "budget: blocked message names spend and the knob" {
     try std.testing.expectEqualStrings(
         "[budget] $0.0123 of $0.0100 spent; raise agents.budget_usd or /usage to inspect\n",
         blockedMessage(&buf, 0.0123, 0.01),
+    );
+    try std.testing.expectEqualStrings(
+        "[budget] $0.00000075 of $0.00000010 spent; raise agents.budget_usd or /usage to inspect\n",
+        blockedMessage(&buf, 0.00000075, 0.0000001),
     );
 }
 
