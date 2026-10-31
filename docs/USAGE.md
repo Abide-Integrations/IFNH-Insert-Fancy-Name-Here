@@ -68,6 +68,96 @@ approval needed: run command
 [y] once  [s] session  [n] no:
 ```
 
+File writes and edits show a unified diff of the change first (new files show
+all lines as additions; output is cut at 40 lines / 4 KiB) and add a fourth
+answer:
+
+```
+approval needed: write file
+  src/a.zig
+    --- a/src/a.zig
+    +++ b/src/a.zig
+    @@ -1,2 +1,2 @@
+     const x = 1;
+    -const y = 2;
+    +const y = 3;
+  (p saves this grant to .ifnh/permissions.local.json)
+[y] once  [s] session  [p] always for this project  [n] no:
+```
+
+`p` allows writes to exactly that path from now on, in this and later
+sessions of this project. It is stored in `.ifnh/permissions.local.json`
+(`{"version":1,"command_prefix":[...],"path_write":[...]}`), which IFNH adds to
+`.ifnh/.gitignore`: grants belong to you, not to the repository. A grant only
+turns a prompt into a yes. Protected paths (`.ifnh/config.json`, instructions,
+`AGENTS.md`, and the grants file itself), deny rules and the `git.*` ceilings
+still win, and agents cannot write the file. Delete a line, or the file, to
+revoke. An unreadable file is reported at startup, ignored, and never
+overwritten (answering `p` then only lasts for the session). `p` is offered for
+file writes only, not for commands or MCP calls.
+
+### Line editor
+
+On a terminal (stdin and stderr are TTYs and `TERM` is not `dumb`) the prompt is
+a line editor. Piped input, `TERM=dumb` and `ifnh ask` use plain line reading
+and none of this applies.
+
+| Keys | Effect |
+|---|---|
+| Left / Right, Ctrl-B / Ctrl-F | move by character |
+| Home / End, Ctrl-A / Ctrl-E | start / end of the current line |
+| Backspace, Delete | delete before / under the cursor |
+| Ctrl-K / Ctrl-U / Ctrl-W | kill to end of line / to start of line / previous word |
+| Ctrl-L | clear the screen and redraw |
+| Up / Down | history; the line you were typing comes back after the newest entry |
+| Ctrl-R | incremental reverse search; Ctrl-R again goes further back, Enter accepts the match into the line, Ctrl-C or ESC restores what you had |
+| Alt+Enter, or a trailing `\` then Enter | new line in the same message (the backslash is removed); a plain Enter sends everything |
+| Tab | `/command` names (first word) and `@path` files; one match completes, several list and complete the common prefix |
+| Ctrl-D | on an empty line, end the session |
+| Ctrl-C | on a non-empty line, clear it; on an empty line, exit with status 130 |
+
+Pasting is safe: terminals that support bracketed paste insert the text
+verbatim (nothing in it is treated as a key; control bytes are dropped). Without
+it, text arriving in one burst with a newline inside is inserted as lines
+instead of being sent. A lone ESC is recognised after a 50 ms pause.
+
+History lives in `~/.local/state/ifnh/history` (mode 0600), 500 entries, with
+consecutive duplicates collapsed. Blank lines and `/provider key ...` (which
+carries a secret) are not recorded.
+
+`@path` attaches a file: `explain @src/main.zig` sends the text with the file
+appended as `<file path="src/main.zig">...</file>`. A word is a file mention
+only if it starts with `@` and contains `/` or `.` or names an existing file
+(`@alice` and a bare `@` are left alone). Files are cut at
+`context.max_file_read_bytes` with `... (truncated)`. A missing, binary or
+directory mention prints `cannot attach <path>: <reason>` and nothing is sent.
+The file contents go to the model provider like the rest of your message, and
+the read is yours, not the agent's: `permissions.read` and `read_dotenv` do not
+apply, so do not `@` a secrets file. Completion skips `.git`, build output and
+dot-files, never leaves the project and reads one directory at a time.
+
+`!cmd` runs a shell command yourself: `!git status`, `!zig build 2>&1 | tail`.
+It runs under `/bin/sh -c` in the project directory with the bash tool's
+timeout (`agents.timeout_tool_s`) and Ctrl-C handling, prints the output and an
+exit line, asks no approval, and is never sent to the model or recorded as a
+message. A multi-line buffer starting with `!` runs as one script.
+
+### Status footer
+
+After each turn (and between tool calls) a dim line is drawn on **stderr**:
+
+```
+claude-sonnet-4-6 | ctx 25% (24000/96000) | ↑1200 ↓345 | $0.0123 | 4.5s
+```
+
+`ctx` is the last request's prompt plus output tokens over
+`context.max_context_tokens` (`ctx ?%` when that is not set). `↑`/`↓` and the
+cost are session totals; cost is `n/a` for a model without a price (see
+`/usage`), and `$0.00` under a tenth of a cent. The time is the wall time of
+the turn. The footer is erased before any other output, so it never mixes
+into streamed text. It is off with `ui.footer: false`, and absent when stderr
+is not a terminal or `TERM` is `dumb`: then nothing at all is written.
+
 ### Slash commands
 
 | Command | Effect |
@@ -84,7 +174,7 @@ approval needed: run command
 | `/skills` | installed skills |
 | `/mcp` | MCP servers/tools |
 | `/exec` | background executions |
-| `/usage` | session token totals |
+| `/usage` | session token and dollar totals, with the budget and a per-model line when several models were used |
 | `/compact` | force context compaction |
 | `/lifecycle run <file.json> [--from <n>]` | run a lifecycle |
 | `/review override <reason>` | developer-only override of a blocked review (audited) |
@@ -158,9 +248,13 @@ commas. Every run emits exactly one `start` and one final `end`:
 | 1 | failure: provider error, tool error that ended the turn, or other turn failure |
 | 2 | usage error: unknown flag, bad/missing flag value, missing/empty prompt, bad `--policy`, conflicting approval flags |
 | 3 | denied: at least one tool call was denied during the turn (includes `--deny-all`) |
+| 4 | budget: `agents.budget_usd` was already spent, so the turn was refused before any request (nothing was spent) |
 | 130 | interrupted: SIGINT during the turn (the interrupted outcome is emitted first) |
 
-When several apply, precedence is `130 > 1 > 3 > 0`.
+When several apply, precedence is `130 > 4 > 1 > 3 > 0`. `ask` always starts a
+new session, so the budget check can only trip there when the budget is `0`
+(spend nothing); in the REPL it trips once the session's spend reaches the
+budget.
 
 ## 5. Configuration
 
@@ -202,10 +296,21 @@ The full annotated default lives in `src/core/config/config.zig`
     "env_allow": ["GITHUB_TOKEN"]  // env vars agents may see
   },
   "git": { "commits": "ask", "push": "never", "force_push": "never" },
-  "agents": { "max_depth": 1, "max_concurrent": 4 },
-  "ui": { "colors": true }
+  "agents": { "max_depth": 1, "max_concurrent": 4, "budget_usd": 5.0 },
+  "ui": { "colors": true, "footer": true }
 }
 ```
+
+`agents.budget_usd` (default `null`, no limit) is a circuit breaker on the
+dollar cost of a session. Costs come from the price table embedded in the
+binary (`src/providers/pricing.json`: list prices per million tokens for
+Anthropic Claude and OpenAI GPT/o-series, matched by model id prefix); models
+without an entry are unpriced, count as $0 and show `n/a`, so the budget cannot
+protect you with them. Before each turn the REPL checks the spend so far; once
+it has reached the budget it prints `[budget] $X of $B spent; raise
+agents.budget_usd or /usage to inspect` and stays at the prompt (slash commands
+still work). The check is per turn: the turn that crosses the line completes,
+and subagent spend is not counted yet. `ui.footer` switches the status footer.
 
 `NO_COLOR` / `--no-color` disable styling.
 
@@ -360,6 +465,7 @@ zig build -Doptimize=ReleaseSafe && scripts/install.sh
 ├── tool-notes/          # committed — per-CLI guidance for agents
 ├── plans/               # plan artifacts
 ├── reports/             # agent reports (gitignored by default)
+├── permissions.local.json  # your "always for this project" grants (gitignored)
 ├── sessions/            # session state (gitignored)
 ├── cache/               # artifacts, background-execution logs (gitignored)
 └── .gitignore           # written by IFNH
