@@ -11,16 +11,6 @@ const std = @import("std");
 pub const Palette = struct {
     enabled: bool = false,
 
-    pub fn detect(allocator: std.mem.Allocator, io: std.Io, environ_get: *const fn ([]const u8) ?[]const u8, config_colors: bool, cli_no_color: bool) Palette {
-        _ = allocator;
-        if (cli_no_color) return .{ .enabled = false };
-        if (environ_get("NO_COLOR") != null) return .{ .enabled = false };
-        if (!config_colors) return .{ .enabled = false };
-        // Color only when stdout is a TTY (best-effort).
-        const is_tty = std.Io.File.stdout().isTty(io) catch false;
-        return .{ .enabled = is_tty };
-    }
-
     fn wrap(self: Palette, code: []const u8, text: []const u8, arena: std.mem.Allocator) []const u8 {
         if (!self.enabled or text.len == 0) return text;
         return std.fmt.allocPrint(arena, "\x1b[{s}m{s}\x1b[0m", .{ code, text }) catch text;

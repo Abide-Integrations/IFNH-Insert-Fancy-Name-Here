@@ -35,6 +35,8 @@ pub const ApprovalRequest = struct {
         path_write: []const u8,
     };
 
+    /// Tool asking ("" when the caller does not know).
+    tool: []const u8 = "",
     title: []const u8,
     detail: []const u8, // command line or path
     /// What a session-scope approval should grant.
@@ -83,9 +85,12 @@ pub const ToolContext = struct {
     use_external_tools: ?bool = null,
     /// Per-context view of the process-global `rg`/`fd` probe.
     external_cache: search.ExternalCache = .{},
+    /// Name of the tool currently executing (set by `execute`, read by
+    /// approval prompts so they can name it).
+    tool_name: []const u8 = "",
 
     pub fn requestApproval(self: *ToolContext, title: []const u8, detail: []const u8, grant: ApprovalRequest.Grant) bool {
-        const resp = self.approval_fn(self.approval_ctx, .{ .title = title, .detail = detail, .grant = grant });
+        const resp = self.approval_fn(self.approval_ctx, .{ .tool = self.tool_name, .title = title, .detail = detail, .grant = grant });
         switch (resp) {
             .approved_once, .approved_session => return true,
             .denied => return false,
@@ -202,6 +207,7 @@ pub fn execute(name: []const u8, args_json: []const u8, ctx: *ToolContext) ToolR
         return errResult(ctx.arena, "invalid JSON arguments", .{});
     if (args != .object) return errResult(ctx.arena, "arguments must be a JSON object", .{});
     const a = Args{ .obj = args.object };
+    ctx.tool_name = name;
 
     if (std.mem.eql(u8, name, "read")) {
         const path = a.str("path") orelse return errResult(ctx.arena, "read: missing path", .{});

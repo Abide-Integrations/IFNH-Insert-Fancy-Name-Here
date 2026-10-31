@@ -10,6 +10,7 @@ const version = @import("version.zig");
 const cli_args = @import("cli/args.zig");
 const fsutil = @import("core/fsutil.zig");
 const repl = @import("cli/repl.zig");
+const ask_mod = @import("cli/ask.zig");
 const session_mod = @import("core/session/store.zig");
 const config_mod = @import("core/config/config.zig");
 const trace_mod = @import("core/trace.zig");
@@ -38,7 +39,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const parsed = cli_args.parse(argv.items) catch |err| {
-        try printOut(io, arena, "error: bad arguments: {s}\n(run `ifnh help` for usage)\n", .{@errorName(err)});
+        try printErr(io, arena, "error: bad arguments: {s}\n(run `ifnh help` for usage)\n", .{@errorName(err)});
         std.process.exit(2);
     };
 
@@ -50,6 +51,20 @@ pub fn main(init: std.process.Init) !void {
         try printOut(io, arena, help_text, .{version.version});
         return;
     }
+    // Headless one-shot: `ifnh ask "<prompt>"` or the `-p` shorthand
+    // (`ifnh -p "<prompt>"`). Both land in the same driver, and the exit
+    // code is the driver's own (0/1/2/3/130), not the generic failure path.
+    if (parsed.subcommand == .ask or (parsed.subcommand == .none and parsed.flags.prompt != null)) {
+        var ask = cli_args.parseAsk(parsed.args) catch |err| {
+            try printErr(io, arena, "error: bad arguments: {s}\n(run `ifnh help` for usage)\n", .{@errorName(err)});
+            std.process.exit(2);
+        };
+        // A `-p` before the subcommand is the prompt when `ask` did not give
+        // one; an explicit `ask -` still means stdin.
+        ask.prompt = cli_args.resolveAskPrompt(parsed.flags.prompt, ask);
+        std.process.exit(ask_mod.run(io, arena, init.environ_map, parsed.flags, ask));
+    }
+
     if (parsed.subcommand == .none) {
         repl.run(io, arena, init.environ_map, .{ .no_color = parsed.flags.no_color, .trace = &startup_trace }) catch |err| {
             if (err == error.AccessDenied) {
@@ -451,6 +466,14 @@ fn printOut(io: std.Io, alloc: std.mem.Allocator, comptime fmt: []const u8, args
     try std.Io.File.stdout().writeStreamingAll(io, text);
 }
 
+/// Usage/config errors must never pollute `--json` stdout.
+fn printErr(io: std.Io, alloc: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
+    var stack_buf: [4096]u8 = undefined;
+    const text = std.fmt.bufPrint(&stack_buf, fmt, args) catch
+        try std.fmt.allocPrint(alloc, fmt, args); // arena-owned; freed at process exit
+    try std.Io.File.stderr().writeStreamingAll(io, text);
+}
+
 const help_text =
     \\ifnh {s} — a tiny, fast, developer-controlled agentic coding harness.
     \\
@@ -464,6 +487,7 @@ const help_text =
     \\  fork        branch a session (ifnh fork <id>); 'ifnh fork diff <a> <b>' compares
     \\  cleanup     enforce retention, list/remove worktrees
     \\  resume      resume a previous session (M0)
+    \\  ask         run one headless turn (prompt arg or stdin; --json NDJSON)
     \\  doctor      check environment health (M1)
     \\  help        show this text
     \\  version     print version
@@ -472,8 +496,17 @@ const help_text =
     \\  --json                  machine-readable output
     \\  --no-color              disable color
     \\  --log-level <level>     err | info | debug | trace
+    \\  -p <prompt>             headless one-shot prompt (same as 'ask -p')
     \\  -h, --help              show help
     \\  -V, --version           print version
+    \\
+    \\ask flags:
+    \\  --json                  NDJSON events on stdout, nothing else
+    \\  --yes                   approve every permission ask (once)
+    \\  --deny-all              deny every permission ask
+    \\  --policy <ask|allow|deny>  default: ask (/dev/tty when stdin is a tty)
+    \\  -p <prompt>             prompt text; '-' or omitted reads stdin
+    \\  (exit: 0 ok, 1 failed, 2 usage, 3 denied, 130 interrupted)
     \\
 ;
 
@@ -502,6 +535,7 @@ test {
     _ = @import("core/agent/engine.zig");
     _ = @import("core/agent/testing.zig");
     _ = @import("core/agent/subagent.zig");
+    _ = @import("core/agent/session_runtime.zig");
     _ = @import("core/git.zig");
     _ = @import("core/mcp.zig");
     _ = @import("core/skills.zig");
@@ -517,6 +551,7 @@ test {
     _ = @import("core/config/keys.zig");
     _ = @import("core/agent/system_prompt.zig");
     _ = @import("cli/repl.zig");
+    _ = @import("cli/ask.zig");
     _ = @import("core/redact.zig");
     _ = @import("providers/testing.zig");
 }
