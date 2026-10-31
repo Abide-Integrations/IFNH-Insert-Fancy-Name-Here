@@ -26,6 +26,12 @@ const openai = @import("../providers/openai.zig");
 const anthropic = @import("../providers/anthropic.zig");
 const trace_mod = @import("../core/trace.zig");
 const turn_cache_mod = @import("../core/turn_cache.zig");
+const budget_mod = @import("../core/budget.zig");
+const footer_mod = @import("../ui/footer.zig");
+const line_editor = @import("../ui/line_editor.zig");
+const interrupt_mod = @import("../core/interrupt.zig");
+const pricing = @import("../providers/pricing.zig");
+const local_grants_mod = @import("../core/permissions/local_grants.zig");
 
 const max_output_bytes: usize = 256 * 1024;
 
@@ -43,6 +49,37 @@ pub const Options = struct {
 const Ui = struct {
     io: std.Io,
     palette: style_mod.Palette,
+    /// Status line on stderr (C-04); every writer below clears it first.
+    footer: footer_mod.Footer,
+    /// Prompt + output tokens of the last request, for the footer's ctx %.
+    ctx_used: u64 = 0,
+
+    fn footerStats(self: *const Ui, rt: *const session_runtime.SessionRuntime, cfg: *const config_mod.Store) footer_mod.Stats {
+        const model = cfg.getString("model.model", "");
+        return .{
+            .model = model,
+            .tokens_in = rt.usage_total.input_tokens,
+            .tokens_out = rt.usage_total.output_tokens,
+            .cache_read = rt.usage_total.cache_read_tokens,
+            .cache_write = rt.usage_total.cache_write_tokens,
+            .ctx_used = self.ctx_used,
+            .window = if (cfg.getOptionalU32("context.max_context_tokens")) |w| w else null,
+            .cost_usd = rt.spent_usd,
+            .priced = pricing.lookup(model) != null,
+            .turn_index = rt.turns_run + 1,
+        };
+    }
+
+    fn beginTurn(self: *Ui, rt: *const session_runtime.SessionRuntime, cfg: *const config_mod.Store) void {
+        self.footer.beginTurn(self.footerStats(rt, cfg));
+    }
+
+    fn endTurn(self: *Ui, rt: *const session_runtime.SessionRuntime, cfg: *const config_mod.Store, res: session_runtime.TurnOutcome) void {
+        if (!res.ran) return self.footer.abandon();
+        const anthropic_wire = std.mem.eql(u8, cfg.getString("model.provider", "openai"), "anthropic");
+        self.ctx_used = footer_mod.contextTokens(res.last_round, anthropic_wire);
+        self.footer.finish(self.footerStats(rt, cfg));
+    }
 
     fn events(self: *Ui) session_runtime.Events {
         return .{
@@ -60,11 +97,13 @@ const Ui = struct {
     /// Assistant text deltas go straight to stdout, byte for byte.
     fn onText(ctx: *anyopaque, text: []const u8) void {
         const self: *Ui = @ptrCast(@alignCast(ctx));
+        self.footer.clear();
         std.Io.File.stdout().writeStreamingAll(self.io, text) catch {};
     }
 
     fn onStatus(ctx: *anyopaque, level: session_runtime.Level, text: []const u8) void {
         const self: *Ui = @ptrCast(@alignCast(ctx));
+        self.footer.clear();
         switch (level) {
             .plain => out(self.io, "{s}", .{text}) catch {},
             .warn => out(self.io, "{s}", .{self.palette.warn(text, std.heap.page_allocator)}) catch {},
@@ -75,6 +114,7 @@ const Ui = struct {
     fn onToolStart(ctx: *anyopaque, call_id: []const u8, name: []const u8, arguments_json: []const u8) void {
         _ = call_id;
         const self: *Ui = @ptrCast(@alignCast(ctx));
+        self.footer.clear();
         out(self.io, "\n[tool] {s} {s}\n", .{ name, arguments_json }) catch {};
     }
 
@@ -82,6 +122,7 @@ const Ui = struct {
         _ = call_id;
         _ = name;
         const self: *Ui = @ptrCast(@alignCast(ctx));
+        self.footer.clear();
         const max_show: usize = 400;
         const shown = if (output.len > max_show) output[0..max_show] else output;
         var scratch: [64]u8 = undefined;
@@ -93,10 +134,12 @@ const Ui = struct {
             else => pa.red(tag, std.heap.page_allocator),
         };
         out(self.io, "{s} {s}{s}\n", .{ colored, shown, if (output.len > max_show) "..." else "" }) catch {};
+        self.footer.tick();
     }
 
     fn onNotice(ctx: *anyopaque, text: []const u8) void {
         const self: *Ui = @ptrCast(@alignCast(ctx));
+        self.footer.clear();
         out(self.io, "! {s}\n", .{text}) catch {};
     }
 
@@ -107,13 +150,24 @@ const Ui = struct {
         _ = tool_calls_json;
     }
 
-    /// Interactive approval prompt. Session grants are applied by the runtime.
+    /// Interactive approval prompt. Session and project grants are applied
+    /// by the runtime. `p` (always for this project) is offered for file
+    /// writes only; typing it for anything else denies.
     fn promptApproval(ctx: *anyopaque, req: tool_mod.ApprovalRequest) tool_mod.ApprovalResponse {
         const self: *Ui = @ptrCast(@alignCast(ctx));
-        const head = std.fmt.allocPrint(std.heap.page_allocator, "\n{s}approval needed:{s} {s}\n  {s}\n[y] once  [s] session  [n] no: ", .{
-            self.palette.warn("", std.heap.page_allocator), "\x1b[0m", req.title, req.detail,
-        }) catch "approval needed: ";
-        out(self.io, "{s}", .{head}) catch return .denied;
+        self.footer.clear();
+        const offer_project = req.grant == .path_write;
+        var aw: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+        defer aw.deinit();
+        const w = &aw.writer;
+        w.print("\n{s}approval needed:{s} {s}\n  {s}\n", .{ self.palette.warn("", std.heap.page_allocator), "\x1b[0m", req.title, req.detail }) catch return .denied;
+        writePreview(w, self.palette, req.preview) catch return .denied;
+        if (offer_project) {
+            w.print("  (p saves this grant to {s})\n[y] once  [s] session  [p] always for this project  [n] no: ", .{local_grants_mod.path}) catch return .denied;
+        } else {
+            w.writeAll("[y] once  [s] session  [n] no: ") catch return .denied;
+        }
+        std.Io.File.stdout().writeStreamingAll(self.io, aw.written()) catch return .denied;
         var buf: [64]u8 = undefined;
         var stdin_r = std.Io.File.stdin().reader(self.io, &buf);
         const line = stdin_r.interface.takeDelimiterInclusive('\n') catch return .denied;
@@ -122,10 +176,39 @@ const Ui = struct {
             return .approved_once;
         } else if (std.ascii.eqlIgnoreCase(answer, "s")) {
             return .approved_session;
+        } else if (offer_project and std.ascii.eqlIgnoreCase(answer, "p")) {
+            return .approved_project;
         }
         return .denied;
     }
 };
+
+/// Print a unified diff indented and dimmed. File content is untrusted, so
+/// control bytes (escape sequences, a bare CR) are shown as visible marks.
+fn writePreview(w: *std.Io.Writer, palette: style_mod.Palette, preview: []const u8) !void {
+    if (preview.len == 0) return;
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, preview, "\n"), '\n');
+    while (lines.next()) |line| {
+        try w.writeAll(if (palette.enabled) "    \x1b[2m" else "    ");
+        for (line) |c| {
+            switch (c) {
+                '\r' => try w.writeAll("\u{240D}"),
+                '\t' => try w.writeByte(c),
+                0...8, 10...12, 14...31, 127 => try w.writeByte('?'),
+                else => try w.writeByte(c),
+            }
+        }
+        try w.writeAll(if (palette.enabled) "\x1b[0m\n" else "\n");
+    }
+}
+
+/// The footer draws escape codes on stderr: only for a real, non-dumb terminal.
+fn footerEnabled(io: std.Io, environ: *const std.process.Environ.Map, cfg: *const config_mod.Store) bool {
+    if (!cfg.getBool("ui.footer", true)) return false;
+    const term = environ.get("TERM") orelse return false;
+    if (term.len == 0 or std.mem.eql(u8, term, "dumb")) return false;
+    return std.Io.File.stderr().isTty(io) catch false;
+}
 
 /// Palette detection needs the merged environment (the user env file may set
 /// NO_COLOR), so the lookup is inlined rather than kept in file-scope state.
@@ -170,10 +253,16 @@ pub fn run(
         .trace = opts.trace,
     });
     defer rt.deinit();
+    if (rt.local_grants_warning) |warning| try out(io, "{s}", .{warning});
 
     // The palette needs the merged environment (the user env file may set
     // NO_COLOR), so it is detected after the runtime exists.
-    var ui = Ui{ .io = io, .palette = detectPalette(io, rt.environ, cfg.getBool("ui.colors", true), opts.no_color) };
+    const palette0 = detectPalette(io, rt.environ, cfg.getBool("ui.colors", true), opts.no_color);
+    var ui = Ui{
+        .io = io,
+        .palette = palette0,
+        .footer = footer_mod.Footer.init(io, footerEnabled(io, rt.environ, &cfg), palette0),
+    };
     const events = ui.events();
     const palette = ui.palette;
 
@@ -227,17 +316,42 @@ pub fn run(
     var stdin_buf: [4096]u8 = undefined;
     var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buf);
 
+    // The line editor (C-03) only on a real terminal; piped input keeps the
+    // plain line reader below, byte for byte.
+    var editor: ?line_editor.Editor = null;
+    if (line_editor.usable(io, rt.environ)) {
+        const history_path = if (config_mod.userStateDir(arena, rt.process_environ)) |dir|
+            std.fmt.allocPrint(arena, "{s}/history", .{dir}) catch null
+        else
+            null;
+        editor = line_editor.Editor.init(io, arena, history_path, .{ .commands = &commands });
+    }
+    defer if (editor) |*ed| ed.deinit();
+
     while (true) {
-        try out(io, "> ", .{});
-        const line_raw = stdin_reader.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
-            error.EndOfStream => {
-                try out(io, "\n", .{});
-                break;
-            },
-            else => break,
-        };
+        var line_raw: []const u8 = undefined;
+        if (editor) |*ed| {
+            line_raw = (ed.readLine("> ") catch break) orelse break;
+        } else {
+            try out(io, "> ", .{});
+            line_raw = stdin_reader.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
+                error.EndOfStream => {
+                    try out(io, "\n", .{});
+                    break;
+                },
+                else => break,
+            };
+        }
         var line = std.mem.trim(u8, line_raw, " \t\r\n");
         if (line.len == 0) continue;
+
+        // `!cmd` runs locally and never reaches the model (editor only).
+        if (editor != null) {
+            if (line_editor.parseShellEscape(line)) |shell_cmd| {
+                runShellEscape(io, arena, cwd, &rt, &cfg, shell_cmd);
+                continue;
+            }
+        }
 
         if (line[0] == '/') {
             const cmd_end = std.mem.indexOfScalar(u8, line, ' ') orelse line.len;
@@ -247,12 +361,26 @@ pub fn run(
             switch (action) {
                 .quit => break,
                 .submit => |prompt| {
+                    ui.beginTurn(&rt, &cfg);
                     const res = try rt.submitTurn(arena, &cfg, rt.providerConfig(&cfg), instr.text, instr.stable_len, prompt, cwd, &events);
                     try renderTurn(io, arena, &ui, res);
+                    ui.endTurn(&rt, &cfg, res);
                 },
                 .none => {},
             }
             continue;
+        }
+
+        // `@path` mentions become attached file blocks (editor only).
+        if (editor != null) {
+            const max_attach = cfg.getU32("context.max_file_read_bytes", 262144);
+            switch (try line_editor.expandAtMentions(arena, io, cwd, line, max_attach)) {
+                .ok => |expanded| line = expanded,
+                .failed => |f| {
+                    try out(io, "cannot attach {s}: {s}\n", .{ f.path, f.reason });
+                    continue;
+                },
+            }
         }
 
         // ---- policy boundary (D029): re-read disk config only when its
@@ -286,9 +414,51 @@ pub fn run(
             break :blk Prompt{ .text = turn_instr.text, .stable_len = turn_instr.stable_len };
         };
 
+        ui.beginTurn(&rt, &cfg);
         const res = try rt.submitTurn(arena, &cfg, rt.providerConfig(&cfg), skill_prompt.text, skill_prompt.stable_len, line, cwd, &events);
         try renderTurn(io, arena, &ui, res);
+        ui.endTurn(&rt, &cfg, res);
     }
+}
+
+/// `!cmd`: run a shell command for the human, in the workspace, under the
+/// bash tool's timeout and Ctrl-C handling. No approval, no model, no session event.
+fn runShellEscape(io: std.Io, arena: std.mem.Allocator, cwd: std.Io.Dir, rt: *session_runtime.SessionRuntime, cfg: *const config_mod.Store, command: []const u8) void {
+    if (command.len == 0) {
+        out(io, "usage: !<shell command>\n", .{}) catch {};
+        return;
+    }
+    const Deny = struct {
+        fn approve(_: *anyopaque, _: tool_mod.ApprovalRequest) tool_mod.ApprovalResponse {
+            return .denied;
+        }
+    };
+    var cancel = std.atomic.Value(bool).init(false);
+    interrupt_mod.install(&cancel);
+    defer interrupt_mod.uninstall();
+    var unused: u8 = 0;
+    var ctx = tool_mod.ToolContext{
+        .io = io,
+        .arena = arena,
+        .workspace = cwd,
+        .engine = &rt.engine,
+        .journal = null,
+        .max_file_read_bytes = cfg.getU32("context.max_file_read_bytes", 262144),
+        .approval_ctx = &unused,
+        .approval_fn = Deny.approve,
+        .cancel = &cancel,
+        .timeout_s = cfg.getU32("agents.timeout_tool_s", 120),
+    };
+    const res = tool_mod.runShell(&ctx, command);
+    var lines = std.mem.splitScalar(u8, res.output, '\n');
+    while (lines.next()) |l| {
+        // The capture wraps streams in tags for the model; a person does not need them.
+        if (std.mem.eql(u8, l, "<stdout>") or std.mem.eql(u8, l, "</stdout>") or
+            std.mem.eql(u8, l, "<stderr>") or std.mem.eql(u8, l, "</stderr>")) continue;
+        if (l.len == 0 and (lines.peek() == null or std.mem.startsWith(u8, lines.peek().?, "</std"))) continue;
+        out(io, "{s}\n", .{l}) catch {};
+    }
+    if (res.status == .ok) out(io, "[exit 0]\n", .{}) catch {} else out(io, "[{s}]\n", .{@tagName(res.status)}) catch {};
 }
 
 /// Render what the runtime reports after a turn. The runtime never touches
@@ -636,8 +806,16 @@ fn sessionsDir(arena: std.mem.Allocator, cfg: *const config_mod.Store) []const u
 fn ensureIfnh(io: std.Io, cwd: std.Io.Dir) !void {
     const dirs = [_][]const u8{ ".ifnh", ".ifnh/sessions", ".ifnh/plans" };
     for (dirs) |d| try cwd.createDirPath(io, d);
-    if (!isFile(cwd, io, ".ifnh/.gitignore")) {
-        try cwd.writeFile(io, .{ .sub_path = ".ifnh/.gitignore", .data = "sessions/\ncache/\ndebug/\nreports/\n" });
+    // The grants file is per-user state, never shared through the repository.
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    const current: ?[]const u8 = if (isFile(cwd, io, ".ifnh/.gitignore"))
+        try fsutil.readSmallFile(cwd, io, arena, ".ifnh/.gitignore", 64 * 1024)
+    else
+        null;
+    if (try local_grants_mod.gitignoreUpdate(arena, current, "sessions/\ncache/\ndebug/\nreports/\n")) |text| {
+        try fsutil.atomicWriteFile(cwd, io, arena, ".ifnh/.gitignore", text);
     }
 }
 
@@ -649,6 +827,16 @@ fn isFile(cwd: std.Io.Dir, io: std.Io, path: []const u8) bool {
 // ---------------------------------------------------------------- slash commands
 
 const CommandAction = union(enum) { none, quit, submit: []const u8 };
+
+/// Built-in slash commands, for Tab completion. Every name must be handled in
+/// `handleCommand` (a test checks the source); disk commands in
+/// `.ifnh/commands/` are not listed.
+pub const commands = [_][]const u8{
+    "help",      "quit",      "model", "config",  "context",  "undo",
+    "redo",      "diff",      "plan",  "agents",  "mcp",      "exec",
+    "review",    "reconcile", "usage", "compact", "sessions", "provider",
+    "lifecycle", "skills",
+};
 
 fn handleCommand(
     io: std.Io,
@@ -987,24 +1175,9 @@ fn handleCommand(
         }
         return .{ .submit = payload.items };
     } else if (std.mem.eql(u8, cmd, "usage")) {
-        var total_in: u64 = 0;
-        var total_out: u64 = 0;
-        var turns: usize = 0;
         const raw = fsutil.readSmallFile(rt.store.dir, io, arena, "usage.jsonl", 1024 * 1024) catch "";
-        var it = std.mem.splitScalar(u8, raw, '\n');
-        while (it.next()) |line| {
-            if (line.len == 0) continue;
-            const v = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch continue;
-            if (v != .object) continue;
-            if (v.object.get("input_tokens")) |ti| {
-                if (ti == .integer) total_in += @intCast(ti.integer);
-            }
-            if (v.object.get("output_tokens")) |to| {
-                if (to == .integer) total_out += @intCast(to.integer);
-            }
-            turns += 1;
-        }
-        out(io, "session usage: {d} turns, {d} tokens in, {d} tokens out\n", .{ turns, total_in, total_out }) catch {};
+        const text = budget_mod.formatSummary(arena, budget_mod.summarize(arena, raw), cfg.getOptionalF64("agents.budget_usd")) catch "usage unavailable\n";
+        out(io, "{s}", .{text}) catch {};
     } else if (std.mem.eql(u8, cmd, "compact")) {
         const pcfg2 = rt.providerConfig(cfg);
         out(io, "[compacting context...]\n", .{}) catch {};
@@ -1146,6 +1319,18 @@ fn out(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
 }
 
 // ---------------------------------------------------------------- tests
+
+test "every completable command is dispatched by handleCommand" {
+    const source = @embedFile("repl.zig");
+    for (commands) |name| {
+        const needle = std.fmt.allocPrint(std.testing.allocator, "std.mem.eql(u8, cmd, \"{s}\")", .{name}) catch return error.OutOfMemory;
+        defer std.testing.allocator.free(needle);
+        if (std.mem.indexOf(u8, source, needle) == null) {
+            std.debug.print("command '{s}' is listed in `commands` but not dispatched\n", .{name});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
 
 test "default config denies git push and gates dotenv" {
     var cfg = try config_mod.Store.init(std.testing.allocator);

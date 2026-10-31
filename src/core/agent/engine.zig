@@ -59,6 +59,9 @@ pub const Outcome = struct {
     tool_rounds: usize = 0,
     tool_calls: usize = 0,
     usage: core_types.Usage = .{},
+    /// Usage of the final provider request alone: its prompt size is how full
+    /// the context window is (the footer's ctx %).
+    last_round: core_types.Usage = .{},
     error_message: []const u8 = "",
 };
 
@@ -157,6 +160,7 @@ pub const RunParams = struct {
 /// Run one agent turn. Appends assistant/tool messages to `history`.
 pub fn runTurn(p: RunParams) !Outcome {
     var total_usage = core_types.Usage{};
+    var last_round = core_types.Usage{};
     var rounds: usize = 0;
     var total_calls: usize = 0;
     var last_reply: []const u8 = "";
@@ -171,7 +175,7 @@ pub fn runTurn(p: RunParams) !Outcome {
 
     while (rounds < p.max_tool_rounds) : (rounds += 1) {
         if (p.cancel.load(.acquire)) {
-            return .{ .status = .cancelled, .reply = last_reply, .tool_rounds = rounds, .tool_calls = total_calls, .usage = total_usage };
+            return .{ .status = .cancelled, .reply = last_reply, .tool_rounds = rounds, .tool_calls = total_calls, .usage = total_usage, .last_round = last_round };
         }
 
         var collector = Collector{ .arena = p.arena, .callbacks = p.callbacks };
@@ -215,6 +219,7 @@ pub fn runTurn(p: RunParams) !Outcome {
         total_usage.output_tokens += collector.usage.output_tokens;
         total_usage.cache_read_tokens += collector.usage.cache_read_tokens;
         total_usage.cache_write_tokens += collector.usage.cache_write_tokens;
+        last_round = collector.usage;
 
         // Keep the text streamed before a failure so the caller can show (and
         // roll back) a partial reply instead of losing it.
@@ -225,7 +230,7 @@ pub fn runTurn(p: RunParams) !Outcome {
             // An interrupted stream is a cancellation, not a provider error:
             // the REPL prints "(interrupted)" and rolls the turn back.
             if (f.kind == .cancelled) {
-                return .{ .status = .cancelled, .reply = last_reply, .tool_rounds = rounds, .tool_calls = total_calls, .usage = total_usage };
+                return .{ .status = .cancelled, .reply = last_reply, .tool_rounds = rounds, .tool_calls = total_calls, .usage = total_usage, .last_round = last_round };
             }
             return .{
                 .status = .failed,
@@ -233,6 +238,7 @@ pub fn runTurn(p: RunParams) !Outcome {
                 .tool_rounds = rounds,
                 .tool_calls = total_calls,
                 .usage = total_usage,
+                .last_round = last_round,
                 .error_message = f.message,
             };
         }
@@ -240,7 +246,7 @@ pub fn runTurn(p: RunParams) !Outcome {
         if (collector.tool_calls.items.len == 0) {
             try p.history.append(p.arena, .{ .role = .assistant, .content = reply });
             if (p.callbacks.on_assistant_message) |cb| cb(p.callbacks.ctx, reply, null);
-            return .{ .status = .completed, .reply = reply, .tool_rounds = rounds + 1, .tool_calls = total_calls, .usage = total_usage };
+            return .{ .status = .completed, .reply = reply, .tool_rounds = rounds + 1, .tool_calls = total_calls, .usage = total_usage, .last_round = last_round };
         }
 
         // Assistant message with tool calls; remember calls for the wire.
@@ -278,7 +284,7 @@ pub fn runTurn(p: RunParams) !Outcome {
         var i: usize = 0;
         while (i < calls.len) {
             if (p.cancel.load(.acquire)) {
-                return .{ .status = .cancelled, .reply = last_reply, .tool_rounds = rounds, .tool_calls = total_calls, .usage = total_usage };
+                return .{ .status = .cancelled, .reply = last_reply, .tool_rounds = rounds, .tool_calls = total_calls, .usage = total_usage, .last_round = last_round };
             }
             if (tool_mod.isReadOnly(calls[i].name)) {
                 var j = i + 1;
@@ -366,6 +372,7 @@ pub fn runTurn(p: RunParams) !Outcome {
         .tool_rounds = rounds,
         .tool_calls = total_calls,
         .usage = total_usage,
+        .last_round = last_round,
         .error_message = "stopped: tool round limit reached",
     };
 }

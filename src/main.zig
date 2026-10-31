@@ -53,7 +53,7 @@ pub fn main(init: std.process.Init) !void {
     }
     // Headless one-shot: `ifnh ask "<prompt>"` or the `-p` shorthand
     // (`ifnh -p "<prompt>"`). Both land in the same driver, and the exit
-    // code is the driver's own (0/1/2/3/130), not the generic failure path.
+    // code is the driver's own (0/1/2/3/4/130), not the generic failure path.
     if (parsed.subcommand == .ask or (parsed.subcommand == .none and parsed.flags.prompt != null)) {
         var ask = cli_args.parseAsk(parsed.args) catch |err| {
             try printErr(io, arena, "error: bad arguments: {s}\n(run `ifnh help` for usage)\n", .{@errorName(err)});
@@ -506,7 +506,7 @@ const help_text =
     \\  --deny-all              deny every permission ask
     \\  --policy <ask|allow|deny>  default: ask (/dev/tty when stdin is a tty)
     \\  -p <prompt>             prompt text; '-' or omitted reads stdin
-    \\  (exit: 0 ok, 1 failed, 2 usage, 3 denied, 130 interrupted)
+    \\  (exit: 0 ok, 1 failed, 2 usage, 3 denied, 4 budget spent, 130 interrupted)
     \\
 ;
 
@@ -521,6 +521,7 @@ test {
     _ = @import("core/permissions/glob.zig");
     _ = @import("core/permissions/command_class.zig");
     _ = @import("core/permissions/engine.zig");
+    _ = @import("core/permissions/local_grants.zig");
     _ = @import("tools/tool.zig");
     _ = @import("tools/search.zig");
     _ = @import("providers/provider.zig");
@@ -529,6 +530,9 @@ test {
     _ = @import("providers/openai.zig");
     _ = @import("providers/anthropic.zig");
     _ = @import("providers/limits.zig");
+    _ = @import("providers/pricing.zig");
+    _ = @import("core/budget.zig");
+    _ = @import("core/diff.zig");
     _ = @import("core/instructions.zig");
     _ = @import("core/trace.zig");
     _ = @import("core/turn_cache.zig");
@@ -546,6 +550,8 @@ test {
     _ = @import("core/interrupt.zig");
     _ = @import("ui/style.zig");
     _ = @import("ui/secret.zig");
+    _ = @import("ui/footer.zig");
+    _ = @import("ui/line_editor.zig");
     _ = @import("providers/models.zig");
     _ = @import("providers/probe.zig");
     _ = @import("core/config/keys.zig");

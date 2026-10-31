@@ -30,7 +30,11 @@ const core_types = @import("../types.zig");
 const openai = @import("../../providers/openai.zig");
 const anthropic = @import("../../providers/anthropic.zig");
 const trace_mod = @import("../trace.zig");
+const fsutil = @import("../fsutil.zig");
 const turn_cache_mod = @import("../turn_cache.zig");
+const budget_mod = @import("../budget.zig");
+const local_grants = @import("../permissions/local_grants.zig");
+const pricing = @import("../../providers/pricing.zig");
 
 /// Severity of an informational status line. The caller picks the styling.
 pub const Level = enum { plain, warn, err };
@@ -73,7 +77,13 @@ pub const TurnOutcome = struct {
     status: agent_engine.Status = .completed,
     error_message: []const u8 = "",
     usage: core_types.Usage = .{},
+    /// Usage of the last provider request of the turn (context fill).
+    last_round: core_types.Usage = .{},
+    /// Dollar cost of `usage`, computed once per turn (C-06).
+    cost: pricing.Cost = .{},
     tool_calls: usize = 0,
+    /// The turn was refused before any request: `agents.budget_usd` is spent.
+    budget_exceeded: bool = false,
 };
 
 pub const SessionRuntime = struct {
@@ -103,6 +113,16 @@ pub const SessionRuntime = struct {
     /// Process environment overlaid with the user env file (D022; the real
     /// environment wins). Provider keys stored mid-session land here.
     environ: *std.process.Environ.Map,
+    /// Priced spend of this session so far; only ever grows (C-06). Seeded
+    /// from `usage.jsonl` when a session is resumed.
+    spent_usd: f64 = 0,
+    /// Token totals of the session so far (footer).
+    usage_total: core_types.Usage = .{},
+    /// Turns that reached the provider in this session so far (footer).
+    turns_run: u32 = 0,
+    /// Set when `.ifnh/permissions.local.json` exists but could not be used;
+    /// the caller prints it (the runtime never writes to the terminal).
+    local_grants_warning: ?[]const u8 = null,
 
     /// Build a runtime: load provider keys, create or open the session
     /// store, and discover skills, background executions and MCP servers.
@@ -152,6 +172,21 @@ pub const SessionRuntime = struct {
             .process_environ = process_environ,
             .environ = merged_env,
         };
+
+        switch (local_grants.load(arena, io, cwd)) {
+            .absent => {},
+            .grants => |g| local_grants.apply(&self.engine, g) catch {},
+            .invalid => |why| self.local_grants_warning = std.fmt.allocPrint(
+                arena,
+                "warning: ignoring {s} ({s}); fix or delete it. Project grants are not loaded and the file will not be overwritten.\n",
+                .{ local_grants.path, why },
+            ) catch null,
+        }
+
+        if (opts.resume_id != null) {
+            const raw = fsutil.readSmallFile(self.store.dir, io, arena, "usage.jsonl", 1024 * 1024) catch "";
+            self.spent_usd = budget_mod.summarize(arena, raw).cost_usd;
+        }
 
         // ---- skills catalog (K148/149) ----
         var skills_span = trace_mod.Span.begin(opts.trace, "startup.skills");
@@ -308,6 +343,15 @@ pub const SessionRuntime = struct {
         events: *const Events,
     ) !TurnOutcome {
         const io = self.io;
+        // Circuit breaker (C-06): checked before anything is built or sent, so
+        // a blocked turn spends nothing.
+        if (cfg.getOptionalF64("agents.budget_usd")) |limit| {
+            if (budget_mod.exceeded(self.spent_usd, limit)) {
+                var msg_buf: [160]u8 = undefined;
+                statusFmt(events, .plain, "{s}", .{budget_mod.blockedMessage(&msg_buf, self.spent_usd, limit)});
+                return .{ .budget_exceeded = true };
+            }
+        }
         if (pcfg.model.len == 0) {
             statusFmt(events, .plain, "no model configured — run /provider set <openai|anthropic> <model> [base_url] [key_env]\n", .{});
             return .{};
@@ -478,8 +522,16 @@ pub const SessionRuntime = struct {
             .status = outcome.status,
             .error_message = outcome.error_message,
             .usage = outcome.usage,
+            .last_round = outcome.last_round,
+            .cost = pricing.cost(pcfg.model, outcome.usage),
             .tool_calls = outcome.tool_calls,
         };
+        self.turns_run += 1;
+        self.spent_usd += result.cost.usd;
+        self.usage_total.input_tokens += outcome.usage.input_tokens;
+        self.usage_total.output_tokens += outcome.usage.output_tokens;
+        self.usage_total.cache_read_tokens += outcome.usage.cache_read_tokens;
+        self.usage_total.cache_write_tokens += outcome.usage.cache_write_tokens;
         switch (outcome.status) {
             .completed => {},
             .failed => {
@@ -490,14 +542,7 @@ pub const SessionRuntime = struct {
         }
         if (outcome.usage.input_tokens > 0 or outcome.usage.output_tokens > 0) {
             // Session usage log (S254-258).
-            const usage_line = try std.fmt.allocPrint(arena, "{{\"ts_ms\":{d},\"input_tokens\":{d},\"output_tokens\":{d},\"cache_read_tokens\":{d},\"cache_write_tokens\":{d},\"tool_calls\":{d}}}\n", .{
-                @as(i64, @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms))),
-                outcome.usage.input_tokens,
-                outcome.usage.output_tokens,
-                outcome.usage.cache_read_tokens,
-                outcome.usage.cache_write_tokens,
-                outcome.tool_calls,
-            });
+            const usage_line = try usageRecord(arena, @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms)), pcfg.model, outcome, result.cost);
             const f = self.store.dir.createFile(io, "usage.jsonl", .{ .truncate = false }) catch null;
             if (f) |file| {
                 defer file.close(io);
@@ -510,6 +555,23 @@ pub const SessionRuntime = struct {
         return result;
     }
 };
+
+/// One `usage.jsonl` line (newline-terminated).
+fn usageRecord(arena: std.mem.Allocator, ts_ms: i64, model: []const u8, outcome: agent_engine.Outcome, cost: pricing.Cost) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.print("{{\"ts_ms\":{d},\"input_tokens\":{d},\"output_tokens\":{d},\"cache_read_tokens\":{d},\"cache_write_tokens\":{d},\"tool_calls\":{d},\"model\":", .{
+        ts_ms,
+        outcome.usage.input_tokens,
+        outcome.usage.output_tokens,
+        outcome.usage.cache_read_tokens,
+        outcome.usage.cache_write_tokens,
+        outcome.tool_calls,
+    });
+    try std.json.Stringify.value(model, .{}, w);
+    try w.print(",\"cost_usd\":{d},\"priced\":{s}}}\n", .{ cost.usd, if (cost.priced) "true" else "false" });
+    return aw.written();
+}
 
 /// Bridges engine callbacks to `Events`, persisting what a resumed session
 /// needs to replay (tool calls, tool results, assistant messages).
@@ -596,6 +658,24 @@ pub const Gate = struct {
                     .none => {},
                 }
                 return .approved_session;
+            },
+            .approved_project => {
+                const kind: local_grants.Kind, const pattern: []const u8 = switch (req.grant) {
+                    .command_prefix => |p| .{ .command_prefix, p },
+                    .path_write => |p| .{ .path_write, p },
+                    .none => return .approved_once,
+                };
+                const engine = &self.rt.engine;
+                switch (kind) {
+                    .command_prefix => engine.commandPrefixGrant(pattern, .project) catch {},
+                    .path_write => engine.pathWriteGrant(pattern, .project) catch {},
+                }
+                local_grants.add(engine.alloc, self.rt.io, std.Io.Dir.cwd(), kind, pattern) catch |err| {
+                    var buf: [256]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&buf, "could not save {s} ({s}); '{s}' is allowed for this session only", .{ local_grants.path, @errorName(err), pattern }) catch "could not save project grant";
+                    self.events.on_notice(self.events.ctx, msg);
+                };
+                return .approved_project;
             },
             .denied => return .denied,
         }

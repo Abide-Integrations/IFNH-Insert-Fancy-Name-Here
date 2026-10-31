@@ -25,7 +25,9 @@ pub const Request = union(enum) {
     mcp: struct { server: []const u8, tool: []const u8 },
 };
 
-pub const GrantScope = enum { once, session, pattern };
+/// `project` grants come from `.ifnh/permissions.local.json` (C-05) and last
+/// as long as the session like `session` ones; the file carries them across.
+pub const GrantScope = enum { once, session, pattern, project };
 
 pub const GrantKind = enum { command_prefix, path_write_glob };
 
@@ -44,6 +46,8 @@ const protected_paths = [_][]const u8{
     ".ifnh/instructions/",
     ".ifnh/commands/",
     ".ifnh/skills/",
+    // The grants store: an agent must not be able to grant itself anything.
+    ".ifnh/permissions.local.json",
     "AGENTS.md",
     "CLAUDE.md",
 };

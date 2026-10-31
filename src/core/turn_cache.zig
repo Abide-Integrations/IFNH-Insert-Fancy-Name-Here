@@ -212,6 +212,9 @@ pub const TurnCache = struct {
     /// SHA-256 over the content of the policy-relevant files (G99/M0-T30),
     /// memoised on their stat fingerprint: unchanged stats reuse the hash,
     /// a touched file re-reads the content. Null when no policy file exists.
+    /// `.ifnh/permissions.local.json` is deliberately absent from the files
+    /// hashed here and in `contentHash`: it is a grants store written by the
+    /// user's own `p` answer, not policy (C-05).
     pub fn policyHash(self: *TurnCache, cwd: std.Io.Dir) ?[32]u8 {
         var h = Hasher.init();
         for ([_][]const u8{ ".ifnh/config.json", "AGENTS.md", "CLAUDE.md" }) |path| {
@@ -431,6 +434,35 @@ test "turn cache policy hash follows content and memoises on stats" {
     try touch(io, tmp.dir, "AGENTS.md", 7_000_000_000);
     const d = cache.policyHash(tmp.dir).?;
     try std.testing.expectEqualSlices(u8, &a, &d);
+}
+
+test "policy hash ignores the grants file but follows config and instructions" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var cache = TurnCache.init(io, arena_state.allocator());
+
+    try tmp.dir.createDirPath(io, ".ifnh/instructions");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ifnh/config.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ifnh/instructions/a.md", .data = "be kind" });
+    const base = cache.policyHash(tmp.dir).?;
+
+    // (i) Answering `p` writes this file mid-session; it is grants, not policy.
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ifnh/permissions.local.json", .data = "{\"version\":1,\"path_write\":[\"src/a.zig\"]}\n" });
+    try touch(io, tmp.dir, ".ifnh/permissions.local.json", 8_000_000_000);
+    try std.testing.expectEqualSlices(u8, &base, &cache.policyHash(tmp.dir).?);
+
+    // (ii) Real policy still moves the hash.
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ifnh/config.json", .data = "{\"git\":{}}" });
+    try touch(io, tmp.dir, ".ifnh/config.json", 9_000_000_000);
+    const edited_config = cache.policyHash(tmp.dir).?;
+    try std.testing.expect(!std.mem.eql(u8, &base, &edited_config));
+
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ifnh/instructions/a.md", .data = "be unkind" });
+    try touch(io, tmp.dir, ".ifnh/instructions/a.md", 10_000_000_000);
+    try std.testing.expect(!std.mem.eql(u8, &edited_config, &cache.policyHash(tmp.dir).?));
 }
 
 test "stat fingerprint distinguishes size, mtime and presence" {

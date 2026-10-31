@@ -14,6 +14,7 @@ const engine_mod = @import("../core/permissions/engine.zig");
 const journal_mod = @import("../core/journal.zig");
 const globm = @import("../core/permissions/glob.zig");
 const search = @import("search.zig");
+const diff_mod = @import("../core/diff.zig");
 
 pub const max_tool_output_bytes: usize = 64 * 1024;
 pub const max_file_size_bytes: usize = 1024 * 1024;
@@ -41,9 +42,13 @@ pub const ApprovalRequest = struct {
     detail: []const u8, // command line or path
     /// What a session-scope approval should grant.
     grant: Grant = .none,
+    /// Unified diff of the change being approved (write/edit); "" otherwise.
+    preview: []const u8 = "",
 };
 
-pub const ApprovalResponse = enum { approved_once, approved_session, denied };
+/// `approved_project` is "always for this project": the grant is also saved
+/// to `.ifnh/permissions.local.json` (C-05).
+pub const ApprovalResponse = enum { approved_once, approved_session, approved_project, denied };
 
 pub const ToolContext = struct {
     io: std.Io,
@@ -90,9 +95,13 @@ pub const ToolContext = struct {
     tool_name: []const u8 = "",
 
     pub fn requestApproval(self: *ToolContext, title: []const u8, detail: []const u8, grant: ApprovalRequest.Grant) bool {
-        const resp = self.approval_fn(self.approval_ctx, .{ .tool = self.tool_name, .title = title, .detail = detail, .grant = grant });
+        return self.requestApprovalWithPreview(title, detail, grant, "");
+    }
+
+    pub fn requestApprovalWithPreview(self: *ToolContext, title: []const u8, detail: []const u8, grant: ApprovalRequest.Grant, preview: []const u8) bool {
+        const resp = self.approval_fn(self.approval_ctx, .{ .tool = self.tool_name, .title = title, .detail = detail, .grant = grant, .preview = preview });
         switch (resp) {
-            .approved_once, .approved_session => return true,
+            .approved_once, .approved_session, .approved_project => return true,
             .denied => return false,
         }
     }
@@ -872,21 +881,49 @@ fn grepFile(ctx: *ToolContext, rel: []const u8, re: *search.Regex, limits: *Walk
 
 // ---------------------------------------------------------------- edit / write
 
-fn prepareWrite(ctx: *ToolContext, path: []const u8, after: []const u8) ?ToolResult {
+/// What a write-class tool is about to do, for the approval preview.
+const Change = union(enum) {
+    write: []const u8,
+    edit: struct { old: []const u8, new: []const u8 },
+};
+
+fn prepareWrite(ctx: *ToolContext, path: []const u8, change: Change) ?ToolResult {
     switch (ctx.engine.decidePath(.write, path)) {
         .allow => {},
         .ask => {
-            if (!ctx.requestApproval("write file", path, .{ .path_write = path })) return deniedResult(ctx.arena, "write '{s}' (declined)", .{path});
+            const preview = previewFor(ctx, path, change);
+            if (!ctx.requestApprovalWithPreview("write file", path, .{ .path_write = path }, preview)) return deniedResult(ctx.arena, "write '{s}' (declined)", .{path});
         },
         .deny => return deniedResult(ctx.arena, "write '{s}' (protected path)", .{path}),
     }
-    _ = after;
     return null;
+}
+
+/// Unified diff shown at the approval prompt. Best effort: anything that
+/// would make the tool itself fail (unreadable file, ambiguous edit) yields a
+/// short note or nothing, and the tool reports the real error afterwards.
+fn previewFor(ctx: *ToolContext, path: []const u8, change: Change) []const u8 {
+    const cap = ctx.max_file_read_bytes;
+    const before = ctx.workspace.readFileAlloc(ctx.io, path, ctx.arena, .limited(cap)) catch |err| switch (err) {
+        error.FileNotFound => @as([]const u8, ""),
+        error.StreamTooLong => return "(file too large to preview)",
+        else => return "",
+    };
+    const after = switch (change) {
+        .write => |content| content,
+        .edit => |e| blk: {
+            const first = std.mem.indexOf(u8, before, e.old) orelse return "";
+            if (std.mem.indexOf(u8, before[first + 1 ..], e.old) != null) return "";
+            break :blk std.fmt.allocPrint(ctx.arena, "{s}{s}{s}", .{ before[0..first], e.new, before[first + e.old.len ..] }) catch return "";
+        },
+    };
+    if (after.len > cap) return "(change too large to preview)";
+    return diff_mod.unifiedDiff(ctx.arena, path, before, after, .{}) catch "";
 }
 
 fn toolEdit(path: []const u8, old_string: []const u8, new_string: []const u8, ctx: *ToolContext) ToolResult {
     if (old_string.len == 0) return errResult(ctx.arena, "edit: old_string must not be empty", .{});
-    if (prepareWrite(ctx, path, new_string)) |r| return r;
+    if (prepareWrite(ctx, path, .{ .edit = .{ .old = old_string, .new = new_string } })) |r| return r;
 
     const before = ctx.workspace.readFileAlloc(ctx.io, path, ctx.arena, .limited(max_file_size_bytes)) catch
         return errResult(ctx.arena, "edit: cannot read '{s}'", .{path});
@@ -908,7 +945,7 @@ fn toolEdit(path: []const u8, old_string: []const u8, new_string: []const u8, ct
 }
 
 fn toolWrite(path: []const u8, content: []const u8, ctx: *ToolContext) ToolResult {
-    if (prepareWrite(ctx, path, content)) |r| return r;
+    if (prepareWrite(ctx, path, .{ .write = content })) |r| return r;
 
     const existing = ctx.workspace.readFileAlloc(ctx.io, path, ctx.arena, .limited(max_file_size_bytes)) catch null;
     if (existing) |before| {
@@ -1174,6 +1211,13 @@ fn toolBash(command: []const u8, background: bool, timeout_s: u32, ctx: *ToolCon
     return runCaptured(&local, &argv, "");
 }
 
+/// Run `command` under `/bin/sh -c` with the bash tool's capture, cancel and
+/// timeout handling, without any permission check. For the human at the
+/// keyboard (the REPL's `!cmd`), never for model-issued commands.
+pub fn runShell(ctx: *ToolContext, command: []const u8) ToolResult {
+    return runCaptured(ctx, &.{ "/bin/sh", "-c", command }, "");
+}
+
 /// "git commit -m x" -> "git commit"; "ls" -> "ls".
 fn commandPrefixOf(command: []const u8) []const u8 {
     var it = std.mem.tokenizeAny(u8, command, " \t");
@@ -1301,6 +1345,54 @@ test "edit and write with journal integration" {
     const stale = execute("edit", "{\"path\":\"code.zig\",\"old_string\":\"const x = 1;\",\"new_string\":\"zz\"}", &ctx);
     try std.testing.expectEqual(Status.failed, stale.status);
     try std.testing.expect(std.mem.indexOf(u8, stale.output, "not found") != null);
+}
+
+test "write and edit approvals carry a diff preview, bash does not" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "code.zig", .data = "const x = 1;\nconst y = 2;\n" });
+
+    const Seen = struct {
+        preview: []const u8 = "",
+        calls: usize = 0,
+        fn approve(ctx: *anyopaque, req: ApprovalRequest) ApprovalResponse {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.preview = req.preview;
+            self.calls += 1;
+            return .denied;
+        }
+    };
+    var seen = Seen{};
+    var e = engine_mod.Engine.init(std.testing.allocator, .ask);
+    defer e.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ctx = testCtx(arena_state.allocator(), io, tmp.dir, &e);
+    ctx.approval_ctx = &seen;
+    ctx.approval_fn = Seen.approve;
+
+    // write over an existing file: only the changed line differs.
+    _ = execute("write", "{\"path\":\"code.zig\",\"content\":\"const x = 1;\\nconst y = 3;\\n\"}", &ctx);
+    try std.testing.expectEqualStrings("--- a/code.zig\n+++ b/code.zig\n@@ -1,2 +1,2 @@\n const x = 1;\n-const y = 2;\n+const y = 3;\n", seen.preview);
+
+    // write of a new file: all additions.
+    _ = execute("write", "{\"path\":\"new.txt\",\"content\":\"hi\\n\"}", &ctx);
+    try std.testing.expectEqualStrings("--- a/new.txt\n+++ b/new.txt\n@@ -0,0 +1,1 @@\n+hi\n", seen.preview);
+
+    // edit: diff of old vs new file content.
+    _ = execute("edit", "{\"path\":\"code.zig\",\"old_string\":\"x = 1\",\"new_string\":\"x = 9\"}", &ctx);
+    try std.testing.expect(std.mem.indexOf(u8, seen.preview, "-const x = 1;\n+const x = 9;\n") != null);
+
+    // An ambiguous edit previews nothing (the tool will refuse it itself).
+    try tmp.dir.writeFile(io, .{ .sub_path = "dup.txt", .data = "aa aa" });
+    _ = execute("edit", "{\"path\":\"dup.txt\",\"old_string\":\"aa\",\"new_string\":\"bb\"}", &ctx);
+    try std.testing.expectEqualStrings("", seen.preview);
+
+    // Other approval sites leave the preview empty.
+    _ = execute("bash", "{\"command\":\"mkdir newdir\"}", &ctx);
+    try std.testing.expectEqualStrings("", seen.preview);
+    try std.testing.expectEqual(@as(usize, 5), seen.calls);
 }
 
 test "write denied on protected path without approval escape" {

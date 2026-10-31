@@ -25,17 +25,26 @@ def text_stream(text):
     )
 
 
-def tool_stream():
-    # A state-changing command so the permission engine asks; `touch` actually
-    # runs in the workspace, so the shell check can verify the tool ran.
-    args = json.dumps({"command": "touch " + TOOL_FILE})
+# Scripted first-round tool calls per mode. `bash touch` is state-changing, so
+# the permission engine asks; it really runs in the workspace. `write`/`edit`
+# exercise the approval diff preview and project grants (C-05).
+TOOL_CALLS = {
+    "tool": ("bash", {"command": "touch " + TOOL_FILE}),
+    "write": ("write", {"path": "smoke.txt", "content": "alpha\nbeta\ngamma\n"}),
+    "edit": ("edit", {"path": "smoke.txt", "old_string": "beta", "new_string": "BETA"}),
+}
+
+
+def tool_stream(mode):
+    name, call_args = TOOL_CALLS[mode]
+    args = json.dumps(call_args)
     return (
         chunk([{"index": 0, "delta": {"role": "assistant", "content": ""}}])
         + chunk([{"index": 0, "delta": {"tool_calls": [{
             "index": 0,
             "id": "call_fake_1",
             "type": "function",
-            "function": {"name": "bash", "arguments": args},
+            "function": {"name": name, "arguments": args},
         }]}}])
         + chunk([{"index": 0, "delta": {}, "finish_reason": "tool_calls"}])
         + chunk([], usage=USAGE)
@@ -76,8 +85,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         body = text_stream(TEXT_REPLY)
-        if self.server.mode == "tool" and not has_tool_result(raw):
-            body = tool_stream()
+        if self.server.mode in TOOL_CALLS and not has_tool_result(raw):
+            body = tool_stream(self.server.mode)
         self.wfile.write(body.encode())
 
     def log_message(self, *args):
@@ -89,7 +98,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=0)
     ap.add_argument("--port-file")
-    ap.add_argument("--mode", choices=("text", "tool", "error"), default="text")
+    ap.add_argument("--mode", choices=("text", "error") + tuple(TOOL_CALLS), default="text")
     ap.add_argument("--delay", type=float, default=0.03)
     a = ap.parse_args()
     srv = HTTPServer(("127.0.0.1", a.port), Handler)
