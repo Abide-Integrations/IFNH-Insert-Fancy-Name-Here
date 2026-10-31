@@ -201,11 +201,17 @@ fn runChild(
 
     // Worktree isolation (D009): the child operates inside its own tree.
     var child_workspace = host.workspace;
+    // True only when the workspace really switched to the worktree. A worktree
+    // that was requested but cannot be opened must not silently degrade to the
+    // parent tree (that would write the parent's files with no journal).
+    var switched = false;
     var wt = WorktreeInfo{};
     if (isolation_worktree) {
         wt = prepareWorktree(host, parent_arena, label);
         if (wt.path) |p| {
-            child_workspace = std.Io.Dir.openDirAbsolute(host.io, p, .{ .access_sub_paths = true }) catch host.workspace;
+            child_workspace = std.Io.Dir.openDirAbsolute(host.io, p, .{ .access_sub_paths = true }) catch |err|
+                return fail(parent_arena, "agent: worktree isolation requested but the worktree could not be opened ({s})", .{@errorName(err)});
+            switched = true;
         }
     }
 
@@ -231,8 +237,9 @@ fn runChild(
         .engine = &child_engine,
         // The shared journal is rooted at the parent workspace; journaling a
         // worktree edit through it would write the parent's tree instead.
-        // Isolated children use the direct-write path (as in the worktree test).
-        .journal = if (wt.path == null) host.journal else null,
+        // Isolated children use the direct-write path (as in the worktree test),
+        // keyed on whether the workspace actually switched, not on the intent.
+        .journal = if (switched) null else host.journal,
         .max_file_read_bytes = 256 * 1024,
         .timeout_s = host.timeout_tool_s,
         .use_external_tools = host.use_external_tools,

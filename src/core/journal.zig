@@ -63,7 +63,10 @@ fn sha256Hex(arena: std.mem.Allocator, data: []const u8) ![]const u8 {
     return hex;
 }
 
-fn validateRelPath(path: []const u8) !void {
+/// Reject paths that escape the workspace root: empty, absolute, any `..`
+/// component (or substring), or NUL. Shared with the journal-less write path
+/// in `tools/tool.zig` so both mutate through one validator.
+pub fn validateRelPath(path: []const u8) !void {
     if (path.len == 0) return error.PathUnsafe;
     if (path[0] == '/') return error.PathUnsafe;
     if (std.mem.indexOf(u8, path, "..") != null) return error.PathUnsafe;
