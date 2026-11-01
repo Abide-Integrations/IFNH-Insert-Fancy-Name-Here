@@ -165,7 +165,7 @@ is not a terminal or `TERM` is `dumb`: then nothing at all is written.
 | `/help` | command list |
 | `/model <name>` | switch model for this session |
 | `/config` | show resolved configuration |
-| `/context` | show assembled instructions + sources |
+| `/context` | context x-ray: bytes and estimated tokens per source (`--json` for machines) |
 | `/undo` / `/redo` | step the file-mutation journal (works across restarts) |
 | `/diff` | git diff of the working tree |
 | `/plan <title>` | create a plan artifact in `.ifnh/plans/` |

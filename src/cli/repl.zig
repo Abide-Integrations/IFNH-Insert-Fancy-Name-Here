@@ -947,7 +947,7 @@ fn handleCommand(
             \\  /quit                 exit ifnh
             \\  /model <name>         switch model for this session
             \\  /config               show resolved configuration
-            \\  /context              show assembled system prompt sources
+            \\  /context [--json]     context x-ray: bytes per source (est. tokens)
             \\  /undo                 undo last file-mutation group
             \\  /redo                 redo
             \\  /diff                 show git diff of the working tree
@@ -987,8 +987,13 @@ fn handleCommand(
         out(io, "permissions.default_mode: {s}\n", .{cfg.getString("permissions.default_mode", "")}) catch {};
         out(io, "agents.max_depth: {d}\n", .{cfg.getU32("agents.max_depth", 1)}) catch {};
     } else if (std.mem.eql(u8, cmd, "context")) {
-        out(io, "assembled context ({d} sources):\n", .{instr.sources.len}) catch {};
-        for (instr.sources) |s| out(io, "  [{s}] {s}\n", .{ s.layer, s.path }) catch {};
+        // Context x-ray (D-08): per-source bytes plus a labelled estimate.
+        const as_json = std.mem.indexOf(u8, rest, "--json") != null;
+        const report = instructions_mod.contextReport(arena, instr, as_json) catch {
+            out(io, "could not build the context report\n", .{}) catch {};
+            return .none;
+        };
+        out(io, "{s}\n", .{report}) catch {};
     } else if (std.mem.eql(u8, cmd, "undo")) {
         if (rt.journal.undo() catch null) |gid| {
             out(io, "undone group {d}\n", .{gid}) catch {};

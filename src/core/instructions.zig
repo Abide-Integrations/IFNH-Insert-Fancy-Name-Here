@@ -13,7 +13,10 @@ pub const max_instruction_bytes: usize = 128 * 1024;
 
 pub const Source = struct {
     path: []const u8,
-    layer: []const u8, // "builtin" | "repo" | "project"
+    layer: []const u8, // "builtin" | "repo" | "project" | "nested"
+    /// Bytes this source contributed to `Assembled.text`, header included
+    /// (D-08 context x-ray). Sources sum to the total minus `other`.
+    bytes: usize = 0,
 };
 
 pub const Assembled = struct {
@@ -42,16 +45,21 @@ pub fn assemble(
     var sources: std.ArrayListUnmanaged(Source) = .empty;
 
     try parts.appendSlice(arena, builtin);
-    try sources.append(arena, .{ .path = "builtin", .layer = "builtin" });
+    try sources.append(arena, .{ .path = "builtin", .layer = "builtin", .bytes = parts.items.len });
 
     const repo_files = [_][]const u8{ "AGENTS.md", "CLAUDE.md" };
     for (repo_files) |f| {
         if (loadBounded(workspace, io, arena, f)) |content| {
+            const start = parts.items.len;
             try parts.appendSlice(arena, "\n\n# Instructions from ");
             try parts.appendSlice(arena, f);
             try parts.appendSlice(arena, "\n\n");
             try parts.appendSlice(arena, content);
-            try sources.append(arena, .{ .path = try arena.dupe(u8, f), .layer = "repo" });
+            try sources.append(arena, .{
+                .path = try arena.dupe(u8, f),
+                .layer = "repo",
+                .bytes = parts.items.len - start,
+            });
         } else |_| {}
     }
 
@@ -75,11 +83,16 @@ pub fn assemble(
     for (names.items) |name| {
         const rel = std.fmt.allocPrint(arena, ".ifnh/instructions/{s}", .{name}) catch continue;
         if (loadBounded(workspace, io, arena, rel)) |content| {
+            const start = parts.items.len;
             try parts.appendSlice(arena, "\n\n# Project instruction: ");
             try parts.appendSlice(arena, rel);
             try parts.appendSlice(arena, "\n\n");
             try parts.appendSlice(arena, content);
-            try sources.append(arena, .{ .path = rel, .layer = "project" });
+            try sources.append(arena, .{
+                .path = rel,
+                .layer = "project",
+                .bytes = parts.items.len - start,
+            });
         } else |_| {}
     }
 
@@ -102,11 +115,16 @@ pub fn assemble(
         seen_dirs.append(arena, dir) catch continue;
         const agents_path = std.fmt.allocPrint(arena, "{s}/AGENTS.md", .{dir}) catch continue;
         if (loadBounded(workspace, io, arena, agents_path)) |content| {
+            const start = parts.items.len;
             try parts.appendSlice(arena, "\n\n# Instructions from ");
             try parts.appendSlice(arena, agents_path);
             try parts.appendSlice(arena, "\n\n");
             try parts.appendSlice(arena, content);
-            try sources.append(arena, .{ .path = agents_path, .layer = "nested" });
+            try sources.append(arena, .{
+                .path = agents_path,
+                .layer = "nested",
+                .bytes = parts.items.len - start,
+            });
         } else |_| {}
     }
 
@@ -121,6 +139,47 @@ pub fn appendFragment(arena: std.mem.Allocator, base: Assembled, fragment: []con
     if (extra.len == 0) return base;
     const text = try std.fmt.allocPrint(arena, "{s}\n\n{s}", .{ base.text, extra });
     return .{ .text = text, .stable_len = base.stable_len, .sources = base.sources };
+}
+
+/// Rough token estimate for a byte count (D-08): ~4 bytes per token.
+/// Labelled "est." wherever it is shown; no tokenizer is bundled.
+pub fn estimateTokens(bytes: usize) usize {
+    return (bytes + 3) / 4;
+}
+
+/// `/context` report (D-08): per-source byte counts plus an estimate, as
+/// text or as JSON. Everything the caller appended after assembly (skills
+/// catalog, profile fragment, attachments) shows up as `other`.
+pub fn contextReport(arena: std.mem.Allocator, assembled: Assembled, json: bool) ![]u8 {
+    const total = assembled.text.len;
+    var attributed: usize = 0;
+    for (assembled.sources) |s| attributed += s.bytes;
+    const other = total - @min(total, attributed);
+
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    if (json) {
+        try w.print("{{\"total_bytes\":{d},\"estimated_tokens\":{d},\"sources\":[", .{ total, estimateTokens(total) });
+        for (assembled.sources, 0..) |s, i| {
+            if (i > 0) try w.writeAll(",");
+            try w.writeAll("{\"path\":");
+            try std.json.Stringify.value(s.path, .{}, w);
+            try w.writeAll(",\"layer\":");
+            try std.json.Stringify.value(s.layer, .{}, w);
+            try w.print(",\"bytes\":{d},\"estimated_tokens\":{d}}}", .{ s.bytes, estimateTokens(s.bytes) });
+        }
+        try w.print("],\"other_bytes\":{d},\"other_estimated_tokens\":{d}}}", .{ other, estimateTokens(other) });
+        return aw.written();
+    }
+
+    try w.print("context: {d} bytes (~{d} tokens, est.)\n", .{ total, estimateTokens(total) });
+    for (assembled.sources) |s| {
+        try w.print("  {d:>8} B  ~{d:>6} tok  [{s}] {s}\n", .{ s.bytes, estimateTokens(s.bytes), s.layer, s.path });
+    }
+    if (other > 0) {
+        try w.print("  {d:>8} B  ~{d:>6} tok  [other] appended after assembly (skills, fragments)\n", .{ other, estimateTokens(other) });
+    }
+    return aw.written();
 }
 
 /// Extract the directories referenced by tool calls in the history
@@ -234,4 +293,65 @@ test "appendFragment keeps the stable prefix and trims the tail" {
     const with_prompt = try appendFragment(arena, base, "be terse  \n");
     try std.testing.expectEqualStrings("builtin\n\nbe terse", with_prompt.text);
     try std.testing.expectEqual(@as(usize, 7), with_prompt.stable_len);
+}
+
+test "context report attributes bytes to every source" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = "repo rules" });
+    try tmp.dir.createDirPath(io, ".ifnh/instructions");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ifnh/instructions/a.md", .data = "proj a" });
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const assembled = try assemble(tmp.dir, io, a, "builtin prompt", &.{});
+    var attributed: usize = 0;
+    for (assembled.sources) |s| {
+        try std.testing.expect(s.bytes > 0);
+        attributed += s.bytes;
+    }
+    // Sources account for every byte of the assembly.
+    try std.testing.expectEqual(assembled.text.len, attributed);
+
+    const text = try contextReport(a, assembled, false);
+    try std.testing.expect(std.mem.indexOf(u8, text, "est.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "[builtin] builtin") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "[repo] AGENTS.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "[project] .ifnh/instructions/a.md") != null);
+    // Nothing was appended after assembly.
+    try std.testing.expect(std.mem.indexOf(u8, text, "[other]") == null);
+
+    const json = try contextReport(a, assembled, true);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
+    try std.testing.expect(parsed == .object);
+    const total = parsed.object.get("total_bytes").?;
+    try std.testing.expectEqual(@as(i64, @intCast(assembled.text.len)), total.integer);
+    try std.testing.expectEqual(@as(i64, @intCast(estimateTokens(assembled.text.len))), parsed.object.get("estimated_tokens").?.integer);
+    try std.testing.expectEqual(@as(usize, 3), parsed.object.get("sources").?.array.items.len);
+    try std.testing.expectEqual(@as(i64, 0), parsed.object.get("other_bytes").?.integer);
+}
+
+test "context report counts bytes appended after assembly as other" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const assembled = Assembled{
+        .text = "builtin" ++ "\n\nskills catalog",
+        .stable_len = 7,
+        .sources = try a.dupe(Source, &.{.{ .path = "builtin", .layer = "builtin", .bytes = 7 }}),
+    };
+
+    const report = try contextReport(a, assembled, true);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, report, .{});
+    const total = parsed.object.get("total_bytes").?.integer;
+    const other = parsed.object.get("other_bytes").?.integer;
+    try std.testing.expectEqual(total, parsed.object.get("sources").?.array.items[0].object.get("bytes").?.integer + other);
+    try std.testing.expectEqual(@as(i64, @intCast(assembled.text.len - 7)), other);
+
+    const plain = try contextReport(a, assembled, false);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "[other]") != null);
 }
