@@ -143,6 +143,20 @@ pub const ToolResult = struct {
 };
 ```
 
+Builtin tools live in one static `registry` table (D-01): `name`,
+`description`, `parameters_json`, `executor_kind` and `call_fn`. `find`
+(dispatch), `specs` (advertisement, derived at comptime) and `isReadOnly`
+(from `executor_kind`) all read that table. Synthetic names are only for
+arguments the model should see; there is no second name list.
+
+Data-defined tools (D-02, ADR 0004) are loaded at session start from
+`<workspace>/.ifnh/tools/*.json` by `src/tools/custom.zig`
+(`{name, description, parameters, command, permission}`) and appended to the
+advertised specs after the builtins. `{arg}` placeholders are substituted with
+shell single-quoting, and the rendered command is classified and approved
+exactly like a `bash` call before running through the same captured path.
+`tools.external: false` disables loading.
+
 M0 tool kernel (D037): `read`, `glob`, `grep`, `edit` (exact old/new replacement with context hash check), `write` (create/replace), `bash`, `git`. `edit`/`write`/`bash` produce `JournalGroup` entries. Tools decode their JSON input with `std.json`, validate, execute under the caller's checked paths, and return bounded output (64 KiB cap, UTF-8-safe, marker).
 
 ### 3.3 PermissionEngine (`src/core/permissions/engine.zig`)
@@ -263,6 +277,7 @@ All of it optional — zero-config runs on env credentials + defaults (D048). `I
 ├── instructions/        # committed, *.md, loaded in precedence
 ├── skills/              # committed, SKILL.md dirs (M1)
 ├── commands/            # committed, *.md slash commands (M1)
+├── tools/               # committed, *.json custom tool definitions (D-02)
 ├── lifecycle/           # committed, *.json lifecycles (M2)
 ├── tool-notes/          # committed, per-CLI instruction notes (M1)
 ├── plans/               # committed-optional, plan artifacts

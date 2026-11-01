@@ -65,7 +65,7 @@
 
 | ID | Task | Depends | Status | Notes |
 |---|---|---|---|---|
-| M0-T23 | `tools/tool.zig`: Tool contract + registry + JSON-schema subset + parallel read-only batches | M0-T04 | `[x]` | 7 specs + dispatch; parallel batches land with M1 subagents |
+| M0-T23 | `tools/tool.zig`: Tool contract + registry + JSON-schema subset + parallel read-only batches | M0-T04 | `[x]` | 7 specs + dispatch; parallel batches land with M1 subagents. 2026-11-01 (D-01/D-02, awaiting owner verification): one static `registry` table now backs `find`/`specs`/`isReadOnly`; data-defined `.ifnh/tools/*.json` tools load at session start (`tools/custom.zig`, ADR 0004) |
 | M0-T24 | `read`, `glob`, `grep` tools (bounded output, 64 KiB cap, UTF-8-safe truncation marker) | M0-T23 | `[x]` | literal-substring grep (no regex, per fx) |
 | M0-T25 | `edit` (exact old/new, context-hash staleness check) + `write` tools, journal-integrated | M0-T14, M0-T23 | `[x]` | ambiguity + staleness refused; journal groups |
 | M0-T26 | `bash` tool: argv vs `$SHELL -c` classification, lexer, destructive lexicon, process groups, output caps, managed timeout | M0-T23 | `[x]` | 120s timeout; classifier tests; background registry M1 |
