@@ -15,6 +15,12 @@ const journal_mod = @import("../core/journal.zig");
 const globm = @import("../core/permissions/glob.zig");
 const search = @import("search.zig");
 const diff_mod = @import("../core/diff.zig");
+const custom_mod = @import("custom.zig");
+
+/// Data-defined tool from `<workspace>/.ifnh/tools/*.json` (D-02, ADR 0004).
+pub const CustomTool = custom_mod.CustomTool;
+/// The whole loaded custom-tool set, warnings included.
+pub const CustomToolSet = custom_mod.Set;
 
 pub const max_tool_output_bytes: usize = 64 * 1024;
 pub const max_file_size_bytes: usize = 1024 * 1024;
@@ -23,10 +29,13 @@ pub const Status = enum { ok, denied, failed, timeout };
 
 /// Tools that only read the workspace and never prompt for approval. These
 /// may run concurrently as one batch (DECISIONS #58 leadingParallelGroup).
+/// Backed by `registry`'s `executor_kind`, so the answer is derived, not a
+/// second list. Custom tools (D-02) are never read-only whatever their
+/// advisory `permission` class says: they run a shell command, so they are
+/// always gated and always dispatched sequentially.
 pub fn isReadOnly(name: []const u8) bool {
-    return std.mem.eql(u8, name, "read") or
-        std.mem.eql(u8, name, "glob") or
-        std.mem.eql(u8, name, "grep");
+    const tool = find(name) orelse return false;
+    return tool.executor_kind == .read;
 }
 
 pub const ApprovalRequest = struct {
@@ -90,6 +99,9 @@ pub const ToolContext = struct {
     use_external_tools: ?bool = null,
     /// Per-context view of the process-global `rg`/`fd` probe.
     external_cache: search.ExternalCache = .{},
+    /// Custom tools loaded from `.ifnh/tools` for this run (D-02). Empty
+    /// disables them; every other tool path is unaffected.
+    custom: []const CustomTool = &.{},
     /// Name of the tool currently executing (set by `execute`, read by
     /// approval prompts so they can name it).
     tool_name: []const u8 = "",
@@ -124,51 +136,116 @@ pub const AgentSpawnResult = struct {
 
 pub const Spec = core_types.ToolSpec;
 
-/// Tool specs advertised to the model (order = advertisement order).
-pub const specs = [_]Spec{
+/// What a tool does to the workspace; drives read-only batching and
+/// advertisement metadata (DESIGN §3.2).
+pub const ExecutorKind = enum { read, write, exec, git };
+
+/// Deviation from DESIGN §3.2: the sketched signature
+/// `call_fn(ctx, alloc, io, input) anyerror!ToolResult` predates this shell, and
+/// the allocator, the `std.Io` and the raw argument JSON already reach every
+/// executor through `ToolContext`/`Args`, so folding them in keeps one call
+/// shape without rewriting fourteen executors for an error union none of them
+/// uses.
+pub const CallFn = *const fn (ctx: *ToolContext, args: *const Args) ToolResult;
+
+/// One dispatchable tool. `parameters_json` is the JSON Schema string sent to
+/// the model; `call_fn` owns all argument validation for its tool.
+pub const Tool = struct {
+    name: []const u8,
+    description: []const u8,
+    parameters_json: []const u8,
+    executor_kind: ExecutorKind,
+    call_fn: CallFn,
+};
+
+/// Every builtin tool, in advertisement order. Dispatch (`find`), the model's
+/// tool list (`specs`) and read-only classification (`isReadOnly`) all read
+/// this one table, so they cannot drift apart.
+pub const registry = [_]Tool{
     .{ .name = "read", .description = "Read a text file with line numbers. Supports offset/limit for paging.", .parameters_json =
     \\{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","description":"0-based start line"},"limit":{"type":"integer"}},"required":["path"]}
-    },
+    , .executor_kind = .read, .call_fn = execRead },
     .{ .name = "glob", .description = "List files matching a glob pattern (** crosses directories, * stays within one). Respects .gitignore and skips hidden entries.", .parameters_json =
     \\{"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"]}
-    },
+    , .executor_kind = .read, .call_fn = execGlob },
     .{ .name = "grep", .description = "Regex search across text files (literals, ., *, +, ?, [...], ^, $). Respects .gitignore; skips hidden and binary files.", .parameters_json =
     \\{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string","description":"subdirectory to search"}},"required":["pattern"]}
-    },
+    , .executor_kind = .read, .call_fn = execGrep },
     .{ .name = "edit", .description = "Replace exactly one occurrence of old_string with new_string in a file. Refuses if the text appears zero or multiple times.", .parameters_json =
     \\{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"}},"required":["path","old_string","new_string"]}
-    },
+    , .executor_kind = .write, .call_fn = execEdit },
     .{ .name = "write", .description = "Create a file or overwrite it entirely. Prefer edit for existing files.", .parameters_json =
     \\{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}
-    },
+    , .executor_kind = .write, .call_fn = execWrite },
     .{ .name = "bash", .description = "Run a shell command with the user's shell. Read-only commands run freely; anything that changes state requires approval. Use background for long-running commands and poll them with the exec tool.", .parameters_json =
     \\{"type":"object","properties":{"command":{"type":"string"},"background":{"type":"boolean","description":"start detached and return an execution id"},"timeout_s":{"type":"integer","description":"wall-clock limit in seconds, capped by the session limit"}},"required":["command"]}
-    },
+    , .executor_kind = .exec, .call_fn = execBash },
     .{ .name = "skill", .description = "Load a named skill's full instructions from the installed skills catalog.", .parameters_json =
     \\{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}
-    },
+    , .executor_kind = .exec, .call_fn = execSkill },
     .{ .name = "mcp_list", .description = "List configured MCP servers and their tools.", .parameters_json =
     \\{"type":"object","properties":{}}
-    },
+    , .executor_kind = .exec, .call_fn = execMcpList },
     .{ .name = "mcp_describe", .description = "Show an MCP tool's description and input schema. Use it before mcp_call when the arguments are unclear.", .parameters_json =
     \\{"type":"object","properties":{"server":{"type":"string"},"tool":{"type":"string"}},"required":["server","tool"]}
-    },
+    , .executor_kind = .exec, .call_fn = execMcpDescribe },
     .{ .name = "mcp_call", .description = "Call an MCP server tool. Server/tool must be permitted; calls require approval unless allowlisted.", .parameters_json =
     \\{"type":"object","properties":{"server":{"type":"string"},"tool":{"type":"string"},"arguments":{"type":"object"}},"required":["server","tool"]}
-    },
+    , .executor_kind = .exec, .call_fn = execMcpCall },
     .{ .name = "agent", .description = "Delegate a self-contained task to a child agent. Roles: research (read-only), implement (may edit), review (read-only findings). The child works independently and returns a summary; its full report is stored under .ifnh/reports/.", .parameters_json =
     \\{"type":"object","properties":{"task":{"type":"string"},"role":{"type":"string","enum":["research","implement","review"]},"model":{"type":"string"}},"required":["task","role"]}
-    },
+    , .executor_kind = .exec, .call_fn = execAgent },
     .{ .name = "exec", .description = "Manage background executions: status/output/stop/list by execution id.", .parameters_json =
     \\{"type":"object","properties":{"action":{"type":"string","enum":["status","output","stop","list"]},"id":{"type":"integer"}},"required":["action"]}
-    },
+    , .executor_kind = .exec, .call_fn = execExec },
     .{ .name = "read_tool_result", .description = "Read a stored oversized tool output artifact by id, with optional offset/limit paging.", .parameters_json =
     \\{"type":"object","properties":{"id":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["id"]}
-    },
+    , .executor_kind = .exec, .call_fn = execReadResult },
     .{ .name = "git", .description = "Run a git subcommand in the workspace (porcelain operations only).", .parameters_json =
     \\{"type":"object","properties":{"args":{"type":"array","items":{"type":"string"}}},"required":["args"]}
-    },
+    , .executor_kind = .git, .call_fn = execGit },
 };
+
+/// Tool specs advertised to the model, derived from `registry` (D-01) so
+/// advertisement and dispatch cannot drift. Custom tools are appended by the
+/// engine, after these, in load order.
+pub const specs: [registry.len]Spec = blk: {
+    var out: [registry.len]Spec = undefined;
+    for (registry, 0..) |t, i| {
+        out[i] = .{ .name = t.name, .description = t.description, .parameters_json = t.parameters_json };
+    }
+    break :blk out;
+};
+
+/// The single dispatch entry for data-defined custom tools (D-02): the
+/// definition itself is resolved from `ctx.custom` through `ctx.tool_name`.
+const custom_entry = Tool{
+    .name = "",
+    .description = "",
+    .parameters_json = "{}",
+    .executor_kind = .exec,
+    .call_fn = customExec,
+};
+
+/// The builtin tool with this name, or null (custom tools are not here).
+pub fn find(name: []const u8) ?*const Tool {
+    for (&registry) |*t| {
+        if (std.mem.eql(u8, t.name, name)) return t;
+    }
+    return null;
+}
+
+// `custom_mod.reserved_names` mirrors this table; fail the build if it drifts.
+comptime {
+    if (custom_mod.reserved_names.len != registry.len) {
+        @compileError("custom.zig reserved_names does not match the tool registry");
+    }
+    for (registry, 0..) |t, i| {
+        if (!std.mem.eql(u8, custom_mod.reserved_names[i], t.name)) {
+            @compileError("custom.zig reserved_names does not match the tool registry at index " ++ std.fmt.comptimePrint("{d}", .{i}));
+        }
+    }
+}
 
 // ---------------------------------------------------------------- helpers
 
@@ -189,8 +266,11 @@ fn deniedResult(arena: std.mem.Allocator, comptime fmt: []const u8, args: anytyp
     return .{ .output = msg, .status = .denied };
 }
 
-const Args = struct {
+/// Parsed tool arguments (always a JSON object). `json` is the raw object text
+/// for executors that forward it unchanged (the `agent` spawn hook).
+pub const Args = struct {
     obj: std.json.ObjectMap,
+    json: []const u8 = "{}",
 
     fn str(self: Args, key: []const u8) ?[]const u8 {
         const v = self.obj.get(key) orelse return null;
@@ -210,119 +290,156 @@ const Args = struct {
 };
 
 /// Dispatch a tool call by name. `args_json` must be a JSON object.
+///
+/// Builtin tools come from `registry`; anything else is looked up in
+/// `ctx.custom` (data-defined tools, D-02) and every custom call runs through
+/// `custom_entry`. Argument validation stays with each executor.
 pub fn execute(name: []const u8, args_json: []const u8, ctx: *ToolContext) ToolResult {
     const V = std.json.Value;
     const args: V = std.json.parseFromSliceLeaky(V, ctx.arena, args_json, .{}) catch
         return errResult(ctx.arena, "invalid JSON arguments", .{});
     if (args != .object) return errResult(ctx.arena, "arguments must be a JSON object", .{});
-    const a = Args{ .obj = args.object };
+    const a = Args{ .obj = args.object, .json = args_json };
     ctx.tool_name = name;
 
-    if (std.mem.eql(u8, name, "read")) {
-        const path = a.str("path") orelse return errResult(ctx.arena, "read: missing path", .{});
-        return toolRead(path, a.int("offset"), a.int("limit"), ctx);
-    } else if (std.mem.eql(u8, name, "glob")) {
-        const pattern = a.str("pattern") orelse return errResult(ctx.arena, "glob: missing pattern", .{});
-        return toolGlob(pattern, ctx);
-    } else if (std.mem.eql(u8, name, "grep")) {
-        const pattern = a.str("pattern") orelse return errResult(ctx.arena, "grep: missing pattern", .{});
-        const root = a.str("path") orelse "";
-        return toolGrep(pattern, root, ctx);
-    } else if (std.mem.eql(u8, name, "edit")) {
-        const path = a.str("path") orelse return errResult(ctx.arena, "edit: missing path", .{});
-        const old_s = a.str("old_string") orelse return errResult(ctx.arena, "edit: missing old_string", .{});
-        const new_s = a.str("new_string") orelse return errResult(ctx.arena, "edit: missing new_string", .{});
-        return toolEdit(path, old_s, new_s, ctx);
-    } else if (std.mem.eql(u8, name, "write")) {
-        const path = a.str("path") orelse return errResult(ctx.arena, "write: missing path", .{});
-        const content = a.str("content") orelse return errResult(ctx.arena, "write: missing content", .{});
-        return toolWrite(path, content, ctx);
-    } else if (std.mem.eql(u8, name, "bash")) {
-        const command = a.str("command") orelse return errResult(ctx.arena, "bash: missing command", .{});
-        const background = if (a.obj.get("background")) |b| (b == .bool and b.bool) else false;
-        const timeout_s: u32 = blk: {
-            const v = a.obj.get("timeout_s") orelse break :blk 0;
-            if (v != .integer or v.integer <= 0 or v.integer > 86_400) break :blk 0;
-            break :blk @intCast(v.integer);
-        };
-        return toolBash(command, background, timeout_s, ctx);
-    } else if (std.mem.eql(u8, name, "skill")) {
-        const load_fn = ctx.skill_load_fn orelse
-            return errResult(ctx.arena, "skill: skills not available", .{});
-        const skill_name = a.str("name") orelse return errResult(ctx.arena, "skill: missing name", .{});
-        const body = load_fn(ctx.skill_ctx orelse ctx.approval_ctx, ctx.arena, skill_name) orelse
-            return errResult(ctx.arena, "skill: '{s}' not found in catalog", .{skill_name});
-        return .{ .output = body, .status = .ok };
-    } else if (std.mem.eql(u8, name, "exec")) {
-        const query_fn = ctx.exec_query_fn orelse
-            return errResult(ctx.arena, "exec: background executions not available", .{});
-        const action = a.str("action") orelse return errResult(ctx.arena, "exec: missing action", .{});
-        var id_buf: [32]u8 = undefined;
-        var id_str: []const u8 = "";
-        if (a.obj.get("id")) |idv| {
-            switch (idv) {
-                .integer => |n| id_str = std.fmt.bufPrint(&id_buf, "{d}", .{n}) catch "",
-                .string => |s| id_str = s,
-                else => {},
-            }
+    const tool = find(name) orelse blk: {
+        if (custom_mod.findTool(ctx.custom, name) != null) break :blk &custom_entry;
+        return errResult(ctx.arena, "unknown tool '{s}'", .{name});
+    };
+    return tool.call_fn(ctx, &a);
+}
+
+// ------------------------------------------------------------ executors
+
+fn execRead(ctx: *ToolContext, a: *const Args) ToolResult {
+    const path = a.str("path") orelse return errResult(ctx.arena, "read: missing path", .{});
+    return toolRead(path, a.int("offset"), a.int("limit"), ctx);
+}
+
+fn execGlob(ctx: *ToolContext, a: *const Args) ToolResult {
+    const pattern = a.str("pattern") orelse return errResult(ctx.arena, "glob: missing pattern", .{});
+    return toolGlob(pattern, ctx);
+}
+
+fn execGrep(ctx: *ToolContext, a: *const Args) ToolResult {
+    const pattern = a.str("pattern") orelse return errResult(ctx.arena, "grep: missing pattern", .{});
+    const root = a.str("path") orelse "";
+    return toolGrep(pattern, root, ctx);
+}
+
+fn execEdit(ctx: *ToolContext, a: *const Args) ToolResult {
+    const path = a.str("path") orelse return errResult(ctx.arena, "edit: missing path", .{});
+    const old_s = a.str("old_string") orelse return errResult(ctx.arena, "edit: missing old_string", .{});
+    const new_s = a.str("new_string") orelse return errResult(ctx.arena, "edit: missing new_string", .{});
+    return toolEdit(path, old_s, new_s, ctx);
+}
+
+fn execWrite(ctx: *ToolContext, a: *const Args) ToolResult {
+    const path = a.str("path") orelse return errResult(ctx.arena, "write: missing path", .{});
+    const content = a.str("content") orelse return errResult(ctx.arena, "write: missing content", .{});
+    return toolWrite(path, content, ctx);
+}
+
+fn execBash(ctx: *ToolContext, a: *const Args) ToolResult {
+    const command = a.str("command") orelse return errResult(ctx.arena, "bash: missing command", .{});
+    const background = if (a.obj.get("background")) |b| (b == .bool and b.bool) else false;
+    const timeout_s: u32 = blk: {
+        const v = a.obj.get("timeout_s") orelse break :blk 0;
+        if (v != .integer or v.integer <= 0 or v.integer > 86_400) break :blk 0;
+        break :blk @intCast(v.integer);
+    };
+    return toolBash(command, background, timeout_s, ctx);
+}
+
+fn execSkill(ctx: *ToolContext, a: *const Args) ToolResult {
+    const load_fn = ctx.skill_load_fn orelse
+        return errResult(ctx.arena, "skill: skills not available", .{});
+    const skill_name = a.str("name") orelse return errResult(ctx.arena, "skill: missing name", .{});
+    const body = load_fn(ctx.skill_ctx orelse ctx.approval_ctx, ctx.arena, skill_name) orelse
+        return errResult(ctx.arena, "skill: '{s}' not found in catalog", .{skill_name});
+    return .{ .output = body, .status = .ok };
+}
+
+fn execExec(ctx: *ToolContext, a: *const Args) ToolResult {
+    const query_fn = ctx.exec_query_fn orelse
+        return errResult(ctx.arena, "exec: background executions not available", .{});
+    const action = a.str("action") orelse return errResult(ctx.arena, "exec: missing action", .{});
+    var id_buf: [32]u8 = undefined;
+    var id_str: []const u8 = "";
+    if (a.obj.get("id")) |idv| {
+        switch (idv) {
+            .integer => |n| id_str = std.fmt.bufPrint(&id_buf, "{d}", .{n}) catch "",
+            .string => |s| id_str = s,
+            else => {},
         }
-        return .{ .output = query_fn(ctx.exec_ctx orelse ctx.approval_ctx, ctx.arena, action, id_str), .status = .ok };
-    } else if (std.mem.eql(u8, name, "read_tool_result")) {
-        const artifact_id = a.str("id") orelse return errResult(ctx.arena, "read_tool_result: missing id", .{});
-        return toolReadResult(artifact_id, a.int("offset"), a.int("limit"), ctx);
-    } else if (std.mem.eql(u8, name, "mcp_list")) {
-        const list_fn = ctx.mcp_list_fn orelse
-            return errResult(ctx.arena, "mcp_list: MCP not configured", .{});
-        return .{ .output = list_fn(ctx.mcp_ctx orelse ctx.approval_ctx, ctx.arena), .status = .ok };
-    } else if (std.mem.eql(u8, name, "mcp_describe")) {
-        const describe_fn = ctx.mcp_describe_fn orelse
-            return errResult(ctx.arena, "mcp_describe: MCP not configured", .{});
-        const server = a.str("server") orelse return errResult(ctx.arena, "mcp_describe: missing server", .{});
-        const mcp_tool = a.str("tool") orelse return errResult(ctx.arena, "mcp_describe: missing tool", .{});
-        const out = describe_fn(ctx.mcp_ctx orelse ctx.approval_ctx, ctx.arena, server, mcp_tool);
-        return .{ .output = out, .status = if (std.mem.startsWith(u8, out, "error:")) .failed else .ok };
-    } else if (std.mem.eql(u8, name, "mcp_call")) {
-        const call_fn = ctx.mcp_call_fn orelse
-            return errResult(ctx.arena, "mcp_call: MCP not configured", .{});
-        const server = a.str("server") orelse return errResult(ctx.arena, "mcp_call: missing server", .{});
-        const mcp_tool = a.str("tool") orelse return errResult(ctx.arena, "mcp_call: missing tool", .{});
-        var arguments_json: []const u8 = "{}";
-        if (a.obj.get("arguments")) |av| {
-            var aw: std.Io.Writer.Allocating = .init(ctx.arena);
-            std.json.Stringify.value(av, .{}, &aw.writer) catch {};
-            arguments_json = aw.written();
-        }
-        switch (ctx.engine.decide(.{ .mcp = .{ .server = server, .tool = mcp_tool } })) {
-            .allow => {},
-            .deny => return deniedResult(ctx.arena, "mcp {s}.{s}", .{ server, mcp_tool }),
-            .ask => {
-                const label = std.fmt.allocPrint(ctx.arena, "{s}.{s}", .{ server, mcp_tool }) catch "?";
-                if (!ctx.requestApproval("call MCP tool", label, .none))
-                    return deniedResult(ctx.arena, "mcp {s}.{s} (declined)", .{ server, mcp_tool });
-            },
-        }
-        const out = call_fn(ctx.mcp_ctx orelse ctx.approval_ctx, ctx.arena, server, mcp_tool, arguments_json);
-        return .{ .output = out, .status = .ok };
-    } else if (std.mem.eql(u8, name, "agent")) {
-        const spawn_fn = ctx.agent_spawn_fn orelse
-            return errResult(ctx.arena, "agent: delegation disabled", .{});
-        const res = spawn_fn(ctx.agent_spawn_ctx orelse ctx.approval_ctx, ctx.arena, ctx.agent_depth, args_json);
-        return .{
-            .output = res.summary,
-            .status = if (res.status == .completed) .ok else .failed,
-        };
-    } else if (std.mem.eql(u8, name, "git")) {
-        const args_v = a.obj.get("args") orelse return errResult(ctx.arena, "git: missing args", .{});
-        if (args_v != .array) return errResult(ctx.arena, "git: args must be an array of strings", .{});
-        var argv: std.ArrayListUnmanaged([]const u8) = .empty;
-        argv.append(ctx.arena, "git") catch return errResult(ctx.arena, "oom", .{});
-        for (args_v.array.items) |item| {
-            if (item != .string) return errResult(ctx.arena, "git: args must be strings", .{});
-            argv.append(ctx.arena, item.string) catch return errResult(ctx.arena, "oom", .{});
-        }
-        return toolGit(argv.items, ctx);
     }
-    return errResult(ctx.arena, "unknown tool '{s}'", .{name});
+    return .{ .output = query_fn(ctx.exec_ctx orelse ctx.approval_ctx, ctx.arena, action, id_str), .status = .ok };
+}
+
+fn execReadResult(ctx: *ToolContext, a: *const Args) ToolResult {
+    const artifact_id = a.str("id") orelse return errResult(ctx.arena, "read_tool_result: missing id", .{});
+    return toolReadResult(artifact_id, a.int("offset"), a.int("limit"), ctx);
+}
+
+fn execMcpList(ctx: *ToolContext, _: *const Args) ToolResult {
+    const list_fn = ctx.mcp_list_fn orelse
+        return errResult(ctx.arena, "mcp_list: MCP not configured", .{});
+    return .{ .output = list_fn(ctx.mcp_ctx orelse ctx.approval_ctx, ctx.arena), .status = .ok };
+}
+
+fn execMcpDescribe(ctx: *ToolContext, a: *const Args) ToolResult {
+    const describe_fn = ctx.mcp_describe_fn orelse
+        return errResult(ctx.arena, "mcp_describe: MCP not configured", .{});
+    const server = a.str("server") orelse return errResult(ctx.arena, "mcp_describe: missing server", .{});
+    const mcp_tool = a.str("tool") orelse return errResult(ctx.arena, "mcp_describe: missing tool", .{});
+    const out = describe_fn(ctx.mcp_ctx orelse ctx.approval_ctx, ctx.arena, server, mcp_tool);
+    return .{ .output = out, .status = if (std.mem.startsWith(u8, out, "error:")) .failed else .ok };
+}
+
+fn execMcpCall(ctx: *ToolContext, a: *const Args) ToolResult {
+    const call_fn = ctx.mcp_call_fn orelse
+        return errResult(ctx.arena, "mcp_call: MCP not configured", .{});
+    const server = a.str("server") orelse return errResult(ctx.arena, "mcp_call: missing server", .{});
+    const mcp_tool = a.str("tool") orelse return errResult(ctx.arena, "mcp_call: missing tool", .{});
+    var arguments_json: []const u8 = "{}";
+    if (a.obj.get("arguments")) |av| {
+        var aw: std.Io.Writer.Allocating = .init(ctx.arena);
+        std.json.Stringify.value(av, .{}, &aw.writer) catch {};
+        arguments_json = aw.written();
+    }
+    switch (ctx.engine.decide(.{ .mcp = .{ .server = server, .tool = mcp_tool } })) {
+        .allow => {},
+        .deny => return deniedResult(ctx.arena, "mcp {s}.{s}", .{ server, mcp_tool }),
+        .ask => {
+            const label = std.fmt.allocPrint(ctx.arena, "{s}.{s}", .{ server, mcp_tool }) catch "?";
+            if (!ctx.requestApproval("call MCP tool", label, .none))
+                return deniedResult(ctx.arena, "mcp {s}.{s} (declined)", .{ server, mcp_tool });
+        },
+    }
+    const out = call_fn(ctx.mcp_ctx orelse ctx.approval_ctx, ctx.arena, server, mcp_tool, arguments_json);
+    return .{ .output = out, .status = .ok };
+}
+
+fn execAgent(ctx: *ToolContext, a: *const Args) ToolResult {
+    const spawn_fn = ctx.agent_spawn_fn orelse
+        return errResult(ctx.arena, "agent: delegation disabled", .{});
+    const res = spawn_fn(ctx.agent_spawn_ctx orelse ctx.approval_ctx, ctx.arena, ctx.agent_depth, a.json);
+    return .{
+        .output = res.summary,
+        .status = if (res.status == .completed) .ok else .failed,
+    };
+}
+
+fn execGit(ctx: *ToolContext, a: *const Args) ToolResult {
+    const args_v = a.obj.get("args") orelse return errResult(ctx.arena, "git: missing args", .{});
+    if (args_v != .array) return errResult(ctx.arena, "git: args must be an array of strings", .{});
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    argv.append(ctx.arena, "git") catch return errResult(ctx.arena, "oom", .{});
+    for (args_v.array.items) |item| {
+        if (item != .string) return errResult(ctx.arena, "git: args must be strings", .{});
+        argv.append(ctx.arena, item.string) catch return errResult(ctx.arena, "oom", .{});
+    }
+    return toolGit(argv.items, ctx);
 }
 
 // ---------------------------------------------------------------- read
@@ -1218,6 +1335,36 @@ pub fn runShell(ctx: *ToolContext, command: []const u8) ToolResult {
     return runCaptured(ctx, &.{ "/bin/sh", "-c", command }, "");
 }
 
+/// Run a data-defined custom tool (D-02): substitute and shell-quote the
+/// arguments, gate the rendered command exactly like `bash`, then run it
+/// through the same captured path (same timeouts, truncation, journal and
+/// background behaviour). The JSON `permission` class is advisory metadata
+/// for the model and future allowlists; enforcement is this gate plus
+/// approval.
+fn customExec(ctx: *ToolContext, a: *const Args) ToolResult {
+    const ct = custom_mod.findTool(ctx.custom, ctx.tool_name) orelse
+        return errResult(ctx.arena, "unknown tool '{s}'", .{ctx.tool_name});
+    const rendered = switch (custom_mod.render(ctx.arena, ct.*, a.obj)) {
+        .command => |c| c,
+        .err => |msg| return .{ .output = msg, .status = .failed },
+    };
+    switch (ctx.engine.decide(.{ .command = .{ .command = rendered } })) {
+        .deny => return deniedResult(ctx.arena, "custom tool '{s}': command '{s}'", .{ ct.name, rendered }),
+        .ask => {
+            const detail = std.fmt.allocPrint(ctx.arena, "{s}: {s}", .{ ct.name, rendered }) catch ct.name;
+            if (!ctx.requestApproval("run custom tool", detail, .none))
+                return deniedResult(ctx.arena, "custom tool '{s}' (declined)", .{ct.name});
+        },
+        .allow => {},
+    }
+
+    // The definition's timeout may only tighten the session ceiling (0 = the
+    // 120 s default, same meaning as everywhere else for `timeout_s`).
+    var local = ctx.*;
+    local.timeout_s = @min(ct.timeout_s, if (ctx.timeout_s == 0) 120 else ctx.timeout_s);
+    return runShell(&local, rendered);
+}
+
 /// "git commit -m x" -> "git commit"; "ls" -> "ls".
 fn commandPrefixOf(command: []const u8) []const u8 {
     var it = std.mem.tokenizeAny(u8, command, " \t");
@@ -1833,4 +1980,142 @@ test "isReadOnly classifies only workspace readers" {
     try std.testing.expect(!isReadOnly("bash"));
     try std.testing.expect(!isReadOnly("write"));
     try std.testing.expect(!isReadOnly("agent"));
+}
+
+test "tool registry and advertised specs agree" {
+    try std.testing.expectEqual(@as(usize, 14), registry.len);
+    try std.testing.expectEqual(@as(usize, registry.len), specs.len);
+    for (registry, 0..) |t, i| {
+        // One spec per registry entry, in registry order.
+        try std.testing.expectEqualStrings(t.name, specs[i].name);
+        try std.testing.expectEqualStrings(t.description, specs[i].description);
+        try std.testing.expectEqualStrings(t.parameters_json, specs[i].parameters_json);
+        // And `find` resolves it back to the same entry.
+        const found = find(t.name) orelse return error.RegistryEntryNotFindable;
+        try std.testing.expectEqual(&registry[i], found);
+        // No duplicate names.
+        for (registry[i + 1 ..]) |later| {
+            try std.testing.expect(!std.mem.eql(u8, t.name, later.name));
+        }
+    }
+    try std.testing.expect(find("frobnicate") == null);
+    try std.testing.expect(find("") == null);
+    try std.testing.expect(find("read_tool_result") != null);
+}
+
+test "tool registry backs read-only classification" {
+    // The read tools are exactly the executor_kind = .read entries.
+    for (registry) |t| {
+        try std.testing.expectEqual(t.executor_kind == .read, isReadOnly(t.name));
+    }
+    // Names outside the table (custom tools included) are never read-only.
+    try std.testing.expect(!isReadOnly("deploy-staging"));
+}
+
+test "custom tool executes end to end through execute" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, ".ifnh/tools");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ifnh/tools/hello.json", .data =
+        \\{"name":"hello","description":"Say hello","parameters":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]},
+        \\ "command":"printf 'hello %s' {name}","permission":"read"}
+    });
+
+    var e = engine_mod.Engine.init(std.testing.allocator, .auto);
+    defer e.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var ctx = testCtx(arena, io, tmp.dir, &e);
+
+    const set = custom_mod.Set.load(arena, io, tmp.dir, true);
+    try std.testing.expectEqual(@as(usize, 1), set.tools.len);
+    try std.testing.expectEqual(@as(usize, 0), set.warnings.len);
+    ctx.custom = set.tools;
+
+    const r = execute("hello", "{\"name\":\"world\"}", &ctx);
+    try std.testing.expectEqual(Status.ok, r.status);
+    try std.testing.expectEqualStrings("<stdout>\nhello world\n</stdout>\n", r.output);
+    try std.testing.expectEqualStrings("hello", ctx.tool_name);
+
+    // The same name is not a builtin: `find` must miss it and isReadOnly false.
+    try std.testing.expect(find("hello") == null);
+    try std.testing.expect(!isReadOnly("hello"));
+}
+
+test "custom tool argument cannot break out of the command" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, ".ifnh/tools");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ifnh/tools/echo.json", .data =
+        \\{"name":"echo-arg","description":"Echo one argument","parameters":{"type":"object"},
+        \\ "command":"printf '%s' {msg}","permission":"read"}
+    });
+
+    var e = engine_mod.Engine.init(std.testing.allocator, .auto);
+    defer e.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var ctx = testCtx(arena, io, tmp.dir, &e);
+    ctx.custom = custom_mod.Set.load(arena, io, tmp.dir, true).tools;
+
+    const payload = "a b; rm -rf / #' \"quoted\" $(whoami)";
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    try aw.writer.writeAll("{\"msg\":");
+    try std.json.Stringify.value(payload, .{}, &aw.writer);
+    try aw.writer.writeByte('}');
+
+    const r = execute("echo-arg", aw.written(), &ctx);
+    try std.testing.expectEqual(Status.ok, r.status);
+    // Passed as one shell word: the echoed text is exactly the argument.
+    try std.testing.expectEqualStrings(
+        "<stdout>\na b; rm -rf / #' \"quoted\" $(whoami)\n</stdout>\n",
+        r.output,
+    );
+}
+
+test "custom tool render and gate failures" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, ".ifnh/tools");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ifnh/tools/tools.json", .data =
+        \\[{"name":"needs-other","description":"d","parameters":{"type":"object"},"command":"echo {other}","permission":"read"},
+        \\ {"name":"touch-it","description":"d","parameters":{"type":"object"},"command":"touch made.txt","permission":"write"}]
+    });
+
+    var e = engine_mod.Engine.init(std.testing.allocator, .ask);
+    defer e.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var ctx = testCtx(arena, io, tmp.dir, &e);
+    // Approval always declined.
+    ctx.approval_fn = struct {
+        fn deny(_: *anyopaque, _: ApprovalRequest) ApprovalResponse {
+            return .denied;
+        }
+    }.deny;
+    ctx.custom = custom_mod.Set.load(arena, io, tmp.dir, true).tools;
+    try std.testing.expectEqual(@as(usize, 2), ctx.custom.len);
+
+    // Missing placeholder key: .failed with the "custom tool" error.
+    const r = execute("needs-other", "{\"msg\":\"x\"}", &ctx);
+    try std.testing.expectEqual(Status.failed, r.status);
+    try std.testing.expect(std.mem.startsWith(u8, r.output, "error: custom tool 'needs-other': "));
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "argument 'other'") != null);
+
+    // A mutating command is gated; a declined approval is .denied and runs nothing.
+    const touched = execute("touch-it", "{}", &ctx);
+    try std.testing.expectEqual(Status.denied, touched.status);
+    try std.testing.expect(std.mem.startsWith(u8, touched.output, "permission denied: custom tool 'touch-it'"));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "made.txt", .{}));
+
+    // An unknown name keeps the old error string and status.
+    const unknown = execute("frobnicate", "{}", &ctx);
+    try std.testing.expectEqual(Status.failed, unknown.status);
+    try std.testing.expectEqualStrings("error: unknown tool 'frobnicate'", unknown.output);
 }
