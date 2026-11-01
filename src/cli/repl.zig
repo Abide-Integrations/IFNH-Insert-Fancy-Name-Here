@@ -45,6 +45,9 @@ pub const Options = struct {
     /// `--profile <name>`: merge `profiles.<name>` and append its prompt
     /// fragment (D-03). Unknown names are a hard startup error.
     profile: ?[]const u8 = null,
+    /// Per-key config flags (`--model`, ...), applied after the profile as
+    /// the `.cli` layer (D-06).
+    overrides: []const config_mod.CliOverride = &.{},
 };
 
 /// Terminal-facing state for the REPL: the palette, the streams and the
@@ -286,6 +289,13 @@ pub fn run(
             }
             return err;
         };
+        for (cfg.errors.items) |e| try out(io, "config error [{s}]: {s}\n", .{ e.path, e.message });
+        if (cfg.errors.items.len > 0) return error.InvalidConfig;
+        for (cfg.warnings.items) |w| try out(io, "config warning: {s}\n", .{w});
+    }
+    // Per-key flags are config like any other and outrank the profile (D-06).
+    if (opts.overrides.len > 0) {
+        try cfg.applyCliOverrides(opts.overrides);
         for (cfg.errors.items) |e| try out(io, "config error [{s}]: {s}\n", .{ e.path, e.message });
         if (cfg.errors.items.len > 0) return error.InvalidConfig;
         for (cfg.warnings.items) |w| try out(io, "config warning: {s}\n", .{w});

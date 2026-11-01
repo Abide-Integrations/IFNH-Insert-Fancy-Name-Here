@@ -13,6 +13,7 @@ const repl = @import("cli/repl.zig");
 const ask_mod = @import("cli/ask.zig");
 const session_mod = @import("core/session/store.zig");
 const config_mod = @import("core/config/config.zig");
+const config_schema = @import("core/config/schema.zig");
 const trace_mod = @import("core/trace.zig");
 
 pub const std_options: std.Options = .{
@@ -70,6 +71,7 @@ pub fn main(init: std.process.Init) !void {
             .no_color = parsed.flags.no_color,
             .trace = &startup_trace,
             .profile = parsed.flags.profile,
+            .overrides = parsed.flags.overrideList(),
         }) catch |err| {
             if (err == error.AccessDenied) {
                 try printOut(io, arena, "error: permission denied\n" ++
@@ -113,11 +115,12 @@ fn dispatch(
             try repl.run(io, arena, environ, .{
                 .no_color = parsed.flags.no_color,
                 .profile = parsed.flags.profile,
+                .overrides = parsed.flags.overrideList(),
             });
             return;
         },
         .init => try runInit(io, arena, parsed.args),
-        .config => try runConfig(io, arena, environ, parsed.args),
+        .config => try runConfig(io, arena, environ, parsed.flags, parsed.args),
         .sessions => try runSessions(io, arena, parsed.args),
         .fork => blk: {
             if (parsed.args.len >= 3 and std.mem.eql(u8, parsed.args[0], "diff")) {
@@ -135,6 +138,7 @@ fn dispatch(
                 .resume_id = parsed.args[0],
                 .no_color = parsed.flags.no_color,
                 .profile = parsed.flags.profile,
+                .overrides = parsed.flags.overrideList(),
             });
         },
         .doctor => try runDoctor(io, arena, environ),
@@ -146,12 +150,47 @@ fn dispatch(
     }
 }
 
-/// `ifnh config [validate|explain <key>|path]`
-fn runConfig(io: std.Io, arena: std.mem.Allocator, environ: *const std.process.Environ.Map, args: []const []const u8) !void {
+/// `ifnh config <validate|explain|path|get|set|edit|schema>` (D-06).
+///
+/// `get` reads the merged tree (all layers); `set`/`edit` touch exactly one
+/// file (`--project` by default, `--global` for the user config) and validate
+/// before writing, so a typo can never poison startup.
+fn runConfig(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    environ: *const std.process.Environ.Map,
+    flags: cli_args.GlobalFlags,
+    args: []const []const u8,
+) !void {
+    const sub = if (args.len == 0) "validate" else args[0];
+    const tail = if (args.len == 0) args else args[1..];
+
+    if (std.mem.eql(u8, sub, "schema")) {
+        try printOut(io, arena, "{s}\n", .{config_schema.json_schema});
+        return;
+    }
+    if (std.mem.eql(u8, sub, "path")) {
+        const user_path = config_mod.userConfigPath(arena, environ) orelse "(no HOME)";
+        if (wantsJson(&flags, tail)) {
+            var aw: std.Io.Writer.Allocating = .init(arena);
+            try aw.writer.writeAll("{\"user\":");
+            try std.json.Stringify.value(user_path, .{}, &aw.writer);
+            try aw.writer.writeAll(",\"project\":\".ifnh/config.json\"}");
+            try printOut(io, arena, "{s}\n", .{aw.written()});
+            return;
+        }
+        try printOut(io, arena, "user: {s}\nproject: .ifnh/config.json\n", .{user_path});
+        return;
+    }
+    if (std.mem.eql(u8, sub, "set")) return runConfigSet(io, arena, environ, flags, tail);
+    if (std.mem.eql(u8, sub, "edit")) return runConfigEdit(io, arena, environ, tail);
+
     var cfg = try config_mod.load(arena, io, environ, std.Io.Dir.cwd());
     defer cfg.deinit();
+    // Flags are config too: `ifnh --model m config get model.model` sees `m`.
+    try applyStartupOverrides(io, arena, &cfg, flags);
 
-    if (args.len == 0 or std.mem.eql(u8, args[0], "validate")) {
+    if (std.mem.eql(u8, sub, "validate")) {
         if (cfg.errors.items.len == 0) {
             try printOut(io, arena, "config valid\n", .{});
         }
@@ -160,19 +199,48 @@ fn runConfig(io: std.Io, arena: std.mem.Allocator, environ: *const std.process.E
         if (cfg.errors.items.len > 0) std.process.exit(1);
         return;
     }
-    if (std.mem.eql(u8, args[0], "explain")) {
-        if (args.len < 2) {
-            try printOut(io, arena, "usage: ifnh config explain <dotted.key>\n", .{});
+    for (cfg.errors.items) |e| try printErr(io, arena, "config error [{s}]: {s}\n", .{ e.path, e.message });
+    const is_get = std.mem.eql(u8, sub, "get");
+    if (std.mem.eql(u8, sub, "explain") or is_get) {
+        if (tail.len == 0) {
+            try printOut(io, arena, "usage: ifnh config {s} <dotted.key>\n", .{sub});
             std.process.exit(2);
         }
-        const key = args[1];
-        const v = cfg.get(key) orelse {
+        const key = tail[0];
+        const value = cfg.get(key);
+        const src_info = cfg.getSource(key);
+        if (wantsJson(&flags, tail)) {
+            var aw: std.Io.Writer.Allocating = .init(arena);
+            try aw.writer.writeAll("{\"key\":");
+            try std.json.Stringify.value(key, .{}, &aw.writer);
+            try aw.writer.writeAll(",\"value\":");
+            if (value) |v| {
+                try std.json.Stringify.value(v, .{}, &aw.writer);
+            } else {
+                try aw.writer.writeAll("null");
+            }
+            if (src_info) |src| {
+                try aw.writer.writeAll(",\"layer\":");
+                try std.json.Stringify.value(src.layer.name(), .{}, &aw.writer);
+                try aw.writer.writeAll(",\"source\":");
+                try std.json.Stringify.value(src.origin, .{}, &aw.writer);
+            } else {
+                try aw.writer.writeAll(",\"layer\":null,\"source\":null");
+            }
+            try aw.writer.writeAll("}");
+            try printOut(io, arena, "{s}\n", .{aw.written()});
+            return;
+        }
+        if (value == null) {
             try printOut(io, arena, "{s}: <unset> (no default)\n", .{key});
             return;
-        };
+        }
         var aw: std.Io.Writer.Allocating = .init(arena);
-        try std.json.Stringify.value(v, .{}, &aw.writer);
-        const src_info = cfg.getSource(key);
+        try std.json.Stringify.value(value.?, .{}, &aw.writer);
+        if (is_get and !hasArg(tail, "--origin")) {
+            try printOut(io, arena, "{s}\n", .{aw.written()});
+            return;
+        }
         try printOut(io, arena, "{s} = {s}\n  layer: {s}\n  source: {s}\n", .{
             key,
             aw.written(),
@@ -181,7 +249,191 @@ fn runConfig(io: std.Io, arena: std.mem.Allocator, environ: *const std.process.E
         });
         return;
     }
-    try printOut(io, arena, "usage: ifnh config [validate|explain <key>]\n", .{});
+    try printOut(io, arena, "usage: ifnh config [validate|explain <key>|get <key>|set <key> <value>|edit|path|schema]\n", .{});
+}
+
+fn hasArg(args: []const []const u8, needle: []const u8) bool {
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, needle)) return true;
+    }
+    return false;
+}
+
+fn wantsJson(flags: *const cli_args.GlobalFlags, args: []const []const u8) bool {
+    return flags.json or hasArg(args, "--json");
+}
+
+/// Apply `--profile` then the per-key flags (D-06) and report config errors
+/// the same way `validate` does.
+fn applyStartupOverrides(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    cfg: *config_mod.Store,
+    flags: cli_args.GlobalFlags,
+) !void {
+    if (flags.profile) |name| {
+        cfg.applyProfile(name) catch |err| {
+            if (err == error.UnknownProfile) {
+                try printErr(io, arena, "error: {s}\n", .{cfg.unknownProfileMessage(arena, name)});
+                std.process.exit(2);
+            }
+            return err;
+        };
+    }
+    try cfg.applyCliOverrides(flags.overrideList());
+}
+
+/// Path `set`/`edit` write: `--global` is the user config, everything else
+/// the project file.
+fn configTargetPath(
+    arena: std.mem.Allocator,
+    environ: *const std.process.Environ.Map,
+    global: bool,
+) ![]const u8 {
+    if (global) {
+        return config_mod.userConfigPath(arena, environ) orelse error.NoHome;
+    }
+    return ".ifnh/config.json";
+}
+
+/// `ifnh config set <key> <value> [--global|--project] [--json]`.
+/// A value that parses as JSON is stored as that type; anything else is a
+/// string, so `set model.model gpt-5` and `set ui.footer false` both work.
+fn runConfigSet(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    environ: *const std.process.Environ.Map,
+    flags: cli_args.GlobalFlags,
+    args: []const []const u8,
+) !void {
+    var positional: [2][]const u8 = undefined;
+    var count: usize = 0;
+    var global = false;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--global")) {
+            global = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--project") or std.mem.eql(u8, arg, "--json") or std.mem.eql(u8, arg, "--origin")) continue;
+        if (count >= 2) {
+            try printErr(io, arena, "usage: ifnh config set <dotted.key> <value> [--global|--project]\n", .{});
+            std.process.exit(2);
+        }
+        positional[count] = arg;
+        count += 1;
+    }
+    if (count < 2) {
+        try printErr(io, arena, "usage: ifnh config set <dotted.key> <value> [--global|--project]\n", .{});
+        std.process.exit(2);
+    }
+    const key = positional[0];
+    const raw = positional[1];
+
+    const path = configTargetPath(arena, environ, global) catch |err| {
+        try printErr(io, arena, "error: cannot resolve the user config path ({s})\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    const cwd = std.Io.Dir.cwd();
+    const existing: []const u8 = cwd.readFileAlloc(io, path, arena, .limited(config_mod.max_config_bytes)) catch |err| switch (err) {
+        error.FileNotFound => "{}",
+        else => {
+            try printErr(io, arena, "error: cannot read {s}: {s}\n", .{ path, @errorName(err) });
+            std.process.exit(1);
+        },
+    };
+    var tree = std.json.parseFromSliceLeaky(std.json.Value, arena, existing, .{}) catch {
+        try printErr(io, arena, "error: invalid JSON in {s}; fix it by hand first\n", .{path});
+        std.process.exit(1);
+    };
+    if (tree != .object) {
+        try printErr(io, arena, "error: {s} does not contain a JSON object\n", .{path});
+        std.process.exit(1);
+    }
+    const value = std.json.parseFromSliceLeaky(std.json.Value, arena, raw, .{}) catch blk: {
+        break :blk std.json.Value{ .string = try arena.dupe(u8, raw) };
+    };
+    try config_mod.setPathIn(arena, &tree, key, value);
+
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    try std.json.Stringify.value(tree, .{ .whitespace = .indent_2 }, &aw.writer);
+    try aw.writer.writeByte('\n');
+    const candidate = aw.written();
+
+    // Validate before write: a typo must never break the next startup.
+    const check = try config_mod.validateFileText(arena, candidate);
+    for (check.warnings) |w| try printErr(io, arena, "warning: {s}\n", .{w});
+    if (check.errors.len > 0) {
+        for (check.errors) |e| try printErr(io, arena, "error [{s}]: {s}\n", .{ e.path, e.message });
+        try printErr(io, arena, "not written\n", .{});
+        std.process.exit(1);
+    }
+    if (std.mem.lastIndexOfScalar(u8, path, '/')) |slash| {
+        try fsutil.ensureDirPath(cwd, io, if (slash == 0) "/" else path[0..slash]);
+    }
+    try fsutil.atomicWriteFile(cwd, io, arena, path, candidate);
+    if (wantsJson(&flags, args)) {
+        var out_aw: std.Io.Writer.Allocating = .init(arena);
+        try out_aw.writer.writeAll("{\"path\":");
+        try std.json.Stringify.value(path, .{}, &out_aw.writer);
+        try out_aw.writer.writeAll(",\"key\":");
+        try std.json.Stringify.value(key, .{}, &out_aw.writer);
+        try out_aw.writer.writeAll(",\"value\":");
+        try std.json.Stringify.value(value, .{}, &out_aw.writer);
+        try out_aw.writer.writeByte('}');
+        try printOut(io, arena, "{s}\n", .{out_aw.written()});
+        return;
+    }
+    try printOut(io, arena, "{s} = {s}  ({s})\n", .{ key, raw, path });
+}
+
+/// `ifnh config edit [--global|--project]`: open the file in `$VISUAL` /
+/// `$EDITOR` (default `vi`) and validate what came back.
+fn runConfigEdit(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    environ: *const std.process.Environ.Map,
+    args: []const []const u8,
+) !void {
+    const global = hasArg(args, "--global");
+    const path = configTargetPath(arena, environ, global) catch |err| {
+        try printErr(io, arena, "error: cannot resolve the user config path ({s})\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    const cwd = std.Io.Dir.cwd();
+    const exists = fsutil.fileExists(cwd, io, path);
+    if (!exists) {
+        if (std.mem.lastIndexOfScalar(u8, path, '/')) |slash| {
+            try fsutil.ensureDirPath(cwd, io, if (slash == 0) "/" else path[0..slash]);
+        }
+        try fsutil.atomicWriteFile(cwd, io, arena, path, "{}\n");
+    }
+    const editor = environ.get("VISUAL") orelse environ.get("EDITOR") orelse "vi";
+    // `$EDITOR` may carry arguments ("code --wait"), so let a shell split it.
+    const script = try std.fmt.allocPrint(arena, "{s} \"$1\"", .{editor});
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "/bin/sh", "-c", script, "ifnh-config-edit", path },
+        .cwd = .{ .dir = cwd },
+    });
+    const term = try child.wait(io);
+    const ok = switch (term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (!ok) {
+        try printErr(io, arena, "editor exited with an error; {s} left unchanged\n", .{path});
+        std.process.exit(1);
+    }
+    const text = cwd.readFileAlloc(io, path, arena, .limited(config_mod.max_config_bytes)) catch {
+        try printErr(io, arena, "error: cannot read {s} after editing\n", .{path});
+        std.process.exit(1);
+    };
+    const check = try config_mod.validateFileText(arena, text);
+    for (check.warnings) |w| try printOut(io, arena, "warning: {s}\n", .{w});
+    for (check.errors) |e| try printOut(io, arena, "error [{s}]: {s}\n", .{ e.path, e.message });
+    if (check.errors.len > 0) {
+        std.process.exit(1);
+    }
+    try printOut(io, arena, "config valid ({s})\n", .{path});
 }
 
 /// `ifnh sessions list`
@@ -492,7 +744,7 @@ const help_text =
     \\subcommands:
     \\  (none)      start an interactive session (M0)
     \\  init        create a .ifnh/ project skeleton
-    \\  config      validate/explain configuration (M0)
+    \\  config      validate/explain/get/set/edit/path/schema configuration
     \\  sessions    list recorded sessions (--json supported)
     \\  fork        branch a session (ifnh fork <id>); 'ifnh fork diff <a> <b>' compares
     \\  cleanup     enforce retention, list/remove worktrees
@@ -507,6 +759,10 @@ const help_text =
     \\  --no-color              disable color
     \\  --log-level <level>     err | info | debug | trace
     \\  --profile <name>        apply profiles.<name> from config (D-03)
+    \\  --model <id>            per-key config flags, applied as the cli layer:
+    \\  --provider <name>       --model --provider --base-url --temperature
+    \\  --base-url <url>        --max-output-tokens --context-tokens
+    \\  --temperature <n>       --permission-mode --no-footer  (D-06)
     \\  -p <prompt>             headless one-shot prompt (same as 'ask -p')
     \\  -h, --help              show help
     \\  -V, --version           print version
@@ -527,6 +783,7 @@ test {
     _ = @import("core/fsutil.zig");
     _ = @import("cli/args.zig");
     _ = @import("core/config/config.zig");
+    _ = @import("core/config/schema.zig");
     _ = @import("core/session/store.zig");
     _ = @import("core/journal.zig");
     _ = @import("core/permissions/glob.zig");

@@ -338,6 +338,16 @@ pub fn run(
         if (cfg.errors.items.len > 0) return exitCode(.failed);
         for (cfg.warnings.items) |w| stderrPrint(io, "config warning: {s}\n", .{w});
     }
+    // Per-key flags are config like any other and outrank the profile (D-06).
+    if (global.override_count > 0) {
+        cfg.applyCliOverrides(global.overrideList()) catch |err| {
+            stderrPrint(io, "error: cannot apply flags: {s}\n", .{@errorName(err)});
+            return exitCode(.failed);
+        };
+        for (cfg.errors.items) |e| stderrPrint(io, "config error [{s}]: {s}\n", .{ e.path, e.message });
+        if (cfg.errors.items.len > 0) return exitCode(.failed);
+        for (cfg.warnings.items) |w| stderrPrint(io, "config warning: {s}\n", .{w});
+    }
 
     var rt = session_runtime.SessionRuntime.init(io, arena, environ, &cfg, cwd, .{
         .sessions_dir = sessionsDir(&cfg),

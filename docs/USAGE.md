@@ -262,8 +262,40 @@ Precedence (low to high): **built-in defaults < user < project < session <
 env < CLI**. Inspect any key:
 
 ```bash
-ifnh config explain model.model
+ifnh config explain model.model   # value, layer and source file
+ifnh config get model.model       # value only (script-friendly)
+ifnh config get ui.footer --json  # {"key","value","layer","source"}
+ifnh config path                  # user + project config paths
+ifnh config schema                # the published JSON Schema
 ifnh config validate
+```
+
+Edit without hand-editing JSON:
+
+```bash
+ifnh config set model.model gpt-5                 # project: .ifnh/config.json
+ifnh config set ui.footer false --global          # user config
+ifnh config set model.temperature 0.3 --json
+ifnh config edit                                  # $VISUAL / $EDITOR / vi
+```
+
+Values parse as JSON when they can (`false`, `0.3`, `["a"]`) and are stored as
+strings otherwise, so bare words work. `set` validates the whole file against
+the schema before writing and refuses on any error (`not written`), so a typo
+cannot break the next startup. `--global`/`--project` pick the file; the
+default is the project config. The schema itself lives in
+`docs/config.schema.json` and is embedded in the binary, so
+`ifnh config schema` always matches the defaults.
+
+Per-key flags are CLI-layer overrides, applied after `--profile`, so they win
+over everything:
+
+```bash
+ifnh --model qwen3-coder --temperature 0.2
+ifnh --provider anthropic --base-url https://example.test/v1
+ifnh --max-output-tokens 4096 --context-tokens 200000
+ifnh --permission-mode auto --no-footer
+ifnh --model m config get model.model   # shows layer: cli, source: --model
 ```
 
 - **User config:** `$XDG_CONFIG_HOME/ifnh/config.json` when `XDG_CONFIG_HOME`

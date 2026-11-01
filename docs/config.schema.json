@@ -1,0 +1,226 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ifnh.dev/config.schema.json",
+  "title": "ifnh configuration",
+  "description": "Layered JSON configuration for ifnh (DESIGN 3.5). Precedence, low to high: builtin defaults < user < project < session < env < cli. `src/core/config/schema.zig` embeds this file verbatim; the drift test keeps it in step with the builtin defaults.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Config format version. Unsupported values fail startup."
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "provider": {
+          "type": "string",
+          "enum": ["openai", "anthropic"]
+        },
+        "model": {
+          "type": "string",
+          "description": "Model id sent to the provider; empty means unconfigured."
+        },
+        "base_url": {
+          "type": ["string", "null"],
+          "description": "Provider endpoint override; null uses the provider default."
+        },
+        "api_key_env": {
+          "type": "string",
+          "description": "Environment variable that holds the API key."
+        },
+        "temperature": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 2
+        },
+        "max_output_tokens": {
+          "type": ["integer", "null"],
+          "minimum": 1
+        },
+        "provider_options": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Provider-specific request options, passed through verbatim."
+        },
+        "provider_label": {
+          "type": "string",
+          "description": "Display label for a custom OpenAI-compatible endpoint."
+        },
+        "tools_enabled": {
+          "type": "boolean",
+          "description": "Whether the model is told about tools (false for chat-only models)."
+        }
+      }
+    },
+    "models": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "aliases": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Alias -> model id."
+        },
+        "fallbacks": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "description": "Model id -> ordered fallback chain."
+        },
+        "provider_options": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    },
+    "routing": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "parent": { "type": "string" },
+        "research": { "type": "string" },
+        "implement": { "type": "string" },
+        "review": { "type": "string" }
+      }
+    },
+    "profiles": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "prompt": { "type": "string" }
+        }
+      },
+      "description": "Named config overlays applied with --profile; `prompt` is appended to the system prompt."
+    },
+    "permissions": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "default_mode": {
+          "type": "string",
+          "enum": ["ask", "auto"]
+        },
+        "read": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "write": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "command_allow": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "command_deny": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "env_allow": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "read_dotenv": { "type": "boolean" }
+      }
+    },
+    "git": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "commits": { "type": "string", "enum": ["never", "ask", "auto"] },
+        "push": { "type": "string", "enum": ["never", "ask", "auto"] },
+        "force_push": { "type": "string", "enum": ["never", "ask", "auto"] }
+      }
+    },
+    "agents": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "max_depth": { "type": "integer", "minimum": 0 },
+        "max_concurrent": { "type": "integer", "minimum": 1 },
+        "max_retries": { "type": "integer", "minimum": 0 },
+        "max_tool_rounds": { "type": "integer", "minimum": 1 },
+        "timeout_tool_s": { "type": "integer", "minimum": 1 },
+        "timeout_turn_s": { "type": "integer", "minimum": 1 },
+        "budget_usd": { "type": ["number", "null"], "minimum": 0 }
+      }
+    },
+    "tools": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "external": {
+          "type": "boolean",
+          "description": "Allow external tools launched from .ifnh/tools/."
+        }
+      }
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "auto_compact": { "type": "boolean" },
+        "compact_at_fraction": { "type": "number", "minimum": 0, "maximum": 1 },
+        "max_file_read_bytes": { "type": "integer", "minimum": 1 },
+        "max_context_tokens": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Context window size used by the footer and /context."
+        }
+      }
+    },
+    "planning": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "auto_call_threshold": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "sessions": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "dir": {
+          "type": "string",
+          "description": "\"project\" keeps sessions in .ifnh/sessions; any other value is a path."
+        },
+        "keep": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "ui": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "colors": { "type": "boolean" },
+        "footer": { "type": "boolean" },
+        "symbols": { "type": "string", "enum": ["unicode", "ascii"] },
+        "verbosity": { "type": "string", "enum": ["quiet", "normal", "verbose"] }
+      }
+    },
+    "debug": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "level": { "type": "string", "enum": ["debug", "info", "warn", "error"] },
+        "redact": { "type": "boolean" }
+      }
+    },
+    "hooks": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Lifecycle hooks (D-07): event name -> array of shell commands or {command, matcher, timeout_s} objects."
+    },
+    "mcp_servers": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "MCP server definitions, keyed by server name."
+    }
+  }
+}
