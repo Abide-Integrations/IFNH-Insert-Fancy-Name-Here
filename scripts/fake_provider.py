@@ -32,7 +32,22 @@ TOOL_CALLS = {
     "tool": ("bash", {"command": "touch " + TOOL_FILE}),
     "write": ("write", {"path": "smoke.txt", "content": "alpha\nbeta\ngamma\n"}),
     "edit": ("edit", {"path": "smoke.txt", "old_string": "beta", "new_string": "BETA"}),
+    # D-02 smoke: calls the custom tool defined in .ifnh/tools/hello.json.
+    "custom": ("hello", {"name": "world"}),
 }
+
+
+def advertised_tools(raw):
+    """Tool names from the request payload, as the model sees them."""
+    try:
+        request = json.loads(raw or b"{}")
+    except (TypeError, ValueError):
+        return ""
+    names = []
+    for spec in request.get("tools", []):
+        fn = spec.get("function") or spec
+        names.append(fn.get("name", "?"))
+    return "tools: " + ",".join(names)
 
 
 def tool_stream(mode):
@@ -85,7 +100,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         body = text_stream(TEXT_REPLY)
-        if self.server.mode in TOOL_CALLS and not has_tool_result(raw):
+        if self.server.mode == "advertised":
+            body = text_stream(advertised_tools(raw))
+        elif self.server.mode in TOOL_CALLS and not has_tool_result(raw):
             body = tool_stream(self.server.mode)
         self.wfile.write(body.encode())
 
@@ -98,7 +115,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=0)
     ap.add_argument("--port-file")
-    ap.add_argument("--mode", choices=("text", "error") + tuple(TOOL_CALLS), default="text")
+    ap.add_argument("--mode", choices=("text", "error", "advertised") + tuple(TOOL_CALLS), default="text")
     ap.add_argument("--delay", type=float, default=0.03)
     a = ap.parse_args()
     srv = HTTPServer(("127.0.0.1", a.port), Handler)

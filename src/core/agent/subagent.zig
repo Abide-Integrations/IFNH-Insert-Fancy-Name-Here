@@ -59,6 +59,8 @@ pub const Host = struct {
     read_dotenv: bool = false,
     /// `tools.external`: let the child use `rg`/`fd` when present.
     use_external_tools: bool = true,
+    /// Custom tools inherited from the parent run (D-02).
+    custom: []const tool_mod.CustomTool = &.{},
     /// `agents.timeout_tool_s` for the child's captured commands.
     timeout_tool_s: u32 = 120,
     journal: ?*journal_mod.Journal,
@@ -233,6 +235,7 @@ fn runChild(
         .max_file_read_bytes = 256 * 1024,
         .timeout_s = host.timeout_tool_s,
         .use_external_tools = host.use_external_tools,
+        .custom = host.custom,
         .approval_ctx = host.approval_ctx,
         .approval_fn = host.approval_fn,
         .agent_spawn_fn = spawnHookFn,
