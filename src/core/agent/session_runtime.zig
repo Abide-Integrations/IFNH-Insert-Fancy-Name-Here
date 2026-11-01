@@ -123,6 +123,10 @@ pub const SessionRuntime = struct {
     /// Set when `.ifnh/permissions.local.json` exists but could not be used;
     /// the caller prints it (the runtime never writes to the terminal).
     local_grants_warning: ?[]const u8 = null,
+    /// Custom tools loaded once per run from `.ifnh/tools` (D-02). `warnings`
+    /// holds one "warning: ..." line per skipped definition; the caller prints
+    /// them, the runtime never does.
+    custom_tools: tool_mod.CustomToolSet = .{},
 
     /// Build a runtime: load provider keys, create or open the session
     /// store, and discover skills, background executions and MCP servers.
@@ -182,6 +186,8 @@ pub const SessionRuntime = struct {
                 .{ local_grants.path, why },
             ) catch null,
         }
+
+        self.custom_tools = tool_mod.CustomToolSet.load(arena, io, cwd, cfg.getBool("tools.external", true));
 
         if (opts.resume_id != null) {
             const raw = fsutil.readSmallFile(self.store.dir, io, arena, "usage.jsonl", 1024 * 1024) catch "";
@@ -393,6 +399,7 @@ pub const SessionRuntime = struct {
             .git_force_push = self.engine.git_force_push,
             .read_dotenv = self.engine.read_dotenv,
             .use_external_tools = cfg.getBool("tools.external", true),
+            .custom = self.custom_tools.tools,
             .timeout_tool_s = cfg.getU32("agents.timeout_tool_s", 120),
             .journal = &self.journal,
             .approval_ctx = &gate,
@@ -422,6 +429,7 @@ pub const SessionRuntime = struct {
             .max_file_read_bytes = cfg.getU32("context.max_file_read_bytes", 262144),
             .timeout_s = cfg.getU32("agents.timeout_tool_s", 120),
             .use_external_tools = cfg.getBool("tools.external", true),
+            .custom = self.custom_tools.tools,
             .approval_ctx = &gate,
             .approval_fn = Gate.approve,
             .agent_spawn_fn = subagent_mod.spawnHookFn,

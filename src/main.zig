@@ -432,6 +432,8 @@ fn runInit(io: std.Io, arena: std.mem.Allocator, args: []const []const u8) !void
     try fsutil.ensureDirPath(cwd, io, ".ifnh/commands");
     try fsutil.ensureDirPath(cwd, io, ".ifnh/instructions");
     try fsutil.ensureDirPath(cwd, io, ".ifnh/plans");
+    // Custom tool definitions (D-02, ADR 0004); the loader tolerates absence.
+    try fsutil.ensureDirPath(cwd, io, ".ifnh/tools");
 
     const starter_config =
         \\
@@ -453,7 +455,7 @@ fn runInit(io: std.Io, arena: std.mem.Allocator, args: []const []const u8) !void
     try fsutil.atomicWriteFile(cwd, io, arena, ".ifnh/.gitignore", gitignore);
 
     try printOut(io, arena,
-        \\created .ifnh/ (config.json, skills/, commands/, instructions/, plans/)
+        \\created .ifnh/ (config.json, skills/, commands/, instructions/, plans/, tools/)
         \\next: run `ifnh` — first-run setup will configure your provider, model, and key
         \\
     , .{});
@@ -524,6 +526,7 @@ test {
     _ = @import("core/permissions/local_grants.zig");
     _ = @import("tools/tool.zig");
     _ = @import("tools/search.zig");
+    _ = @import("tools/custom.zig");
     _ = @import("providers/provider.zig");
     _ = @import("providers/transport.zig");
     _ = @import("providers/sse.zig");

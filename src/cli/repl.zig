@@ -285,6 +285,7 @@ pub fn run(
     });
     defer rt.deinit();
     if (rt.local_grants_warning) |warning| try out(io, "{s}", .{warning});
+    for (rt.custom_tools.warnings) |warning| try out(io, "{s}", .{warning});
 
     // The palette needs the merged environment (the user env file may set
     // NO_COLOR), so it is detected after the runtime exists.
@@ -844,7 +845,7 @@ fn sessionsDir(arena: std.mem.Allocator, cfg: *const config_mod.Store) []const u
 }
 
 fn ensureIfnh(io: std.Io, cwd: std.Io.Dir) !void {
-    const dirs = [_][]const u8{ ".ifnh", ".ifnh/sessions", ".ifnh/plans" };
+    const dirs = [_][]const u8{ ".ifnh", ".ifnh/sessions", ".ifnh/plans", ".ifnh/tools" };
     for (dirs) |d| try cwd.createDirPath(io, d);
     // The grants file is per-user state, never shared through the repository.
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);

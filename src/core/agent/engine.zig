@@ -157,8 +157,30 @@ pub const RunParams = struct {
     trace: ?*trace_mod.Trace = null,
 };
 
+/// Builtin tool specs plus one spec per loaded custom tool (D-02).
+fn advertisedTools(arena: std.mem.Allocator, ctx: *const tool_mod.ToolContext) std.mem.Allocator.Error![]const core_types.ToolSpec {
+    if (ctx.custom.len == 0) return &tool_mod.specs;
+    var out: std.ArrayListUnmanaged(core_types.ToolSpec) = .empty;
+    try out.appendSlice(arena, &tool_mod.specs);
+    for (ctx.custom) |ct| {
+        try out.append(arena, .{
+            .name = ct.name,
+            .description = ct.description,
+            .parameters_json = ct.parameters_json,
+        });
+    }
+    return out.items;
+}
+
 /// Run one agent turn. Appends assistant/tool messages to `history`.
 pub fn runTurn(p: RunParams) !Outcome {
+    // The model-facing tool list: builtins, then data-defined custom tools in
+    // load order (D-02). `include_tools = false` still advertises nothing.
+    const tool_specs: []const core_types.ToolSpec = if (p.include_tools)
+        try advertisedTools(p.arena, p.tool_ctx)
+    else
+        &.{};
+
     var total_usage = core_types.Usage{};
     var last_round = core_types.Usage{};
     var rounds: usize = 0;
@@ -179,7 +201,7 @@ pub fn runTurn(p: RunParams) !Outcome {
         }
 
         var collector = Collector{ .arena = p.arena, .callbacks = p.callbacks };
-        const tools: []const core_types.ToolSpec = if (p.include_tools) &tool_mod.specs else &.{};
+        const tools = tool_specs;
         var round_span = trace_mod.Span.begin(p.trace, "turn.provider_round");
         const ttft_span = trace_mod.Span.begin(p.trace, "provider.ttft");
         // One sink for the whole round: a retry must not end the TTFT span a
