@@ -527,7 +527,8 @@ pub const SessionRuntime = struct {
 
         var hooks_span = trace_mod.Span.begin(self.trace, "turn.hooks");
         var hook_engine = hooks_mod.Engine.init(io, cwd, try hooks_mod.Engine.fromConfig(arena, cfg.get("hooks")), arena);
-        const pre = hook_engine.dispatch(.before_agent, "{}");
+        hook_engine.environ = self.process_environ;
+        const pre = hook_engine.dispatchFor(.before_agent, .{ .session_id = self.store.manifest.id });
         hooks_span.end("");
         if (pre.blocked) {
             statusFmt(events, .plain, "before_agent hook blocked the turn: {s}\n", .{pre.output});
@@ -588,6 +589,9 @@ pub const SessionRuntime = struct {
             .max_tool_rounds = cfg.getU32("agents.max_tool_rounds", 25),
             .redactions = redactionsFor(arena, cfg.getBool("debug.redact", true), pcfg.api_key),
             .trace = self.trace,
+            .hook_engine = &hook_engine,
+            .hook_environ = self.process_environ,
+            .session_id = self.store.manifest.id,
         }) catch |err| {
             self.rollbackTurn(history_start);
             // Report the failure once, through the outcome: the caller renders
@@ -597,7 +601,7 @@ pub const SessionRuntime = struct {
             return .{ .ran = true, .status = .failed, .error_message = @errorName(err) };
         };
 
-        _ = hook_engine.dispatch(.after_agent, "{}");
+        _ = hook_engine.dispatchFor(.after_agent, .{ .session_id = self.store.manifest.id });
         const result = TurnOutcome{
             .ran = true,
             .status = outcome.status,
@@ -767,6 +771,21 @@ fn statusFmt(events: *const Events, level: Level, comptime fmt: []const u8, args
     var buf: [1024]u8 = undefined;
     const text = std.fmt.bufPrint(&buf, fmt, args) catch return;
     events.on_status(events.ctx, level, text);
+}
+
+/// Run a session-scoped hook event outside a turn (`session_start` /
+/// `session_end`, D-07). Hooks for these events never block.
+pub fn dispatchHook(
+    rt: *SessionRuntime,
+    arena: std.mem.Allocator,
+    cfg: *const config_mod.Store,
+    event: hooks_mod.Event,
+) hooks_mod.HookResult {
+    const defs = hooks_mod.Engine.fromConfig(arena, cfg.get("hooks")) catch
+        return .{ .ok = true };
+    var engine = hooks_mod.Engine.init(rt.io, std.Io.Dir.cwd(), defs, arena);
+    engine.environ = rt.process_environ;
+    return engine.dispatchFor(event, .{ .session_id = rt.store.manifest.id });
 }
 
 pub fn engineFromConfig(arena: std.mem.Allocator, cfg: *config_mod.Store) engine_mod.Engine {

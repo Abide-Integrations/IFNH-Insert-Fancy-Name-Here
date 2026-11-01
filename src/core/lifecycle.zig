@@ -10,6 +10,7 @@
 const std = @import("std");
 const core_types = @import("types.zig");
 const subagent_mod = @import("agent/subagent.zig");
+const hooks_mod = @import("hooks.zig");
 const tool_mod = @import("../tools/tool.zig");
 const testing = @import("agent/testing.zig");
 
@@ -135,6 +136,10 @@ pub const RunCallbacks = struct {
     on_stage_done: *const fn (ctx: *anyopaque, out: StageOutcome) void,
     /// Human approval gate (D027); true = approved.
     approve: *const fn (ctx: *anyopaque, stage: []const u8, summary: []const u8) bool,
+    /// Hooks around each stage (D-07); null disables them.
+    hooks: ?*hooks_mod.Engine = null,
+    /// Session id handed to hooks as `IFNH_SESSION_ID`.
+    session_id: []const u8 = "",
 };
 
 /// Entry condition: all required artifacts exist (F81).
@@ -158,10 +163,33 @@ pub fn run(
 ) ![]StageOutcome {
     var outcomes: std.ArrayListUnmanaged(StageOutcome) = .empty;
 
+    // Stage hooks dispatch into this arena, never into the caller's engine
+    // struct (D-07).
+    var engine_opt: ?hooks_mod.Engine = null;
+    if (callbacks.hooks) |shared| engine_opt = shared.withAlloc(arena);
+
     var i = start_stage;
     while (i < lc.stages.len) : (i += 1) {
         const stage = lc.stages[i];
         callbacks.on_stage_start(callbacks.ctx, stage.name, @tagName(stage.role));
+
+        if (engine_opt) |*he| {
+            const pre = he.dispatchFor(.before_stage, .{
+                .session_id = callbacks.session_id,
+                .stage = stage.name,
+                .extra_json = std.fmt.allocPrint(arena, "{{\"role\":\"{s}\"}}", .{@tagName(stage.role)}) catch "",
+            });
+            if (pre.blocked) {
+                const blocked = StageOutcome{
+                    .stage = stage.name,
+                    .status = .blocked,
+                    .summary = if (pre.output.len > 0) pre.output else "blocked by a before_stage hook",
+                };
+                try outcomes.append(arena, blocked);
+                callbacks.on_stage_done(callbacks.ctx, blocked);
+                return outcomes.items;
+            }
+        }
 
         if (!checkRequires(host.workspace, io, stage)) {
             const out = StageOutcome{
@@ -186,6 +214,13 @@ pub fn run(
         };
         callbacks.on_stage_done(callbacks.ctx, out);
         try outcomes.append(arena, out);
+        if (engine_opt) |*he| {
+            _ = he.dispatchFor(.after_stage, .{
+                .session_id = callbacks.session_id,
+                .stage = stage.name,
+                .extra_json = std.fmt.allocPrint(arena, "{{\"status\":\"{s}\"}}", .{@tagName(out.status)}) catch "",
+            });
+        }
         if (out.status != .completed) return outcomes.items;
 
         // Review pass (D026, G88-92): N independent review-role children;

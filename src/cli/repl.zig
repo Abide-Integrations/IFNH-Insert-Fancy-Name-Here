@@ -15,6 +15,7 @@ const instructions_mod = @import("../core/instructions.zig");
 const system_prompt = @import("../core/agent/system_prompt.zig");
 const subagent_mod = @import("../core/agent/subagent.zig");
 const session_runtime = @import("../core/agent/session_runtime.zig");
+const hooks_mod = @import("../core/hooks.zig");
 const git_mod = @import("../core/git.zig");
 const compaction_mod = @import("../core/compaction.zig");
 const lifecycle_mod = @import("../core/lifecycle.zig");
@@ -377,6 +378,13 @@ pub fn run(
         try out(io, "{s}type a message, or /help for commands{s}\n", .{ palette.dim("", arena), "\x1b[0m" });
     }
 
+    // `session_start` hooks run once the session exists and before any input
+    // is read (D-07); they are advisory, so a failure only prints.
+    {
+        const started = session_runtime.dispatchHook(&rt, arena, &cfg, .session_start);
+        if (started.output.len > 0) try out(io, "{s}\n", .{started.output});
+    }
+
     // First paint is measured from process start, not from REPL setup.
     if (opts.trace) |t| {
         const first_paint = trace_mod.Span{ .trace = t, .name = "startup.first_paint", .start = t.t0 };
@@ -489,6 +497,12 @@ pub fn run(
         const res = try rt.submitTurn(arena, &cfg, rt.providerConfig(&cfg), skill_prompt.text, skill_prompt.stable_len, line, cwd, &events);
         try renderTurn(io, arena, &ui, res);
         ui.endTurn(&rt, &cfg, res);
+    }
+
+    // `session_end` hooks fire once the input loop is over (D-07).
+    {
+        const ended = session_runtime.dispatchHook(&rt, arena, &cfg, .session_end);
+        if (ended.output.len > 0) try out(io, "{s}\n", .{ended.output});
     }
 }
 
@@ -1060,8 +1074,12 @@ fn handleCommand(
             },
             .session_hint = rt.store.manifest.id,
         };
+        var lc_hooks = hooks_mod.Engine.init(io, cwd, hooks_mod.Engine.fromConfig(arena, cfg.get("hooks")) catch &.{}, arena);
+        lc_hooks.environ = rt.process_environ;
         const outcomes = lifecycle_mod.run(arena, io, &host2, lc, start_stage, .{
             .ctx = io.userdata.?,
+            .hooks = &lc_hooks,
+            .session_id = rt.store.manifest.id,
             .on_stage_start = struct {
                 fn f(_: *anyopaque, stage: []const u8, role: []const u8) void {
                     _ = stage;

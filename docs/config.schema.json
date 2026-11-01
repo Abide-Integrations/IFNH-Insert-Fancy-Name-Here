@@ -214,8 +214,30 @@
     },
     "hooks": {
       "type": "object",
-      "additionalProperties": true,
-      "description": "Lifecycle hooks (D-07): event name -> array of shell commands or {command, matcher, timeout_s} objects."
+      "description": "Lifecycle hooks (D-07): event name (session_start, session_end, before_agent, after_agent, before_stage, after_stage, before_tool, after_tool, before_merge, after_merge) mapped to a command, a list of commands, or a list of objects.",
+      "additionalProperties": {
+        "oneOf": [
+          { "type": "string" },
+          {
+            "type": "array",
+            "items": {
+              "oneOf": [
+                { "type": "string" },
+                {
+                  "type": "object",
+                  "properties": {
+                    "command": { "type": "string" },
+                    "matcher": { "type": "string", "description": "Pipe-separated exact tool names; empty or * matches every tool." },
+                    "timeout_s": { "type": "integer", "minimum": 1, "maximum": 300, "default": 30 }
+                  },
+                  "required": ["command"],
+                  "additionalProperties": false
+                }
+              ]
+            }
+          }
+        ]
+      }
     },
     "mcp_servers": {
       "type": "object",

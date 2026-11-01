@@ -657,6 +657,11 @@ fn runDoctor(io: std.Io, arena: std.mem.Allocator, environ: *const std.process.E
     defer reg.deinit();
     try printOut(io, arena, "  mcp: {d} servers configured\n", .{reg.configs.len});
 
+    // Hooks (D-07).
+    const hooks_mod = @import("core/hooks.zig");
+    const hook_defs = hooks_mod.Engine.fromConfig(arena, cfg.get("hooks")) catch &.{};
+    try printOut(io, arena, "  hooks: {d} configured\n", .{hook_defs.len});
+
     // Session dir writability.
     cwd.createDirPath(io, ".ifnh/sessions") catch {
         problems += 1;

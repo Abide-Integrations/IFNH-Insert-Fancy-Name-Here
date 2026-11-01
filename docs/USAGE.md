@@ -474,13 +474,33 @@ The agent sees a budgeted catalog each turn and loads bodies with the
 ```jsonc
 { "hooks": {
     "before_agent": "echo starting | tee -a .ifnh/hook.log",
-    "after_agent":  "zig build test"     // non-zero exit BLOCKS before_* only
+    "after_agent":  "zig build test",           // non-zero exit BLOCKS before_* only
+    "before_tool": [
+      "echo audit >> .ifnh/hook.log",
+      { "command": "scripts/fmt-check.sh", "matcher": "edit|write", "timeout_s": 10 }
+    ]
 } }
 ```
 
-Events: `session_start/end`, `before/after_tool`, `before/after_agent`,
-`before/after_merge`. `before_*` hooks block on non-zero exit; everything
-runs under `/bin/sh` with a 30s timeout.
+Events (all ten of P212): `session_start/end`, `before/after_agent`,
+`before/after_stage`, `before/after_tool`, `before/after_merge`. Each event
+takes a command, a list of commands, or a list of objects with `command`,
+`matcher` (`|`-separated exact tool names, `*` or omitted = every tool) and
+`timeout_s` (1..300, default 30). Every hook runs under `/bin/sh` in the
+workspace.
+
+The event payload arrives as JSON on stdin and as `IFNH_EVENT`,
+`IFNH_SESSION_ID` and `IFNH_TOOL_NAME` in the environment. A `before_*`
+hook can steer the call from its stdout, using the last non-empty line:
+
+```jsonc
+{"decision": "deny", "reason": "no pushes on Fridays"}   // blocks the call
+{"decision": "rewrite", "arguments": {"path": "b.txt"}} // replaces tool input
+```
+
+Rewrites chain through the remaining `before_tool` hooks; `after_*` hooks
+never block, whatever they print. A non-zero exit or a timeout still blocks
+`before_*` and is advisory everywhere else. Hooks never trigger hooks.
 
 ## 11. Lifecycles
 
