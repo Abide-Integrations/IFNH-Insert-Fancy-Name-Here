@@ -113,6 +113,16 @@ pub fn assemble(
     return .{ .text = parts.items, .stable_len = stable_len, .sources = sources.items };
 }
 
+/// Append a caller-owned fragment (e.g. `profiles.<name>.prompt`, D-03) to
+/// an assembled prompt. The fragment is volatile by construction, so
+/// `stable_len` does not move.
+pub fn appendFragment(arena: std.mem.Allocator, base: Assembled, fragment: []const u8) !Assembled {
+    const extra = std.mem.trimEnd(u8, fragment, " \t\r\n");
+    if (extra.len == 0) return base;
+    const text = try std.fmt.allocPrint(arena, "{s}\n\n{s}", .{ base.text, extra });
+    return .{ .text = text, .stable_len = base.stable_len, .sources = base.sources };
+}
+
 /// Extract the directories referenced by tool calls in the history
 /// (read/edit/write/grep targets), used to focus nested instructions.
 pub fn focusDirsFromHistory(arena: std.mem.Allocator, history: []const @import("types.zig").ChatMessage, max: usize) []const []const u8 {
@@ -210,4 +220,18 @@ test "focus dirs pull in nested AGENTS.md" {
     try std.testing.expect(asm2.text.len > asm2.stable_len);
     try std.testing.expectEqualStrings(plain.text, asm2.text[0..asm2.stable_len]);
     try std.testing.expect(std.mem.indexOf(u8, asm2.text[0..asm2.stable_len], "core rules") == null);
+}
+test "appendFragment keeps the stable prefix and trims the tail" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const base = Assembled{ .text = "builtin", .stable_len = 7, .sources = &.{} };
+    const same = try appendFragment(arena, base, "  \n\t");
+    try std.testing.expectEqualStrings("builtin", same.text);
+    try std.testing.expectEqual(@as(usize, 7), same.stable_len);
+
+    const with_prompt = try appendFragment(arena, base, "be terse  \n");
+    try std.testing.expectEqualStrings("builtin\n\nbe terse", with_prompt.text);
+    try std.testing.expectEqual(@as(usize, 7), with_prompt.stable_len);
 }

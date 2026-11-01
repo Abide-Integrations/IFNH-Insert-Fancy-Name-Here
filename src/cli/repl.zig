@@ -42,6 +42,9 @@ pub const Options = struct {
     no_color: bool = false,
     /// Startup trace owned by main, measured from process start (B-01).
     trace: ?*trace_mod.Trace = null,
+    /// `--profile <name>`: merge `profiles.<name>` and append its prompt
+    /// fragment (D-03). Unknown names are a hard startup error.
+    profile: ?[]const u8 = null,
 };
 
 /// Terminal-facing state for the REPL: the palette, the streams and the
@@ -273,6 +276,21 @@ pub fn run(
     if (cfg.errors.items.len > 0) return error.InvalidConfig;
     for (cfg.warnings.items) |w| try out(io, "config warning: {s}\n", .{w});
 
+    // `--profile` is a hard startup error when the name is unknown (D-03):
+    // a typo must not silently run with a different configuration.
+    if (opts.profile) |name| {
+        cfg.applyProfile(name) catch |err| {
+            if (err == error.UnknownProfile) {
+                errOut(io, "error: {s}\n", .{cfg.unknownProfileMessage(arena, name)});
+                std.process.exit(2);
+            }
+            return err;
+        };
+        for (cfg.errors.items) |e| try out(io, "config error [{s}]: {s}\n", .{ e.path, e.message });
+        if (cfg.errors.items.len > 0) return error.InvalidConfig;
+        for (cfg.warnings.items) |w| try out(io, "config warning: {s}\n", .{w});
+    }
+
     // ---- session state (zero-config: lazily create .ifnh) ----
     ensureIfnh(io, cwd) catch {};
     const sessions_dir_name = sessionsDir(arena, &cfg);
@@ -282,6 +300,7 @@ pub fn run(
         .resume_id = opts.resume_id,
         .cwd_label = if (environ.get("PWD")) |pwd| pwd else ".",
         .trace = opts.trace,
+        .profile = opts.profile,
     });
     defer rt.deinit();
     if (rt.local_grants_warning) |warning| try out(io, "{s}", .{warning});
@@ -323,6 +342,9 @@ pub fn run(
     var instructions_span = trace_mod.Span.begin(opts.trace, "startup.instructions");
     const instr = try instructions_mod.assemble(cwd, io, arena, builtin_prompt, &.{});
     instructions_span.end("");
+    // Slash commands and submitted prompts see the profile fragment; the
+    // per-turn prompt gets it in the loop (after the instruction cache).
+    const profiled_instr = profileInstr(arena, &cfg, opts.profile, instr);
 
     // ---- welcome ----
     {
@@ -396,12 +418,12 @@ pub fn run(
             const cmd_end = std.mem.indexOfScalar(u8, line, ' ') orelse line.len;
             const cmd = line[1..cmd_end];
             const rest = if (cmd_end < line.len) std.mem.trim(u8, line[cmd_end + 1 ..], " \t") else "";
-            const action = handleCommand(io, arena, cwd, &rt, &ui, &events, &cfg, cmd, rest, instr);
+            const action = handleCommand(io, arena, cwd, &rt, &ui, &events, &cfg, cmd, rest, profiled_instr);
             switch (action) {
                 .quit => break,
                 .submit => |prompt| {
                     ui.beginTurn(&rt, &cfg);
-                    const res = try rt.submitTurn(arena, &cfg, rt.providerConfig(&cfg), instr.text, instr.stable_len, prompt, cwd, &events);
+                    const res = try rt.submitTurn(arena, &cfg, rt.providerConfig(&cfg), profiled_instr.text, profiled_instr.stable_len, prompt, cwd, &events);
                     try renderTurn(io, arena, &ui, res);
                     ui.endTurn(&rt, &cfg, res);
                 },
@@ -435,7 +457,7 @@ pub fn run(
         var turn_instructions_span = trace_mod.Span.begin(rt.trace, "turn.instructions");
         const turn_instr_lookup = rt.turn_cache.instructions(cwd, system_prompt.system_prompt, focus) catch turn_cache_mod.Lookup(instructions_mod.Assembled){ .value = instr, .hit = false };
         turn_instructions_span.end(if (turn_instr_lookup.hit) "cached" else "");
-        const turn_instr = turn_instr_lookup.value;
+        const turn_instr = profileInstr(arena, &cfg, opts.profile, turn_instr_lookup.value);
         // Skills catalog appendix (budgeted, K148). It goes after the stable
         // prefix, so a cacheable prefix stays valid across turns (B-03).
         const Prompt = struct { text: []const u8, stable_len: usize };
@@ -928,6 +950,10 @@ fn handleCommand(
                 return .none;
             };
             rt.overrides.append(arena, .{ .path = "model.model", .json = json }) catch {};
+            // A typed model id must win over `routing.parent` (D-04),
+            // otherwise the alias would silently keep answering.
+            cfg.applyOverride("routing.parent", "\"default\"", .{ .layer = .session, .origin = "session" }) catch {};
+            rt.overrides.append(arena, .{ .path = "routing.parent", .json = "\"default\"" }) catch {};
             out(io, "model set to {s} for this session\n", .{rest}) catch {};
         } else {
             out(io, "usage: /model <name>\n", .{}) catch {};
@@ -1357,6 +1383,27 @@ fn out(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
     var buf: [4096]u8 = undefined;
     const text = std.fmt.bufPrint(&buf, fmt, args) catch return error.MessageTooLong;
     try std.Io.File.stdout().writeStreamingAll(io, text);
+}
+
+/// Startup errors go to stderr: a script reading stdout must not see them
+/// mixed into the session output.
+fn errOut(io: std.Io, comptime fmt: []const u8, args: anytype) void {
+    var buf: [4096]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    std.Io.File.stderr().writeStreamingAll(io, text) catch {};
+}
+
+/// Append `profiles.<name>.prompt` (D-03) after the assembled prompt. The
+/// fragment is volatile, so the stable prefix does not move.
+fn profileInstr(
+    arena: std.mem.Allocator,
+    cfg: *const config_mod.Store,
+    profile: ?[]const u8,
+    base: instructions_mod.Assembled,
+) instructions_mod.Assembled {
+    const name = profile orelse return base;
+    const fragment = cfg.profilePrompt(name) orelse return base;
+    return instructions_mod.appendFragment(arena, base, fragment) catch base;
 }
 
 // ---------------------------------------------------------------- tests

@@ -11,6 +11,7 @@ const provider = @import("provider.zig");
 const sse = @import("sse.zig");
 const transport = @import("transport.zig");
 const limits = @import("limits.zig");
+const options_mod = @import("options.zig");
 const trace_mod = @import("../core/trace.zig");
 
 const anthropic_version = "2023-06-01";
@@ -382,6 +383,8 @@ fn buildBody(arena: std.mem.Allocator, req: provider.ModelRequest) ![]u8 {
     if (req.temperature) |t| {
         try w.print(",\"temperature\":{d}", .{t});
     }
+    // Provider-specific options (D-05), only for keys this adapter compiles.
+    try options_mod.splice(w, req.provider_options);
     try w.writeByte('}');
     return aw.written();
 }
@@ -547,6 +550,25 @@ test "body max_tokens uses the model default unless configured" {
     try std.testing.expect(std.mem.indexOf(u8, try buildBody(arena, req), "\"max_tokens\":8192,") != null);
     req.max_output_tokens = 1234;
     try std.testing.expect(std.mem.indexOf(u8, try buildBody(arena, req), "\"max_tokens\":1234,") != null);
+}
+
+test "provider options are spliced as body members" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var req = testRequest(&.{.{ .role = .user, .content = "hi" }}, &.{});
+    req.provider_options = "{\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":2048},\"top_k\":5}";
+    const body = try buildBody(arena, req);
+    try std.testing.expect(std.mem.endsWith(u8, body, ",\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":2048},\"top_k\":5}"));
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{});
+    try std.testing.expectEqualStrings("enabled", parsed.object.get("thinking").?.object.get("type").?.string);
+    try std.testing.expectEqual(@as(i64, 5), parsed.object.get("top_k").?.integer);
+    // max_tokens keeps its required position and value.
+    try std.testing.expect(parsed.object.get("max_tokens").?.integer > 0);
+
+    req.provider_options = "";
+    try std.testing.expect(std.mem.indexOf(u8, try buildBody(arena, req), "thinking") == null);
 }
 
 test "body splits a cacheable system prefix into two blocks" {

@@ -314,6 +314,69 @@ and subagent spend is not counted yet. `ui.footer` switches the status footer.
 
 `NO_COLOR` / `--no-color` disable styling.
 
+### Profiles, aliases and routing
+
+`--profile <name>` (a global flag, so it goes before the subcommand) merges
+`profiles.<name>` over the loaded config as the highest layer below session
+overrides, and appends its `prompt` text to the system prompt:
+
+```bash
+ifnh --profile offline            # REPL with the profile applied
+ifnh --profile offline ask -p "hi"
+```
+
+```jsonc
+{
+  "profiles": {
+    "offline": {
+      "model": { "provider": "openai", "base_url": "http://127.0.0.1:11434/v1" },
+      "permissions": { "default_mode": "auto" },
+      "prompt": "This machine has no network access."
+    }
+  }
+}
+```
+
+An unknown name is a startup error (`unknown profile 'x'; known profiles: a, b`)
+with exit code 2; `/model` still wins over a profile. A profile may set any
+config key, including `models` and `routing` — the merged result is validated
+the same way a hand-written config is.
+
+Model aliases name a provider/model pair once and reuse it:
+
+```jsonc
+{
+  "models": {
+    "aliases": {
+      "fast": { "provider": "openai", "model": "gpt-5-mini",
+                "provider_options": { "reasoning_effort": "low" } },
+      "deep": { "provider": "anthropic", "model": "claude-opus-4-1",
+                "provider_options": { "thinking": { "type": "enabled", "budget_tokens": 8192 } } }
+    },
+    "fallbacks": { "fast": ["deep"] },
+    "provider_options": { "claude-opus-4-1": { "top_k": 40 } }
+  },
+  "routing": { "parent": "deep", "research": "fast",
+               "implement": "default", "review": "fast" }
+}
+```
+
+- `routing` picks the model per role: `parent` for the main turn, `research`,
+  `implement` and `review` for the child agents that role can spawn.
+  `"default"` means the plain `model` block. A role with no entry uses the
+  parent's provider, model, endpoint and key together (never a mix).
+- An explicit `model` argument in an `agent` tool call beats `routing`.
+- `fallbacks` is a chain, off by default. It is tried only after the failures
+  that are worth retrying (HTTP 429/5xx, network, timeout) are exhausted, never
+  after an error that a retry cannot fix and never after text has already been
+  streamed. The switch prints `fallback: fast -> deep` on stderr.
+- `provider_options` is per adapter and only implemented keys survive:
+  `openai` accepts `reasoning_effort` (`minimal|low|medium|high`) and
+  `reasoning` (object); `anthropic` accepts `thinking` (object) and `top_k`
+  (integer). Anything else is dropped with a config warning. Precedence is
+  alias > `models.provider_options.<model id>` > `model.provider_options`,
+  merged key by key.
+
 ## 6. What the agent can do (tool kernel)
 
 `read` `glob` `grep` `edit` `write` `bash` `git` — plus:

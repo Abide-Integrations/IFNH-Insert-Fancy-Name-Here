@@ -66,7 +66,11 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (parsed.subcommand == .none) {
-        repl.run(io, arena, init.environ_map, .{ .no_color = parsed.flags.no_color, .trace = &startup_trace }) catch |err| {
+        repl.run(io, arena, init.environ_map, .{
+            .no_color = parsed.flags.no_color,
+            .trace = &startup_trace,
+            .profile = parsed.flags.profile,
+        }) catch |err| {
             if (err == error.AccessDenied) {
                 try printOut(io, arena, "error: permission denied\n" ++
                     "ifnh needs to write .ifnh/ in the current directory.\n" ++
@@ -106,7 +110,10 @@ fn dispatch(
     _ = io_arg;
     switch (parsed.subcommand) {
         .none => {
-            try repl.run(io, arena, environ, .{ .no_color = parsed.flags.no_color });
+            try repl.run(io, arena, environ, .{
+                .no_color = parsed.flags.no_color,
+                .profile = parsed.flags.profile,
+            });
             return;
         },
         .init => try runInit(io, arena, parsed.args),
@@ -127,6 +134,7 @@ fn dispatch(
             break :blk try repl.run(io, arena, environ, .{
                 .resume_id = parsed.args[0],
                 .no_color = parsed.flags.no_color,
+                .profile = parsed.flags.profile,
             });
         },
         .doctor => try runDoctor(io, arena, environ),
@@ -498,6 +506,7 @@ const help_text =
     \\  --json                  machine-readable output
     \\  --no-color              disable color
     \\  --log-level <level>     err | info | debug | trace
+    \\  --profile <name>        apply profiles.<name> from config (D-03)
     \\  -p <prompt>             headless one-shot prompt (same as 'ask -p')
     \\  -h, --help              show help
     \\  -V, --version           print version
@@ -559,6 +568,8 @@ test {
     _ = @import("providers/models.zig");
     _ = @import("providers/probe.zig");
     _ = @import("core/config/keys.zig");
+    _ = @import("core/config/resolve.zig");
+    _ = @import("providers/options.zig");
     _ = @import("core/agent/system_prompt.zig");
     _ = @import("cli/repl.zig");
     _ = @import("cli/ask.zig");

@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const config_mod = @import("../config/config.zig");
+const resolve_mod = @import("../config/resolve.zig");
 const keys_mod = @import("../config/keys.zig");
 const session_mod = @import("../session/store.zig");
 const journal_mod = @import("../journal.zig");
@@ -68,6 +69,8 @@ pub const InitOptions = struct {
     cwd_label: []const u8 = ".",
     /// Startup trace owned by main (B-01).
     trace: ?*trace_mod.Trace = null,
+    /// `--profile` name, re-applied after config re-reads (D-03).
+    profile: ?[]const u8 = null,
 };
 
 /// Result of one turn. `ran` is false when the turn never reached the
@@ -127,6 +130,9 @@ pub const SessionRuntime = struct {
     /// holds one "warning: ..." line per skipped definition; the caller prints
     /// them, the runtime never does.
     custom_tools: tool_mod.CustomToolSet = .{},
+    /// `--profile` name: the `.cli` layer it merged must survive config
+    /// re-reads at turn boundaries (D-03).
+    profile: ?[]const u8 = null,
 
     /// Build a runtime: load provider keys, create or open the session
     /// store, and discover skills, background executions and MCP servers.
@@ -175,6 +181,7 @@ pub const SessionRuntime = struct {
             .http = .{ .allocator = arena, .io = io },
             .process_environ = process_environ,
             .environ = merged_env,
+            .profile = opts.profile,
         };
 
         switch (local_grants.load(arena, io, cwd)) {
@@ -231,24 +238,61 @@ pub const SessionRuntime = struct {
     /// Provider settings for the current config, with the API key read from
     /// the merged environment.
     pub fn providerConfig(self: *SessionRuntime, cfg: *config_mod.Store) agent_engine.ProviderConfig {
+        // `routing.parent` picks the parent's model (D45); the resolved
+        // bundle carries the fallback chain (D49) and provider options (D-05).
+        // Resolution fails for an unconfigured model, which is not an error:
+        // the base config still reports "no model configured" and the
+        // first-run setup can fill it in.
+        if (resolve_mod.resolveRole(cfg, cfg.alloc(), "parent")) |resolved| {
+            return self.providerFrom(cfg, resolved);
+        } else |_| {}
+
         const provider_name = cfg.getString("model.provider", "openai");
         const is_anthropic = std.mem.eql(u8, provider_name, "anthropic");
         const base_url = cfg.getOptionalString("model.base_url") orelse
             (if (is_anthropic) "https://api.anthropic.com" else "https://api.openai.com/v1");
-        const model = cfg.getString("model.model", "");
         const api_key_env = cfg.getOptionalString("model.api_key_env") orelse
             (if (is_anthropic) "ANTHROPIC_API_KEY" else "OPENAI_API_KEY");
-        const api_key = if (self.environ.get(api_key_env)) |k|
-            k
-        else
-            (self.process_environ.get(api_key_env) orelse "");
         return .{
             .provider = if (is_anthropic) anthropic.instance else openai.instance,
-            .model = model,
+            .model = cfg.getString("model.model", ""),
             .base_url = base_url,
-            .api_key = api_key,
+            .api_key = self.keyFor(api_key_env),
+            .api_key_env = api_key_env,
             .client = &self.http,
         };
+    }
+
+    fn providerFrom(self: *SessionRuntime, cfg: *config_mod.Store, resolved: resolve_mod.ResolvedModel) agent_engine.ProviderConfig {
+        const arena = cfg.alloc();
+        var fallbacks: []agent_engine.ProviderConfig = arena.alloc(agent_engine.ProviderConfig, resolved.fallbacks.len) catch
+            &[_]agent_engine.ProviderConfig{};
+        for (resolved.fallbacks, 0..) |fb, i| fallbacks[i] = self.providerEntry(fb);
+        var pcfg = self.providerEntry(resolved);
+        pcfg.fallbacks = fallbacks;
+        return pcfg;
+    }
+
+    fn providerEntry(self: *SessionRuntime, resolved: resolve_mod.ResolvedModel) agent_engine.ProviderConfig {
+        return .{
+            .provider = resolved.provider,
+            .model = resolved.model,
+            .base_url = resolved.base_url,
+            .api_key = self.keyFor(resolved.api_key_env),
+            .api_key_env = resolved.api_key_env,
+            .client = &self.http,
+            .label = resolved.alias,
+            .provider_options = resolved.provider_options,
+            .temperature = resolved.temperature,
+            .max_output_tokens = resolved.max_output_tokens,
+        };
+    }
+
+    /// Key lookup in the merged environment (user env file overlaid by the
+    /// real environment, D022).
+    fn keyFor(self: *SessionRuntime, name: []const u8) []const u8 {
+        if (self.environ.get(name)) |k| return k;
+        return self.process_environ.get(name) orelse "";
     }
 
     /// MCP server/tool listing for slash commands.
@@ -261,6 +305,15 @@ pub const SessionRuntime = struct {
     /// store, or null when the reload failed (caller keeps the last-good one).
     pub fn reloadConfig(self: *SessionRuntime, arena: std.mem.Allocator, cwd: std.Io.Dir) ?config_mod.Store {
         var fresh = config_mod.load(arena, self.io, self.process_environ, cwd) catch return null;
+        // The `.cli` layer is not on disk: re-apply `--profile` so a reload
+        // cannot silently drop it (D-03). Session overrides go on last, so
+        // `/model` still wins.
+        if (self.profile) |name| {
+            fresh.applyProfile(name) catch {
+                fresh.deinit();
+                return null;
+            };
+        }
         for (self.overrides.items) |ov| {
             fresh.applyOverride(ov.path, ov.json, .{ .layer = .session, .origin = "session" }) catch {};
         }
@@ -363,7 +416,10 @@ pub const SessionRuntime = struct {
             return .{};
         }
         if (pcfg.api_key.len == 0) {
-            const key_env = cfg.getOptionalString("model.api_key_env") orelse "OPENAI_API_KEY";
+            const key_env = if (pcfg.api_key_env.len > 0)
+                pcfg.api_key_env
+            else
+                (cfg.getOptionalString("model.api_key_env") orelse "OPENAI_API_KEY");
             statusFmt(events, .plain, "note: no api key — run /provider key {s} <value> (or export it) before sending a message\n", .{key_env});
         }
 
@@ -379,6 +435,21 @@ pub const SessionRuntime = struct {
         const turn_git_lookup = self.turn_cache.gitRepo(cwd) catch turn_cache_mod.Lookup(?git_mod.Git){ .value = null, .hit = false };
         git_span.end(if (turn_git_lookup.hit) "cached" else "");
         const turn_git = turn_git_lookup.value;
+        // Child model routing (D45): resolve each role here, on the parent
+        // thread, so a child thread only reads a finished table.
+        var child_models = subagent_mod.ChildModels{};
+        for (subagent_mod.ChildModels.roles) |role| {
+            const resolved = resolve_mod.resolveRole(cfg, arena, role) catch continue;
+            child_models.set(role, .{
+                .provider = resolved.provider,
+                .model = resolved.model,
+                .base_url = resolved.base_url,
+                .api_key = self.keyFor(resolved.api_key_env),
+                .provider_options = resolved.provider_options,
+                .temperature = resolved.temperature,
+                .max_output_tokens = resolved.max_output_tokens,
+            });
+        }
         var host = subagent_mod.Host{
             .io = io,
             .workspace = cwd,
@@ -408,8 +479,10 @@ pub const SessionRuntime = struct {
             .max_concurrent = cfg.getU32("agents.max_concurrent", 4),
             .max_rounds = cfg.getU32("agents.max_tool_rounds", 25),
             .redactions = redactionsFor(arena, cfg.getBool("debug.redact", true), pcfg.api_key),
-            .temperature = cfg.getOptionalF64("model.temperature"),
-            .max_output_tokens = cfg.getOptionalU32("model.max_output_tokens"),
+            .temperature = pcfg.temperature,
+            .max_output_tokens = pcfg.max_output_tokens,
+            .provider_options = pcfg.provider_options,
+            .routing = &child_models,
             .cancel = &cancel,
             .git = turn_git,
             .worktree_root = blk: {

@@ -177,6 +177,9 @@ pub fn compact(
         .api_key = pcfg.api_key,
         .system = compaction_instructions,
         .messages = msgs[0..],
+        .temperature = pcfg.temperature,
+        .max_output_tokens = pcfg.max_output_tokens,
+        .provider_options = pcfg.provider_options,
         .cancel = &cancel,
     }, .{ .ctx = &sink_ctx, .emit_fn = SinkCtx.emit });
 
