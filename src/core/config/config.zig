@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const trace_mod = @import("../trace.zig");
+const resolve_mod = @import("resolve.zig");
 
 pub const Layer = enum {
     builtin,
@@ -49,8 +50,21 @@ pub const default_config_json =
     \\    "base_url": null,
     \\    "api_key_env": "OPENAI_API_KEY",
     \\    "temperature": null,
-    \\    "max_output_tokens": null
+    \\    "max_output_tokens": null,
+    \\    "provider_options": {}
     \\  },
+    \\  "models": {
+    \\    "aliases": {},
+    \\    "fallbacks": {},
+    \\    "provider_options": {}
+    \\  },
+    \\  "routing": {
+    \\    "parent": "default",
+    \\    "research": "default",
+    \\    "implement": "default",
+    \\    "review": "default"
+    \\  },
+    \\  "profiles": {},
     \\  "permissions": {
     \\    "default_mode": "ask",
     \\    "read": ["**"],
@@ -105,8 +119,19 @@ pub const default_config_json =
 /// Top-level sections recognized by the schema. Unknown keys produce
 /// warnings (DECISIONS B19); unknown values in security sections are errors.
 pub const known_sections = [_][]const u8{
-    "schema_version", "model",    "permissions", "git", "agents", "tools",
-    "context",        "planning", "sessions",    "ui",  "debug",
+    "schema_version", "model",    "models", "routing", "profiles",
+    "permissions",    "git",      "agents", "tools",   "context",
+    "planning",       "sessions", "ui",     "debug",
+};
+
+/// Subtrees keyed by user-chosen names (alias names, model ids, profile
+/// names): there is no schema to compare below them, so validation stops.
+pub const free_form_paths = [_][]const u8{
+    "models.aliases",
+    "models.fallbacks",
+    "models.provider_options",
+    "model.provider_options",
+    "profiles",
 };
 
 /// Top-level keys consumed at runtime that have no builtin default value
@@ -139,7 +164,9 @@ pub const wired_defaults = [_][]const u8{
     "context.compact_at_fraction", "context.max_file_read_bytes",
     "sessions.dir",                "sessions.keep",
     "ui.colors",                   "ui.footer",
-    "debug.redact",
+    "debug.redact",                "routing.parent",
+    "routing.research",            "routing.implement",
+    "routing.review",
 };
 
 /// Defaults leaves deliberately not read yet: each would need a feature that
@@ -339,10 +366,14 @@ pub const Store = struct {
         }
     }
 
-    /// Append a warning (bounded).
+    /// Append a warning (bounded). Reachable from per-turn model resolution
+    /// too, so each distinct message is reported once.
     pub fn warn(self: *Store, comptime fmt: []const u8, args: anytype) !void {
         if (self.warnings.items.len >= 64) return;
         const msg = try std.fmt.allocPrint(self.alloc(), fmt, args);
+        for (self.warnings.items) |existing| {
+            if (std.mem.eql(u8, existing, msg)) return;
+        }
         try self.warnings.append(self.alloc(), msg);
     }
 
@@ -357,6 +388,9 @@ pub const Store = struct {
     /// warning on keys the schema does not know (A-T07).
     fn validateKeys(self: *Store, value: std.json.Value, defaults: std.json.Value, prefix: []const u8) !void {
         if (value != .object) return;
+        for (free_form_paths) |free_form| {
+            if (std.mem.eql(u8, prefix, free_form)) return;
+        }
         const arena = self.alloc();
         var it = value.object.iterator();
         loop: while (it.next()) |entry| {
@@ -413,6 +447,70 @@ pub const Store = struct {
         if (self.get("tools.external")) |value| {
             if (value != .bool) try self.addError("tools.external", "must be true or false", .{});
         }
+        // Aliases, fallback chains, routing and profiles reference each
+        // other by name; check the references (D44/D45/D49).
+        try resolve_mod.validateConfig(self);
+    }
+
+    /// Merge `profiles.<name>` into the live tree at the CLI layer and
+    /// re-validate (a profile is config like any other). The `prompt`
+    /// fragment stays out of the tree: the prompt assembler reads it through
+    /// `profilePrompt`.
+    pub fn applyProfile(self: *Store, name: []const u8) !void {
+        const arena = self.alloc();
+        const profiles = self.get("profiles") orelse return error.UnknownProfile;
+        if (profiles != .object) return error.UnknownProfile;
+        const profile = profiles.object.get(name) orelse return error.UnknownProfile;
+        if (profile != .object) return error.UnknownProfile;
+
+        var copy = try std.json.ObjectMap.init(arena, &.{}, &.{});
+        var it = profile.object.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.key_ptr.*, "prompt")) continue;
+            try copy.put(arena, entry.key_ptr.*, try cloneValue(arena, entry.value_ptr.*));
+        }
+        const origin = try std.fmt.allocPrint(arena, "--profile {s}", .{name});
+        try self.mergeValue(.{ .object = copy }, .{ .layer = .cli, .origin = origin });
+
+        self.errors.clearRetainingCapacity();
+        self.warnings.clearRetainingCapacity();
+        try self.validate();
+    }
+
+    /// `profiles.<name>.prompt`: the fragment appended after the assembled
+    /// system prompt (D-03).
+    pub fn profilePrompt(self: *const Store, name: []const u8) ?[]const u8 {
+        const profiles = self.get("profiles") orelse return null;
+        if (profiles != .object) return null;
+        const profile = profiles.object.get(name) orelse return null;
+        if (profile != .object) return null;
+        const v = profile.object.get("prompt") orelse return null;
+        return switch (v) {
+            .string => |s| s,
+            else => null,
+        };
+    }
+
+    /// Diagnostic for `--profile`: names the unknown profile and lists the
+    /// known ones in a stable order.
+    pub fn unknownProfileMessage(self: *const Store, arena: std.mem.Allocator, name: []const u8) []const u8 {
+        var names: std.ArrayListUnmanaged([]const u8) = .empty;
+        if (self.get("profiles")) |profiles| {
+            if (profiles == .object) {
+                var it = profiles.object.iterator();
+                while (it.next()) |entry| names.append(arena, entry.key_ptr.*) catch {};
+            }
+        }
+        std.mem.sort([]const u8, names.items, {}, struct {
+            fn lt(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lt);
+        const joined = std.mem.join(arena, ", ", names.items) catch "";
+        return std.fmt.allocPrint(arena, "unknown profile '{s}'; known profiles: {s}", .{
+            name,
+            if (joined.len == 0) "(none)" else joined,
+        }) catch "unknown profile";
     }
 };
 
@@ -825,6 +923,106 @@ fn collectLeaves(alloc: std.mem.Allocator, value: std.json.Value, prefix: []cons
             else => try out.append(alloc, path),
         }
     }
+}
+
+test "applyProfile merges at the cli layer without the prompt fragment" {
+    var store = try Store.init(std.testing.allocator);
+    defer store.deinit();
+    const json =
+        \\{ "model": { "model": "base-model" },
+        \\  "profiles": { "fast": { "model": { "model": "fast-model" },
+        \\                           "permissions": { "default_mode": "auto" },
+        \\                           "prompt": "be brief" } } }
+    ;
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, store.alloc(), json, .{});
+    try store.mergeValue(v, .{ .layer = .project, .origin = ".ifnh/config.json" });
+    try store.validate();
+    try std.testing.expect(store.errors.items.len == 0);
+
+    try store.applyProfile("fast");
+    try std.testing.expect(store.errors.items.len == 0);
+    try std.testing.expectEqualStrings("fast-model", store.getString("model.model", ""));
+    try std.testing.expectEqualStrings("auto", store.getString("permissions.default_mode", ""));
+    const src = store.getSource("model.model").?;
+    try std.testing.expectEqual(Layer.cli, src.layer);
+    try std.testing.expectEqualStrings("--profile fast", src.origin);
+    // The prompt fragment is read separately, never merged.
+    try std.testing.expectEqualStrings("be brief", store.profilePrompt("fast").?);
+    try std.testing.expect(store.get("prompt") == null);
+    try std.testing.expect(store.profilePrompt("nope") == null);
+}
+
+test "unknown profile is an error naming the known profiles" {
+    var store = try Store.init(std.testing.allocator);
+    defer store.deinit();
+    const json =
+        \\{ "profiles": { "slowp": {}, "alp": {} } }
+    ;
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, store.alloc(), json, .{});
+    try store.mergeValue(v, .{ .layer = .user, .origin = "user" });
+
+    try std.testing.expectError(error.UnknownProfile, store.applyProfile("bogus"));
+    try std.testing.expectEqualStrings(
+        "unknown profile 'bogus'; known profiles: alp, slowp",
+        store.unknownProfileMessage(store.alloc(), "bogus"),
+    );
+
+    var empty = try Store.init(std.testing.allocator);
+    defer empty.deinit();
+    try std.testing.expectError(error.UnknownProfile, empty.applyProfile("x"));
+    try std.testing.expectEqualStrings(
+        "unknown profile 'x'; known profiles: (none)",
+        empty.unknownProfileMessage(empty.alloc(), "x"),
+    );
+}
+
+test "applyProfile re-validates aliases and routing it introduces" {
+    var store = try Store.init(std.testing.allocator);
+    defer store.deinit();
+    const json =
+        \\{ "profiles": { "bad": { "routing": { "research": "ghost" } } } }
+    ;
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, store.alloc(), json, .{});
+    try store.mergeValue(v, .{ .layer = .project, .origin = ".ifnh/config.json" });
+    try store.validate();
+    try std.testing.expect(store.errors.items.len == 0);
+
+    try store.applyProfile("bad");
+    try std.testing.expect(store.errors.items.len == 1);
+    try std.testing.expectEqualStrings("routing.research", store.errors.items[0].path);
+}
+
+test "free-form name sections never warn" {
+    var store = try Store.init(std.testing.allocator);
+    defer store.deinit();
+    const json =
+        \\{ "model": { "provider_options": { "reasoning_effort": "high", "x": 1 } },
+        \\  "models": { "aliases": { "fast": { "model": "m", "note": 1 } },
+        \\              "fallbacks": { "fast": ["other"] },
+        \\              "provider_options": { "gpt-x": { "reasoning_effort": "low" } } },
+        \\  "profiles": { "quick": { "model": { "model": "m2" }, "prompt": "p" } } }
+    ;
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, store.alloc(), json, .{});
+    try store.mergeValue(v, .{ .layer = .project, .origin = ".ifnh/config.json" });
+    try store.validate();
+    // A free-form map is never itself an unknown key: the quoted path has to
+    // be the whole section, not a child of one.
+    for (free_form_paths) |path| {
+        const needle = try std.fmt.allocPrint(std.testing.allocator, "unknown config key '{s}'", .{path});
+        defer std.testing.allocator.free(needle);
+        for (store.warnings.items) |w| {
+            try std.testing.expect(std.mem.indexOf(u8, w, needle) == null);
+        }
+    }
+    // Keys inside the maps are still policed: the alias's own stray key warns,
+    // and so does an option the openai adapter does not implement.
+    var saw_alias_key = false;
+    var saw_option = false;
+    for (store.warnings.items) |w| {
+        if (std.mem.indexOf(u8, w, "models.aliases.fast.note") != null) saw_alias_key = true;
+        if (std.mem.indexOf(u8, w, "unknown key 'x' for openai") != null) saw_option = true;
+    }
+    try std.testing.expect(saw_alias_key and saw_option);
 }
 
 test "setPath creates intermediate objects" {

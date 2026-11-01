@@ -17,6 +17,9 @@ pub const GlobalFlags = struct {
     /// `-p "<prompt>"` before the subcommand: headless one-shot prompt,
     /// the same thing as `ifnh ask -p "<prompt>"` (C-02).
     prompt: ?[]const u8 = null,
+    /// `--profile <name>`: merge `profiles.<name>` over the loaded config
+    /// and append its `prompt` fragment (D-03).
+    profile: ?[]const u8 = null,
 };
 
 pub const Subcommand = enum {
@@ -82,6 +85,10 @@ fn parseGlobal(argv: []const []const u8, i: *usize, result: *Parsed) ParseError!
         if (i.* >= argv.len) return error.MissingFlagValue;
         result.flags.log_level = std.meta.stringToEnum(LogLevel, argv[i.*]) orelse
             return error.UnknownFlag;
+    } else if (std.mem.eql(u8, arg, "--profile")) {
+        i.* += 1;
+        if (i.* >= argv.len) return error.MissingFlagValue;
+        result.flags.profile = argv[i.*];
     } else if (std.mem.eql(u8, arg, "-p")) {
         i.* += 1;
         if (i.* >= argv.len) return error.MissingFlagValue;
@@ -241,6 +248,19 @@ test "unknown flag is an error" {
     try std.testing.expectError(error.UnknownFlag, parse(&.{"--bogus"}));
     try std.testing.expectError(error.MissingFlagValue, parse(&.{"--log-level"}));
     try std.testing.expectError(error.MissingFlagValue, parse(&.{"-p"}));
+}
+
+test "parse --profile before the subcommand" {
+    const p = try parse(&.{ "--profile", "fast", "-p", "hi" });
+    try std.testing.expectEqualStrings("fast", p.flags.profile.?);
+    try std.testing.expectEqualStrings("hi", p.flags.prompt.?);
+    try std.testing.expectEqual(Subcommand.none, p.subcommand);
+
+    const ask = try parse(&.{ "--profile", "fast", "ask", "-p", "hi" });
+    try std.testing.expectEqualStrings("fast", ask.flags.profile.?);
+    try std.testing.expectEqual(Subcommand.ask, ask.subcommand);
+    try std.testing.expect((try parse(&.{})).flags.profile == null);
+    try std.testing.expectError(error.MissingFlagValue, parse(&.{"--profile"}));
 }
 
 test "unknown subcommand captures args" {

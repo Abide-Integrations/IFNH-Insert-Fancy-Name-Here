@@ -324,9 +324,25 @@ pub fn run(
     if (cfg.errors.items.len > 0) return exitCode(.failed);
     for (cfg.warnings.items) |w| stderrPrint(io, "config warning: {s}\n", .{w});
 
+    // `--profile` is a hard startup error when the name is unknown (D-03).
+    if (global.profile) |name| {
+        cfg.applyProfile(name) catch |err| {
+            if (err == error.UnknownProfile) {
+                stderrPrint(io, "error: {s}\n", .{cfg.unknownProfileMessage(arena, name)});
+                return exit_usage;
+            }
+            stderrPrint(io, "error: cannot apply profile '{s}': {s}\n", .{ name, @errorName(err) });
+            return exitCode(.failed);
+        };
+        for (cfg.errors.items) |e| stderrPrint(io, "config error [{s}]: {s}\n", .{ e.path, e.message });
+        if (cfg.errors.items.len > 0) return exitCode(.failed);
+        for (cfg.warnings.items) |w| stderrPrint(io, "config warning: {s}\n", .{w});
+    }
+
     var rt = session_runtime.SessionRuntime.init(io, arena, environ, &cfg, cwd, .{
         .sessions_dir = sessionsDir(&cfg),
         .cwd_label = if (environ.get("PWD")) |pwd| pwd else ".",
+        .profile = global.profile,
     }) catch |err| {
         stderrPrint(io, "error: cannot start a session: {s}\n", .{@errorName(err)});
         return exitCode(.failed);
@@ -335,10 +351,16 @@ pub fn run(
     if (rt.local_grants_warning) |warning| stderrPrint(io, "{s}", .{warning});
     for (rt.custom_tools.warnings) |warning| stderrPrint(io, "{s}", .{warning});
 
-    const instr = instructions_mod.assemble(cwd, io, arena, system_prompt.system_prompt, &.{}) catch |err| {
+    var instr = instructions_mod.assemble(cwd, io, arena, system_prompt.system_prompt, &.{}) catch |err| {
         stderrPrint(io, "error: cannot assemble instructions: {s}\n", .{@errorName(err)});
         return exitCode(.failed);
     };
+    // The profile prompt is a volatile tail; the stable prefix is untouched.
+    if (global.profile) |name| {
+        if (cfg.profilePrompt(name)) |fragment| {
+            instr = instructions_mod.appendFragment(arena, instr, fragment) catch instr;
+        }
+    }
 
     var sink = Sink{
         .io = io,

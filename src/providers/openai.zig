@@ -11,6 +11,7 @@ const sse = @import("sse.zig");
 const transport = @import("transport.zig");
 const trace_mod = @import("../core/trace.zig");
 const core_types = @import("../core/types.zig");
+const options_mod = @import("options.zig");
 
 pub const default_context: Context = .{};
 
@@ -396,9 +397,8 @@ fn buildBody(arena: std.mem.Allocator, req: provider.ModelRequest) ![]u8 {
     if (req.max_output_tokens) |t| {
         try w.print(",\"max_tokens\":{d}", .{t});
     }
-    if (req.provider_options.len > 0) {
-        try w.print(",{s}", .{std.mem.trimEnd(u8, req.provider_options, "{}")});
-    }
+    // Provider-specific options (D-05), only for keys this adapter compiles.
+    try options_mod.splice(w, req.provider_options);
     try w.writeByte('}');
     return aw.written();
 }
@@ -521,6 +521,25 @@ test "body emits max_tokens only when configured" {
     try std.testing.expect(std.mem.indexOf(u8, try buildBody(arena, req), "max_tokens") == null);
     req.max_output_tokens = 1234;
     try std.testing.expect(std.mem.indexOf(u8, try buildBody(arena, req), "\"max_tokens\":1234") != null);
+}
+
+test "provider options are spliced as body members" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var req = testRequest(&.{.{ .role = .user, .content = "hi" }}, &.{});
+    req.provider_options = "{\"reasoning_effort\":\"high\",\"reasoning\":{\"effort\":\"low\"}}";
+    const body = try buildBody(arena, req);
+    // Exactly one object closes the body, and the options are top-level.
+    try std.testing.expect(std.mem.endsWith(u8, body, ",\"reasoning_effort\":\"high\",\"reasoning\":{\"effort\":\"low\"}}"));
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{});
+    try std.testing.expectEqualStrings("high", parsed.object.get("reasoning_effort").?.string);
+    try std.testing.expectEqualStrings("low", parsed.object.get("reasoning").?.object.get("effort").?.string);
+
+    // No options: the body is unchanged.
+    req.provider_options = "";
+    try std.testing.expect(std.mem.indexOf(u8, try buildBody(arena, req), "reasoning_effort") == null);
 }
 
 test "usage parses prompt_tokens_details.cached_tokens" {

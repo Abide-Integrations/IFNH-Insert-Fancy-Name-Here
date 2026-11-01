@@ -34,7 +34,25 @@ pub const ProviderConfig = struct {
     api_key: []const u8,
     /// Session-owned client shared by every round (B-02).
     client: ?*std.http.Client = null,
+    /// Alias that produced this config (D44); "" for an unaliased model.
+    /// Used for the fallback notice.
+    label: []const u8 = "",
+    /// Environment variable the key was read from (diagnostics).
+    api_key_env: []const u8 = "",
+    /// Compiled provider options as a JSON object (D-05).
+    provider_options: []const u8 = "",
+    /// Sampling settings from the alias or `model.*`; null leaves them off
+    /// the request (the provider default applies).
+    temperature: ?f64 = null,
+    max_output_tokens: ?u32 = null,
+    /// Later models to try after retryable failures are exhausted (D49).
+    fallbacks: []const ProviderConfig = &.{},
 };
+
+/// Name used in the `fallback:` notice.
+fn labelOf(cfg: ProviderConfig) []const u8 {
+    return if (cfg.label.len > 0) cfg.label else cfg.model;
+}
 
 pub const Callbacks = struct {
     ctx: *anyopaque,
@@ -207,33 +225,49 @@ pub fn runTurn(p: RunParams) !Outcome {
         // One sink for the whole round: a retry must not end the TTFT span a
         // second time when the replacement attempt emits its first event.
         var trace_sink = TraceSink{ .collector = &collector, .ttft = ttft_span };
+        var active: ProviderConfig = p.pcfg;
+        var fallback_index: usize = 0;
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
             collector = Collector{ .arena = p.arena, .callbacks = p.callbacks };
             trace_sink.collector = &collector;
-            try p.pcfg.provider.stream(p.arena, p.io, .{
-                .model = p.pcfg.model,
-                .base_url = p.pcfg.base_url,
-                .api_key = p.pcfg.api_key,
+            try active.provider.stream(p.arena, p.io, .{
+                .model = active.model,
+                .base_url = active.base_url,
+                .api_key = active.api_key,
                 .system = p.system,
                 .system_stable_len = p.system_stable_len,
                 .messages = p.history.items,
                 .tools = tools,
-                .temperature = p.temperature,
-                .max_output_tokens = p.max_output_tokens,
+                .temperature = p.temperature orelse active.temperature,
+                .max_output_tokens = p.max_output_tokens orelse active.max_output_tokens,
+                .provider_options = active.provider_options,
                 .cancel = p.cancel,
                 .trace = p.trace,
-                .client = p.pcfg.client,
+                .client = active.client,
             }, .{ .ctx = &trace_sink, .emit_fn = TraceSink.emit });
-            if (collector.failure) |f| {
-                if (core_types.isRetryable(f.kind) and attempt < p.max_retries and
-                    collector.text.items.len == 0 and !p.cancel.load(.acquire))
-                {
-                    sleepSeconds(p.io, retryDelaySeconds(attempt, f.retry_after_s)) catch break;
-                    continue;
-                }
+            const failure = collector.failure orelse break;
+            if (!core_types.isRetryable(failure.kind)) break;
+            // A failure that already streamed text may have been delivered
+            // (D47): retry and fallback are only safe on a clean attempt.
+            const clean = collector.text.items.len == 0 and !p.cancel.load(.acquire);
+            if (!clean) break;
+            if (attempt < p.max_retries) {
+                sleepSeconds(p.io, retryDelaySeconds(attempt, failure.retry_after_s)) catch break;
+                continue;
             }
-            break;
+            // Retries are exhausted: switch to the next fallback model, if
+            // the alias configured one (D49, off by default).
+            if (fallback_index >= p.pcfg.fallbacks.len) break;
+            const next = p.pcfg.fallbacks[fallback_index];
+            fallback_index += 1;
+            p.callbacks.on_notice(p.callbacks.ctx, try std.fmt.allocPrint(
+                p.arena,
+                "fallback: {s} -> {s}",
+                .{ labelOf(active), labelOf(next) },
+            ));
+            active = next;
+            attempt = 0;
         }
         round_span.end("");
 
@@ -1070,6 +1104,157 @@ test "partial stream failure is not retried" {
     try std.testing.expectEqual(Status.failed, outcome.status);
     try std.testing.expectEqualStrings("partial", outcome.reply);
     try std.testing.expectEqual(@as(usize, 1), fake.call_index);
+}
+
+test "fallback model is used after retryable attempts are exhausted" {
+    var primary = testing.Fake{
+        .script = &.{
+            // `retry_after_s = 0` keeps the test from sleeping between attempts.
+            &.{.{ .failure = .{ .kind = .rate_limited, .message = "slow down", .retry_after_s = 0 } }},
+            &.{.{ .failure = .{ .kind = .unavailable, .message = "down", .retry_after_s = 0 } }},
+        },
+    };
+    var backup = testing.Fake{ .script = &.{&.{.{ .text = "from backup" }}} };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var history: std.ArrayListUnmanaged(core_types.ChatMessage) = .empty;
+    try history.append(arena, .{ .role = .user, .content = "hi" });
+    var cancel = std.atomic.Value(bool).init(false);
+    var perm_engine = @import("../permissions/engine.zig").Engine.init(arena, .auto);
+    var tool_ctx: tool_mod.ToolContext = .{
+        .io = std.testing.io,
+        .arena = arena,
+        .workspace = std.Io.Dir.cwd(),
+        .engine = &perm_engine,
+        .journal = null,
+        .max_file_read_bytes = 64 * 1024,
+        .approval_ctx = undefined,
+        .approval_fn = struct {
+            fn approve(_: *anyopaque, _: tool_mod.ApprovalRequest) tool_mod.ApprovalResponse {
+                return .denied;
+            }
+        }.approve,
+    };
+
+    const Notices = struct {
+        arena: std.mem.Allocator,
+        texts: std.ArrayListUnmanaged([]const u8) = .empty,
+        fn push(ctx: *anyopaque, text: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.texts.append(self.arena, self.arena.dupe(u8, text) catch return) catch {};
+        }
+    };
+    var notices = Notices{ .arena = arena };
+
+    const backup_pcfg = ProviderConfig{
+        .provider = backup.provider(),
+        .model = "backup-model",
+        .base_url = "",
+        .api_key = "",
+        .label = "backup",
+    };
+    const outcome = try runTurn(.{
+        .io = std.testing.io,
+        .arena = arena,
+        .pcfg = .{
+            .provider = primary.provider(),
+            .model = "primary-model",
+            .base_url = "",
+            .api_key = "",
+            .label = "primary",
+            .fallbacks = &.{backup_pcfg},
+        },
+        .system = "",
+        .history = &history,
+        .tool_ctx = &tool_ctx,
+        .max_retries = 1,
+        .callbacks = .{
+            .ctx = &notices,
+            .on_text = noopText,
+            .on_tool_start = noopStart,
+            .on_tool_result = noopResult,
+            .on_notice = Notices.push,
+        },
+        .cancel = &cancel,
+    });
+
+    try std.testing.expectEqual(Status.completed, outcome.status);
+    try std.testing.expectEqualStrings("from backup", outcome.reply);
+    // One retry on the primary, then the switch.
+    try std.testing.expectEqual(@as(usize, 2), primary.call_index);
+    try std.testing.expectEqual(@as(usize, 1), backup.call_index);
+    try std.testing.expectEqual(@as(usize, 1), notices.texts.items.len);
+    try std.testing.expectEqualStrings("fallback: primary -> backup", notices.texts.items[0]);
+}
+
+test "non-retryable failures never fall back" {
+    var primary = testing.Fake{ .script = &.{&.{
+        .{ .failure = .{ .kind = .unauthorized, .message = "bad key" } },
+    }} };
+    var backup = testing.Fake{ .script = &.{&.{.{ .text = "must not run" }}} };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var history: std.ArrayListUnmanaged(core_types.ChatMessage) = .empty;
+    try history.append(arena, .{ .role = .user, .content = "hi" });
+    var cancel = std.atomic.Value(bool).init(false);
+    var perm_engine = @import("../permissions/engine.zig").Engine.init(arena, .auto);
+    var tool_ctx: tool_mod.ToolContext = .{
+        .io = std.testing.io,
+        .arena = arena,
+        .workspace = std.Io.Dir.cwd(),
+        .engine = &perm_engine,
+        .journal = null,
+        .max_file_read_bytes = 64 * 1024,
+        .approval_ctx = undefined,
+        .approval_fn = struct {
+            fn approve(_: *anyopaque, _: tool_mod.ApprovalRequest) tool_mod.ApprovalResponse {
+                return .denied;
+            }
+        }.approve,
+    };
+    var notices: usize = 0;
+    const outcome = try runTurn(.{
+        .io = std.testing.io,
+        .arena = arena,
+        .pcfg = .{
+            .provider = primary.provider(),
+            .model = "primary-model",
+            .base_url = "",
+            .api_key = "",
+            .fallbacks = &.{.{
+                .provider = backup.provider(),
+                .model = "backup-model",
+                .base_url = "",
+                .api_key = "",
+            }},
+        },
+        .system = "",
+        .history = &history,
+        .tool_ctx = &tool_ctx,
+        .callbacks = .{
+            .ctx = &notices,
+            .on_text = noopText,
+            .on_tool_start = noopStart,
+            .on_tool_result = noopResult,
+            .on_notice = struct {
+                fn f(ctx: *anyopaque, _: []const u8) void {
+                    const n: *usize = @ptrCast(@alignCast(ctx));
+                    n.* += 1;
+                }
+            }.f,
+        },
+        .cancel = &cancel,
+    });
+
+    try std.testing.expectEqual(Status.failed, outcome.status);
+    try std.testing.expectEqual(@as(usize, 1), primary.call_index);
+    try std.testing.expectEqual(@as(usize, 0), backup.call_index);
+    try std.testing.expectEqual(@as(usize, 0), notices);
 }
 
 /// Test-only allocator that tracks outstanding bytes and their peak.

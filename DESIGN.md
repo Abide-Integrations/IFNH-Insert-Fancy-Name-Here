@@ -224,17 +224,24 @@ pub const FileOp = union(enum) {
     "base_url": null,              // OpenAI-compatible override (Ollama etc.)
     "api_key_env": "OPENAI_API_KEY",
     "temperature": null,
-    "max_output_tokens": null
+    "max_output_tokens": null,
+    "provider_options": {}        // model-wide adapter options (D-05)
   },
   "models": {
     "aliases": {                   // DECISIONS D44
       "fast":     { "provider": "openai", "model": "..." },
-      "reasoning":{ "provider": "anthropic", "model": "..." }
+      "reasoning":{ "provider": "anthropic", "model": "...",
+                     "provider_options": { "thinking": { "type": "enabled", "budget_tokens": 4096 } } }
     },
-    "fallbacks": {}                // alias -> [alias], off by default (D49)
+    "fallbacks": {},               // alias -> [alias], off by default (D49)
+    "provider_options": {}        // per model id, below an alias, above `model` (D-05)
   },
   "routing": { "parent": "default", "research": "fast",
                "implement": "default", "review": "default" },
+  "profiles": {                    // `--profile <name>` bundles (D-03)
+    "offline": { "model": { "base_url": "http://127.0.0.1:11434/v1" },
+                 "prompt": "Work without network access." }
+  },
   "permissions": {
     "default_mode": "ask",         // ask | auto   (auto = read allow, write ask)
     "read":  ["**"],
@@ -266,6 +273,8 @@ pub const FileOp = union(enum) {
 ```
 
 All of it optional — zero-config runs on env credentials + defaults (D048). `IFNH_MODEL=anthropic/claude-...` style env and `IFNH_PERMISSIONS__DEFAULT_MODE=auto` nesting both work.
+
+**Model resolution order** (`src/core/config/resolve.zig`). An alias wins over the `model` block; a missing key is inherited from `model` only when the alias keeps the same provider (a provider switch drops `base_url`/`api_key_env`, D46). `routing.<role>` names an alias (`default` = the `model` block) and is read for the parent turn and for each spawned child role; a role with no entry (or an explicit `model` argument) keeps the parent's bundle. `provider_options` merge shallowly per key: alias > `models.provider_options.<model>` > `model.provider_options`, then `src/providers/options.zig` keeps only the keys the adapter implements (`reasoning_effort`, `reasoning` for openai; `thinking`, `top_k` for anthropic) and warns about the rest. Fallbacks are tried only after the retryable-failure budget is spent, never after a non-retryable error or partial text, and are pre-resolved into a flat chain. `profiles.<name>` is deep-merged as the `.cli` layer when `--profile <name>` is given (minus `prompt`, which is appended to the assembled system prompt after the stable prefix); an unknown name is a startup error, exit code 2.
 
 ## 5. `.ifnh/` layout v1
 

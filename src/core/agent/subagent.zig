@@ -32,6 +32,46 @@ fn parseRole(s: []const u8) ?Role {
     return null;
 }
 
+/// Model settings for one child role (D45). Provider, base URL, key and
+/// model switch together, so a child can never mix one provider's endpoint
+/// with another provider's credential.
+pub const ChildModel = struct {
+    provider: provider_mod.Provider,
+    model: []const u8,
+    base_url: []const u8,
+    api_key: []const u8,
+    provider_options: []const u8 = "",
+    temperature: ?f64 = null,
+    max_output_tokens: ?u32 = null,
+};
+
+/// Role -> model table for children. Resolved once per turn on the parent
+/// thread: a `config.Store` must not be read from a child thread.
+pub const ChildModels = struct {
+    research: ?ChildModel = null,
+    implement: ?ChildModel = null,
+    review: ?ChildModel = null,
+
+    pub const roles = [_][]const u8{ "research", "implement", "review" };
+
+    pub fn set(self: *ChildModels, role: []const u8, model: ChildModel) void {
+        if (std.mem.eql(u8, role, "research")) {
+            self.research = model;
+        } else if (std.mem.eql(u8, role, "implement")) {
+            self.implement = model;
+        } else if (std.mem.eql(u8, role, "review")) {
+            self.review = model;
+        }
+    }
+
+    pub fn get(self: *const ChildModels, role: []const u8) ?ChildModel {
+        if (std.mem.eql(u8, role, "research")) return self.research;
+        if (std.mem.eql(u8, role, "implement")) return self.implement;
+        if (std.mem.eql(u8, role, "review")) return self.review;
+        return null;
+    }
+};
+
 /// Authority snapshot captured once per spawn (fx admission-snapshot
 /// pattern): everything a child needs, borrowed from stable memory.
 pub const Host = struct {
@@ -70,8 +110,14 @@ pub const Host = struct {
     max_concurrent: usize,
     max_rounds: usize,
     redactions: []const []const u8,
+    /// Sampling settings of the inherited (parent) model; a routed child
+    /// role carries its own in `ChildModel`.
     temperature: ?f64 = null,
     max_output_tokens: ?u32 = null,
+    /// Compiled provider options of the inherited model (D-05).
+    provider_options: []const u8 = "",
+    /// Per-role model table (D45); null keeps the parent's model.
+    routing: ?*const ChildModels = null,
     cancel: *std.atomic.Value(bool),
     active: std.atomic.Value(u32) = .init(0),
     report_seq: std.atomic.Value(u32) = .init(0),
@@ -255,15 +301,35 @@ fn runChild(
         host.base_system,
     }) catch return fail(parent_arena, "agent: out of memory", .{});
 
+    // An explicit `model` on the tool call wins; otherwise `routing.<role>`
+    // picks the whole bundle (D45). No routing entry keeps the parent's.
+    var chosen = ChildModel{
+        .provider = host.provider,
+        .model = model orelse host.default_model,
+        .base_url = host.base_url,
+        .api_key = host.api_key,
+        .provider_options = host.provider_options,
+        .temperature = host.temperature,
+        .max_output_tokens = host.max_output_tokens,
+    };
+    if (model == null) {
+        if (host.routing) |routing| {
+            if (routing.get(@tagName(role))) |routed| chosen = routed;
+        }
+    }
+
     const outcome = agent_engine.runTurn(.{
         .io = host.io,
         .arena = child_arena,
         .pcfg = .{
-            .provider = host.provider,
-            .model = model orelse host.default_model,
-            .base_url = host.base_url,
-            .api_key = host.api_key,
+            .provider = chosen.provider,
+            .model = chosen.model,
+            .base_url = chosen.base_url,
+            .api_key = chosen.api_key,
             .client = host.client,
+            .provider_options = chosen.provider_options,
+            .temperature = chosen.temperature,
+            .max_output_tokens = chosen.max_output_tokens,
         },
         .system = system,
         .history = &history,
@@ -278,8 +344,8 @@ fn runChild(
         .cancel = host.cancel,
         .max_tool_rounds = host.max_rounds,
         .redactions = host.redactions,
-        .temperature = host.temperature,
-        .max_output_tokens = host.max_output_tokens,
+        .temperature = chosen.temperature,
+        .max_output_tokens = chosen.max_output_tokens,
     }) catch |err| {
         return fail(parent_arena, "agent: child turn failed: {s}", .{@errorName(err)});
     };
@@ -615,4 +681,104 @@ test "worktree isolation: child edits land in its own tree" {
     // Main tree untouched; worktree has the edit.
     const main_data = try tmp.dir.readFileAlloc(io, "code.txt", arena, .limited(1024));
     try std.testing.expectEqualStrings("original\n", main_data);
+}
+
+/// Records the request a child turn actually made.
+const Recorder = struct {
+    model: []const u8 = "",
+    base_url: []const u8 = "",
+    api_key: []const u8 = "",
+    options: []const u8 = "",
+    calls: usize = 0,
+
+    fn stream(ctx: *anyopaque, alloc: std.mem.Allocator, io: std.Io, req: provider_mod.ModelRequest, sink: provider_mod.Sink) anyerror!void {
+        _ = alloc;
+        _ = io;
+        const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.model = req.model;
+        self.base_url = req.base_url;
+        self.api_key = req.api_key;
+        self.options = req.provider_options;
+        self.calls += 1;
+        sink.emit(.{ .content_delta = "Findings: routed." });
+        sink.emit(.{ .done = {} });
+    }
+
+    fn provider(self: *Recorder) provider_mod.Provider {
+        return .{ .ctx = self, .stream_fn = Recorder.stream };
+    }
+};
+
+test "routed child role switches provider, model and options together" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var parent_rec = Recorder{};
+    var research_rec = Recorder{};
+    var models = ChildModels{};
+    models.set("research", .{
+        .provider = research_rec.provider(),
+        .model = "research-model",
+        .base_url = "http://research.example",
+        .api_key = "research-key",
+        .provider_options = "{\"reasoning_effort\":\"high\"}",
+        .temperature = 0.1,
+    });
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var host = Host{
+        .io = io,
+        .workspace = tmp.dir,
+        .base_system = "base rules",
+        .provider = parent_rec.provider(),
+        .base_url = "http://parent.example",
+        .api_key = "parent-key",
+        .default_model = "parent-model",
+        .provider_options = "{\"reasoning_effort\":\"low\"}",
+        .mode = .auto,
+        .read_globs = &.{"**"},
+        .write_globs = &.{"**"},
+        .command_allow = &.{},
+        .command_deny = &.{},
+        .env_allow = &.{},
+        .journal = null,
+        .approval_ctx = undefined,
+        .approval_fn = struct {
+            fn deny(_: *anyopaque, _: tool_mod.ApprovalRequest) tool_mod.ApprovalResponse {
+                return .denied;
+            }
+        }.deny,
+        .max_depth = 1,
+        .max_concurrent = 1,
+        .max_rounds = 4,
+        .redactions = &.{},
+        .cancel = &cancel,
+        .routing = &models,
+    };
+
+    const routed = spawnHook(&host, arena, 0, "{\"task\":\"look\",\"role\":\"research\"}");
+    try std.testing.expectEqual(tool_mod.AgentSpawnResult.SpawnStatus.completed, routed.status);
+    try std.testing.expectEqualStrings("research-model", research_rec.model);
+    try std.testing.expectEqualStrings("http://research.example", research_rec.base_url);
+    try std.testing.expectEqualStrings("research-key", research_rec.api_key);
+    try std.testing.expectEqualStrings("{\"reasoning_effort\":\"high\"}", research_rec.options);
+    try std.testing.expectEqual(@as(usize, 0), parent_rec.calls);
+
+    // A role with no routing entry keeps the parent's whole bundle.
+    _ = spawnHook(&host, arena, 0, "{\"task\":\"ship\",\"role\":\"implement\"}");
+    try std.testing.expectEqualStrings("parent-model", parent_rec.model);
+    try std.testing.expectEqualStrings("http://parent.example", parent_rec.base_url);
+    try std.testing.expectEqualStrings("parent-key", parent_rec.api_key);
+    try std.testing.expectEqualStrings("{\"reasoning_effort\":\"low\"}", parent_rec.options);
+
+    // An explicit `model` argument wins over the role table: the child stays
+    // on the parent's provider and endpoint, only the model name changes.
+    _ = spawnHook(&host, arena, 0, "{\"task\":\"look\",\"role\":\"research\",\"model\":\"explicit-model\"}");
+    try std.testing.expectEqualStrings("explicit-model", parent_rec.model);
+    try std.testing.expectEqualStrings("http://parent.example", parent_rec.base_url);
+    try std.testing.expectEqualStrings("parent-key", parent_rec.api_key);
 }
