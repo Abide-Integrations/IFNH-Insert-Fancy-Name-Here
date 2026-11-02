@@ -171,8 +171,8 @@ pub const registry = [_]Tool{
     .{ .name = "grep", .description = "Regex search across text files (literals, ., *, +, ?, [...], ^, $). Respects .gitignore; skips hidden and binary files.", .parameters_json =
     \\{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string","description":"subdirectory to search"}},"required":["pattern"]}
     , .executor_kind = .read, .call_fn = execGrep },
-    .{ .name = "edit", .description = "Replace exactly one occurrence of old_string with new_string in a file. Refuses if the text appears zero or multiple times.", .parameters_json =
-    \\{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"}},"required":["path","old_string","new_string"]}
+    .{ .name = "edit", .description = "Replace exactly one occurrence of old_string with new_string in a file. Refuses if the text appears zero or multiple times. Set replace_all to replace every occurrence. Pass edits (an array of {old_string,new_string,replace_all}) instead of old_string/new_string to apply several edits atomically in one write: all must match or the file is unchanged. If old_string has no exact match, a unique match ignoring per-line leading/trailing whitespace and space/tab run lengths is used instead (new_string is inserted verbatim, replacing whole lines).", .parameters_json =
+    \\{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"replace_all":{"type":"boolean","description":"replace every exact occurrence (default false)"},"edits":{"type":"array","description":"atomic multi-edit, applied in order; exclusive with old_string/new_string","items":{"type":"object","properties":{"old_string":{"type":"string"},"new_string":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["old_string","new_string"]}}},"required":["path"]}
     , .executor_kind = .write, .call_fn = execEdit },
     .{ .name = "write", .description = "Create a file or overwrite it entirely. Prefer edit for existing files.", .parameters_json =
     \\{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}
@@ -327,11 +327,51 @@ fn execGrep(ctx: *ToolContext, a: *const Args) ToolResult {
     return toolGrep(pattern, root, ctx);
 }
 
+const max_edits_per_call: usize = 100;
+
+fn replaceAllFlag(ctx: *ToolContext, obj: std.json.ObjectMap, prefix: []const u8) union(enum) { ok: bool, fail: ToolResult } {
+    const v = obj.get("replace_all") orelse return .{ .ok = false };
+    return switch (v) {
+        .bool => |b| .{ .ok = b },
+        .null => .{ .ok = false },
+        else => .{ .fail = errResult(ctx.arena, "edit: {s}replace_all must be a boolean", .{prefix}) },
+    };
+}
+
 fn execEdit(ctx: *ToolContext, a: *const Args) ToolResult {
     const path = a.str("path") orelse return errResult(ctx.arena, "edit: missing path", .{});
+    if (a.obj.get("edits")) |ev| {
+        if (a.obj.get("old_string") != null or a.obj.get("new_string") != null or a.obj.get("replace_all") != null)
+            return errResult(ctx.arena, "edit: pass either old_string/new_string (with optional replace_all) or edits, not both", .{});
+        if (ev != .array or ev.array.items.len == 0)
+            return errResult(ctx.arena, "edit: edits must be a non-empty array", .{});
+        if (ev.array.items.len > max_edits_per_call)
+            return errResult(ctx.arena, "edit: at most {d} edits per call", .{max_edits_per_call});
+        const ops = ctx.arena.alloc(EditOp, ev.array.items.len) catch return errResult(ctx.arena, "oom", .{});
+        for (ev.array.items, ops, 0..) |item, *op, i| {
+            if (item != .object) return errResult(ctx.arena, "edit: edits[{d}] must be an object", .{i});
+            const old_v = item.object.get("old_string") orelse return errResult(ctx.arena, "edit: edits[{d}]: missing old_string", .{i});
+            const new_v = item.object.get("new_string") orelse return errResult(ctx.arena, "edit: edits[{d}]: missing new_string", .{i});
+            if (old_v != .string or new_v != .string)
+                return errResult(ctx.arena, "edit: edits[{d}]: old_string and new_string must be strings", .{i});
+            const prefix = std.fmt.allocPrint(ctx.arena, "edits[{d}]: ", .{i}) catch "";
+            const all = switch (replaceAllFlag(ctx, item.object, prefix)) {
+                .ok => |b| b,
+                .fail => |r| return r,
+            };
+            op.* = .{ .old = old_v.string, .new = new_v.string, .replace_all = all };
+        }
+        return toolEdit(path, ops, true, ctx);
+    }
     const old_s = a.str("old_string") orelse return errResult(ctx.arena, "edit: missing old_string", .{});
     const new_s = a.str("new_string") orelse return errResult(ctx.arena, "edit: missing new_string", .{});
-    return toolEdit(path, old_s, new_s, ctx);
+    const all = switch (replaceAllFlag(ctx, a.obj, "")) {
+        .ok => |b| b,
+        .fail => |r| return r,
+    };
+    const ops = ctx.arena.alloc(EditOp, 1) catch return errResult(ctx.arena, "oom", .{});
+    ops[0] = .{ .old = old_s, .new = new_s, .replace_all = all };
+    return toolEdit(path, ops, false, ctx);
 }
 
 fn execWrite(ctx: *ToolContext, a: *const Args) ToolResult {
@@ -1001,7 +1041,7 @@ fn grepFile(ctx: *ToolContext, rel: []const u8, re: *search.Regex, limits: *Walk
 /// What a write-class tool is about to do, for the approval preview.
 const Change = union(enum) {
     write: []const u8,
-    edit: struct { old: []const u8, new: []const u8 },
+    edits: []const EditOp,
 };
 
 fn prepareWrite(ctx: *ToolContext, path: []const u8, change: Change) ?ToolResult {
@@ -1028,37 +1068,160 @@ fn previewFor(ctx: *ToolContext, path: []const u8, change: Change) []const u8 {
     };
     const after = switch (change) {
         .write => |content| content,
-        .edit => |e| blk: {
-            const first = std.mem.indexOf(u8, before, e.old) orelse return "";
-            if (std.mem.indexOf(u8, before[first + 1 ..], e.old) != null) return "";
-            break :blk std.fmt.allocPrint(ctx.arena, "{s}{s}{s}", .{ before[0..first], e.new, before[first + e.old.len ..] }) catch return "";
+        .edits => |ops| switch (applyEdits(ctx.arena, path, before, ops, false)) {
+            .ok => |r| r.text,
+            .fail => return "",
         },
     };
     if (after.len > cap) return "(change too large to preview)";
     return diff_mod.unifiedDiff(ctx.arena, path, before, after, .{}) catch "";
 }
 
-fn toolEdit(path: []const u8, old_string: []const u8, new_string: []const u8, ctx: *ToolContext) ToolResult {
-    if (old_string.len == 0) return errResult(ctx.arena, "edit: old_string must not be empty", .{});
-    if (prepareWrite(ctx, path, .{ .edit = .{ .old = old_string, .new = new_string } })) |r| return r;
+/// One replacement in an `edit` call (a plain edit is a one-element list).
+const EditOp = struct { old: []const u8, new: []const u8, replace_all: bool = false };
+
+const EditResult = union(enum) {
+    ok: struct { text: []const u8, replacements: usize, whitespace_match: bool },
+    /// Ready-to-report failure text.
+    fail: []const u8,
+};
+
+const Applied = union(enum) {
+    ok: struct { text: []const u8, count: usize, whitespace_match: bool },
+    not_found,
+    multiple,
+    multiple_whitespace,
+    oom,
+};
+
+/// Apply `ops` in order against one in-memory buffer. Pure: nothing is
+/// written, so a failing op leaves the file untouched. `indexed` appends the
+/// failing `edits[i]` to the message.
+fn applyEdits(arena: std.mem.Allocator, path: []const u8, before: []const u8, ops: []const EditOp, indexed: bool) EditResult {
+    var text = before;
+    var total: usize = 0;
+    var whitespace_match = false;
+    for (ops, 0..) |op, i| {
+        const msg: []const u8 = switch (applyOne(arena, text, op)) {
+            .ok => |r| {
+                text = r.text;
+                total += r.count;
+                whitespace_match = whitespace_match or r.whitespace_match;
+                continue;
+            },
+            .oom => "edit: out of memory",
+            .not_found => std.fmt.allocPrint(arena, "edit: old_string not found in '{s}' (file may have changed; re-read it)", .{path}) catch "edit: old_string not found",
+            .multiple => std.fmt.allocPrint(arena, "edit: old_string appears multiple times in '{s}'; provide a larger unique context", .{path}) catch "edit: old_string appears multiple times",
+            .multiple_whitespace => std.fmt.allocPrint(arena, "edit: old_string appears multiple times in '{s}'; provide a larger unique context (the match was whitespace-insensitive)", .{path}) catch "edit: old_string appears multiple times",
+        };
+        if (!indexed) return .{ .fail = msg };
+        return .{ .fail = std.fmt.allocPrint(arena, "{s} [edits[{d}]]", .{ msg, i }) catch msg };
+    }
+    return .{ .ok = .{ .text = text, .replacements = total, .whitespace_match = whitespace_match } };
+}
+
+fn applyOne(arena: std.mem.Allocator, text: []const u8, op: EditOp) Applied {
+    if (std.mem.indexOf(u8, text, op.old)) |first| {
+        // An exact match always wins; the whitespace fallback never runs.
+        if (op.replace_all) {
+            const n = std.mem.count(u8, text, op.old);
+            const out = std.mem.replaceOwned(u8, arena, text, op.old, op.new) catch return .oom;
+            return .{ .ok = .{ .text = out, .count = n, .whitespace_match = false } };
+        }
+        if (std.mem.indexOf(u8, text[first + 1 ..], op.old) != null) return .multiple;
+        const out = std.fmt.allocPrint(arena, "{s}{s}{s}", .{ text[0..first], op.new, text[first + op.old.len ..] }) catch return .oom;
+        return .{ .ok = .{ .text = out, .count = 1, .whitespace_match = false } };
+    }
+    // replace_all means "every exact occurrence": no fuzzy fallback for it.
+    if (op.replace_all) return .not_found;
+    return applyWhitespaceTolerant(arena, text, op);
+}
+
+/// Same tokens once leading/trailing blanks are dropped and space/tab runs
+/// collapse to one.
+fn sameIgnoringBlanks(a: []const u8, b: []const u8) bool {
+    var ia = std.mem.tokenizeAny(u8, a, " \t\r");
+    var ib = std.mem.tokenizeAny(u8, b, " \t\r");
+    while (true) {
+        const ta = ia.next();
+        const tb = ib.next();
+        if (ta == null or tb == null) return ta == null and tb == null;
+        if (!std.mem.eql(u8, ta.?, tb.?)) return false;
+    }
+}
+
+/// Fallback for an old_string with no exact match: whole lines compared with
+/// `sameIgnoringBlanks`, accepted only when exactly one window of lines
+/// matches. The matched lines are replaced by `new` verbatim (indentation is
+/// not reinterpreted).
+fn applyWhitespaceTolerant(arena: std.mem.Allocator, text: []const u8, op: EditOp) Applied {
+    const Line = struct { start: usize, end: usize };
+    var old_lines: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, op.old, '\n');
+    while (it.next()) |l| old_lines.append(arena, l) catch return .oom;
+    const ends_newline = op.old[op.old.len - 1] == '\n';
+    if (ends_newline) _ = old_lines.pop();
+    var any_content = false;
+    for (old_lines.items) |l| {
+        if (std.mem.trim(u8, l, " \t\r").len > 0) any_content = true;
+    }
+    if (!any_content) return .not_found;
+
+    var lines: std.ArrayList(Line) = .empty;
+    var pos: usize = 0;
+    while (pos < text.len) {
+        const nl = std.mem.indexOfScalarPos(u8, text, pos, '\n');
+        lines.append(arena, .{ .start = pos, .end = nl orelse text.len }) catch return .oom;
+        pos = if (nl) |n| n + 1 else text.len;
+    }
+
+    const k = old_lines.items.len;
+    if (lines.items.len < k) return .not_found;
+    var found: ?usize = null;
+    var s: usize = 0;
+    while (s + k <= lines.items.len) : (s += 1) {
+        for (old_lines.items, 0..) |ol, j| {
+            const fl = lines.items[s + j];
+            if (!sameIgnoringBlanks(text[fl.start..fl.end], ol)) break;
+        } else {
+            if (found != null) return .multiple_whitespace;
+            found = s;
+        }
+    }
+    const first = found orelse return .not_found;
+    const start = lines.items[first].start;
+    var end = lines.items[first + k - 1].end;
+    if (ends_newline and end < text.len) end += 1;
+    const out = std.fmt.allocPrint(arena, "{s}{s}{s}", .{ text[0..start], op.new, text[end..] }) catch return .oom;
+    return .{ .ok = .{ .text = out, .count = 1, .whitespace_match = true } };
+}
+
+fn toolEdit(path: []const u8, ops: []const EditOp, indexed: bool, ctx: *ToolContext) ToolResult {
+    for (ops, 0..) |op, i| {
+        if (op.old.len > 0) continue;
+        if (indexed) return errResult(ctx.arena, "edit: old_string must not be empty [edits[{d}]]", .{i});
+        return errResult(ctx.arena, "edit: old_string must not be empty", .{});
+    }
+    if (prepareWrite(ctx, path, .{ .edits = ops })) |r| return r;
 
     const before = ctx.workspace.readFileAlloc(ctx.io, path, ctx.arena, .limited(max_file_size_bytes)) catch
         return errResult(ctx.arena, "edit: cannot read '{s}'", .{path});
 
-    const first = std.mem.indexOf(u8, before, old_string) orelse
-        return errResult(ctx.arena, "edit: old_string not found in '{s}' (file may have changed; re-read it)", .{path});
-    if (std.mem.indexOf(u8, before[first + 1 ..], old_string) != null)
-        return errResult(ctx.arena, "edit: old_string appears multiple times in '{s}'; provide a larger unique context", .{path});
+    const applied = switch (applyEdits(ctx.arena, path, before, ops, indexed)) {
+        .ok => |r| r,
+        .fail => |msg| return errResult(ctx.arena, "{s}", .{msg}),
+    };
+    const after = applied.text;
 
-    const after = std.fmt.allocPrint(ctx.arena, "{s}{s}{s}", .{
-        before[0..first],
-        new_string,
-        before[first + old_string.len ..],
-    }) catch return errResult(ctx.arena, "oom", .{});
-
+    // One write for the whole call: one journal group, one atomic replace.
     commitMutation(ctx, path, before, after) catch |err|
         return errResult(ctx.arena, "edit: failed to write '{s}': {s}", .{ path, @errorName(err) });
-    return .{ .output = std.fmt.allocPrint(ctx.arena, "edited {s} ({d} -> {d} bytes)", .{ path, before.len, after.len }) catch "edited", .status = .ok };
+    const note: []const u8 = if (applied.whitespace_match) "; matched ignoring whitespace differences" else "";
+    const out = if (ops.len == 1 and !ops[0].replace_all and !indexed)
+        std.fmt.allocPrint(ctx.arena, "edited {s} ({d} -> {d} bytes){s}", .{ path, before.len, after.len, note })
+    else
+        std.fmt.allocPrint(ctx.arena, "edited {s} ({d} edits, {d} replacements, {d} -> {d} bytes){s}", .{ path, ops.len, applied.replacements, before.len, after.len, note });
+    return .{ .output = out catch "edited", .status = .ok };
 }
 
 fn toolWrite(path: []const u8, content: []const u8, ctx: *ToolContext) ToolResult {
@@ -2118,4 +2281,229 @@ test "custom tool render and gate failures" {
     const unknown = execute("frobnicate", "{}", &ctx);
     try std.testing.expectEqual(Status.failed, unknown.status);
     try std.testing.expectEqualStrings("error: unknown tool 'frobnicate'", unknown.output);
+}
+
+// ---------------------------------------------------------------- edit upgrades (D-10)
+
+const EditSeen = struct {
+    preview: []const u8 = "",
+    calls: usize = 0,
+    fn approve(ctx: *anyopaque, req: ApprovalRequest) ApprovalResponse {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.preview = req.preview;
+        self.calls += 1;
+        return .approved_once;
+    }
+};
+
+fn readText(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, name: []const u8) ![]const u8 {
+    return dir.readFileAlloc(io, name, arena, .limited(1 << 16));
+}
+
+test "edit replace_all replaces every occurrence and reports the count" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = "foo bar foo\nfoo\n" });
+    var e = engine_mod.Engine.init(std.testing.allocator, .auto);
+    defer e.deinit();
+    e.write_globs = &.{"**"};
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ctx = testCtx(arena_state.allocator(), io, tmp.dir, &e);
+
+    const r = execute("edit", "{\"path\":\"f.txt\",\"old_string\":\"foo\",\"new_string\":\"baz\",\"replace_all\":true}", &ctx);
+    try std.testing.expectEqual(Status.ok, r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "3 replacements") != null);
+    try std.testing.expectEqualStrings("baz bar baz\nbaz\n", try readText(arena_state.allocator(), io, tmp.dir, "f.txt"));
+}
+
+test "edit replace_all with no match fails and leaves the file alone" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = "alpha\n" });
+    var e = engine_mod.Engine.init(std.testing.allocator, .auto);
+    defer e.deinit();
+    e.write_globs = &.{"**"};
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ctx = testCtx(arena_state.allocator(), io, tmp.dir, &e);
+
+    const r = execute("edit", "{\"path\":\"f.txt\",\"old_string\":\"zzz\",\"new_string\":\"y\",\"replace_all\":true}", &ctx);
+    try std.testing.expectEqual(Status.failed, r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "not found") != null);
+    try std.testing.expectEqualStrings("alpha\n", try readText(arena_state.allocator(), io, tmp.dir, "f.txt"));
+    // Default (replace_all false) still refuses several matches, same wording.
+    try tmp.dir.writeFile(io, .{ .sub_path = "d.txt", .data = "aa aa" });
+    const dup = execute("edit", "{\"path\":\"d.txt\",\"old_string\":\"aa\",\"new_string\":\"b\",\"replace_all\":false}", &ctx);
+    try std.testing.expect(std.mem.indexOf(u8, dup.output, "appears multiple times in 'd.txt'; provide a larger unique context") != null);
+}
+
+test "edit multi-edit applies three edits in one approval, one write and one journal group" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+    const original = "one\ntwo\nthree\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = original });
+    var e = engine_mod.Engine.init(std.testing.allocator, .ask);
+    defer e.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var j = try journal_mod.Journal.open(io, arena, tmp.dir);
+    defer j.close();
+    var seen = EditSeen{};
+    var ctx = testCtx(arena, io, tmp.dir, &e);
+    ctx.journal = &j;
+    ctx.approval_ctx = &seen;
+    ctx.approval_fn = EditSeen.approve;
+
+    const r = execute("edit", "{\"path\":\"f.txt\",\"edits\":[{\"old_string\":\"one\",\"new_string\":\"1\"},{\"old_string\":\"two\",\"new_string\":\"2\"},{\"old_string\":\"1\\n2\",\"new_string\":\"12\"}]}", &ctx);
+    try std.testing.expectEqual(Status.ok, r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "3 edits") != null);
+    try std.testing.expectEqualStrings("12\nthree\n", try readText(arena, io, tmp.dir, "f.txt"));
+    // One approval whose diff is the final content; one journal group.
+    try std.testing.expectEqual(@as(usize, 1), seen.calls);
+    try std.testing.expect(std.mem.indexOf(u8, seen.preview, "-one\n-two\n+12\n") != null);
+    _ = try j.undo();
+    try std.testing.expect(!j.canUndo());
+    try std.testing.expectEqualStrings(original, try readText(arena, io, tmp.dir, "f.txt"));
+}
+
+test "edit multi-edit with a stale second edit leaves the file byte-identical" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = "one\ntwo\n" });
+    var e = engine_mod.Engine.init(std.testing.allocator, .auto);
+    defer e.deinit();
+    e.write_globs = &.{"**"};
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ctx = testCtx(arena_state.allocator(), io, tmp.dir, &e);
+
+    const r = execute("edit", "{\"path\":\"f.txt\",\"edits\":[{\"old_string\":\"one\",\"new_string\":\"1\"},{\"old_string\":\"gone\",\"new_string\":\"x\"}]}", &ctx);
+    try std.testing.expectEqual(Status.failed, r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "old_string not found in 'f.txt'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "edits[1]") != null);
+    try std.testing.expectEqualStrings("one\ntwo\n", try readText(arena_state.allocator(), io, tmp.dir, "f.txt"));
+}
+
+test "edit rejects edits combined with old_string and malformed edits" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = "one\n" });
+    var e = engine_mod.Engine.init(std.testing.allocator, .auto);
+    defer e.deinit();
+    e.write_globs = &.{"**"};
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ctx = testCtx(arena_state.allocator(), io, tmp.dir, &e);
+
+    const both = execute("edit", "{\"path\":\"f.txt\",\"old_string\":\"one\",\"new_string\":\"1\",\"edits\":[{\"old_string\":\"one\",\"new_string\":\"1\"}]}", &ctx);
+    try std.testing.expectEqual(Status.failed, both.status);
+    try std.testing.expect(std.mem.indexOf(u8, both.output, "old_string/new_string") != null);
+    try std.testing.expect(std.mem.indexOf(u8, both.output, "edits") != null);
+    const empty = execute("edit", "{\"path\":\"f.txt\",\"edits\":[]}", &ctx);
+    try std.testing.expectEqual(Status.failed, empty.status);
+    const bad_flag = execute("edit", "{\"path\":\"f.txt\",\"old_string\":\"one\",\"new_string\":\"1\",\"replace_all\":\"yes\"}", &ctx);
+    try std.testing.expect(std.mem.indexOf(u8, bad_flag.output, "replace_all must be a boolean") != null);
+    try std.testing.expectEqualStrings("one\n", try readText(arena_state.allocator(), io, tmp.dir, "f.txt"));
+}
+
+test "edit whitespace-tolerant unique match applies with new_string verbatim" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "f.zig", .data = "fn a() void {\n\tconst  x =\t1;\n    return;\n}\n" });
+    var e = engine_mod.Engine.init(std.testing.allocator, .auto);
+    defer e.deinit();
+    e.write_globs = &.{"**"};
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ctx = testCtx(arena_state.allocator(), io, tmp.dir, &e);
+
+    // The model's old_string has different indentation and spacing.
+    const r = execute("edit", "{\"path\":\"f.zig\",\"old_string\":\"  const x = 1;\\nreturn;\",\"new_string\":\"  const x = 2;\\n  return;\"}", &ctx);
+    try std.testing.expectEqual(Status.ok, r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "ignoring whitespace") != null);
+    // Whole matched lines are replaced; new_string is inserted as given.
+    try std.testing.expectEqualStrings("fn a() void {\n  const x = 2;\n  return;\n}\n", try readText(arena_state.allocator(), io, tmp.dir, "f.zig"));
+}
+
+test "edit whitespace-tolerant ambiguous match fails with a hint" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+    const original = "a\n  x = 1;\nb\n\tx  =  1;\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = original });
+    var e = engine_mod.Engine.init(std.testing.allocator, .auto);
+    defer e.deinit();
+    e.write_globs = &.{"**"};
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ctx = testCtx(arena_state.allocator(), io, tmp.dir, &e);
+
+    const r = execute("edit", "{\"path\":\"f.txt\",\"old_string\":\"x   =   1;\",\"new_string\":\"y\"}", &ctx);
+    try std.testing.expectEqual(Status.failed, r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "appears multiple times") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "whitespace-insensitive") != null);
+    try std.testing.expectEqualStrings(original, try readText(arena_state.allocator(), io, tmp.dir, "f.txt"));
+}
+
+test "edit exact match wins over a whitespace-insensitive candidate" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+    // "x = 1;" matches exactly once (line 2) and ignoring whitespace twice.
+    try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = "x  =  1;\nx = 1;\n" });
+    var e = engine_mod.Engine.init(std.testing.allocator, .auto);
+    defer e.deinit();
+    e.write_globs = &.{"**"};
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ctx = testCtx(arena_state.allocator(), io, tmp.dir, &e);
+
+    const r = execute("edit", "{\"path\":\"f.txt\",\"old_string\":\"x = 1;\",\"new_string\":\"y\"}", &ctx);
+    try std.testing.expectEqual(Status.ok, r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "ignoring whitespace") == null);
+    try std.testing.expectEqualStrings("x  =  1;\ny\n", try readText(arena_state.allocator(), io, tmp.dir, "f.txt"));
+}
+
+test "edit replace_all never uses the whitespace fallback" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = "x  =  1;\n" });
+    var e = engine_mod.Engine.init(std.testing.allocator, .auto);
+    defer e.deinit();
+    e.write_globs = &.{"**"};
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ctx = testCtx(arena_state.allocator(), io, tmp.dir, &e);
+
+    const r = execute("edit", "{\"path\":\"f.txt\",\"old_string\":\"x = 1;\",\"new_string\":\"y\",\"replace_all\":true}", &ctx);
+    try std.testing.expectEqual(Status.failed, r.status);
+    try std.testing.expectEqualStrings("x  =  1;\n", try readText(arena_state.allocator(), io, tmp.dir, "f.txt"));
+}
+
+test "edit multi-edit reports an ambiguous edit by index and writes nothing" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = "aa aa\nzz\n" });
+    var e = engine_mod.Engine.init(std.testing.allocator, .auto);
+    defer e.deinit();
+    e.write_globs = &.{"**"};
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ctx = testCtx(arena_state.allocator(), io, tmp.dir, &e);
+
+    const r = execute("edit", "{\"path\":\"f.txt\",\"edits\":[{\"old_string\":\"zz\",\"new_string\":\"q\"},{\"old_string\":\"aa\",\"new_string\":\"b\"}]}", &ctx);
+    try std.testing.expectEqual(Status.failed, r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "multiple times") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "edits[1]") != null);
+    try std.testing.expectEqualStrings("aa aa\nzz\n", try readText(arena_state.allocator(), io, tmp.dir, "f.txt"));
 }
