@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const trace_mod = @import("../trace.zig");
+const wire_log = @import("../wire_log.zig");
 const resolve_mod = @import("resolve.zig");
 
 pub const Layer = enum {
@@ -179,6 +180,11 @@ pub const unwired_defaults = [_][]const u8{
     "debug.level", // std log level is comptime (`std_options`); no runtime logger
 };
 
+/// `IFNH_*` variables that switch runtime features and are not config keys.
+fn isRuntimeSwitch(key: []const u8) bool {
+    return std.mem.eql(u8, key, trace_mod.env_var) or std.mem.eql(u8, key, wire_log.env_var);
+}
+
 pub const Store = struct {
     arena_state: std.heap.ArenaAllocator,
     /// Merged configuration tree (owned by arena).
@@ -255,23 +261,7 @@ pub const Store = struct {
     }
 
     pub fn setPath(self: *Store, dotted_path: []const u8, v: std.json.Value) !void {
-        const arena = self.alloc();
-        if (self.value != .object) {
-            self.value = .{ .object = try std.json.ObjectMap.init(arena, &.{}, &.{}) };
-        }
-        var obj_ptr: *std.json.ObjectMap = &self.value.object;
-        var it = std.mem.splitScalar(u8, dotted_path, '.');
-        var key = it.next() orelse return error.InvalidOverrideValue;
-        while (it.next()) |next_key| {
-            const existing = obj_ptr.getPtr(key) orelse blk: {
-                try obj_ptr.put(arena, try arena.dupe(u8, key), .{ .object = try std.json.ObjectMap.init(arena, &.{}, &.{}) });
-                break :blk obj_ptr.getPtr(key).?;
-            };
-            if (existing.* != .object) existing.* = .{ .object = try std.json.ObjectMap.init(arena, &.{}, &.{}) };
-            obj_ptr = &existing.object;
-            key = next_key;
-        }
-        try obj_ptr.put(arena, try arena.dupe(u8, key), try cloneValue(arena, v));
+        try setPathIn(self.alloc(), &self.value, dotted_path, v);
     }
 
     /// Look up a value by dotted path.
@@ -491,6 +481,29 @@ pub const Store = struct {
         };
     }
 
+    /// Merge the per-key CLI flags (`--model`, `--temperature`, ...) as the
+    /// highest-precedence layer and re-validate (a flag is config like any
+    /// other, D-06). Call after `applyProfile` so an explicit flag wins.
+    pub fn applyCliOverrides(self: *Store, overrides: []const CliOverride) !void {
+        if (overrides.len == 0) return;
+        const arena = self.alloc();
+        for (overrides) |o| {
+            const json = switch (o.kind) {
+                .string => blk: {
+                    var aw: std.Io.Writer.Allocating = .init(arena);
+                    try std.json.Stringify.value(o.value, .{}, &aw.writer);
+                    break :blk aw.written();
+                },
+                .raw_json => o.value,
+                .boolean_false => "false",
+            };
+            try self.applyOverride(o.path, json, .{ .layer = .cli, .origin = o.origin });
+        }
+        self.errors.clearRetainingCapacity();
+        self.warnings.clearRetainingCapacity();
+        try self.validate();
+    }
+
     /// Diagnostic for `--profile`: names the unknown profile and lists the
     /// known ones in a stable order.
     pub fn unknownProfileMessage(self: *const Store, arena: std.mem.Allocator, name: []const u8) []const u8 {
@@ -513,6 +526,45 @@ pub const Store = struct {
         }) catch "unknown profile";
     }
 };
+
+/// One per-key CLI flag (`--model`, `--temperature`, ...) applied as the
+/// `.cli` layer. `value` is the raw flag text for `.raw_json` and the
+/// literal string for `.string`.
+pub const CliOverride = struct {
+    path: []const u8,
+    value: []const u8 = "",
+    kind: CliValueKind = .string,
+    origin: []const u8,
+};
+
+pub const CliValueKind = enum { string, raw_json, boolean_false };
+
+/// Set `dotted_path` inside an arbitrary JSON tree, creating intermediate
+/// objects. Shared by `Store.setPath` and `ifnh config set`, which mutates a
+/// file tree before writing it back (D-06).
+pub fn setPathIn(
+    arena: std.mem.Allocator,
+    value: *std.json.Value,
+    dotted_path: []const u8,
+    v: std.json.Value,
+) !void {
+    if (value.* != .object) {
+        value.* = .{ .object = try std.json.ObjectMap.init(arena, &.{}, &.{}) };
+    }
+    var obj_ptr: *std.json.ObjectMap = &value.object;
+    var it = std.mem.splitScalar(u8, dotted_path, '.');
+    var key = it.next() orelse return error.InvalidOverrideValue;
+    while (it.next()) |next_key| {
+        const existing = obj_ptr.getPtr(key) orelse blk: {
+            try obj_ptr.put(arena, try arena.dupe(u8, key), .{ .object = try std.json.ObjectMap.init(arena, &.{}, &.{}) });
+            break :blk obj_ptr.getPtr(key).?;
+        };
+        if (existing.* != .object) existing.* = .{ .object = try std.json.ObjectMap.init(arena, &.{}, &.{}) };
+        obj_ptr = &existing.object;
+        key = next_key;
+    }
+    try obj_ptr.put(arena, try arena.dupe(u8, key), try cloneValue(arena, v));
+}
 
 fn mergeObjects(arena: std.mem.Allocator, dst: std.json.Value, src: std.json.Value) !std.json.Value {
     var out = try std.json.ObjectMap.init(arena, &.{}, &.{});
@@ -626,7 +678,7 @@ pub fn load(
         while (it.next()) |entry| {
             const key = entry.key_ptr.*;
             if (!std.mem.startsWith(u8, key, "IFNH_")) continue;
-            if (std.mem.eql(u8, key, trace_mod.env_var)) continue; // runtime switch, not config
+            if (isRuntimeSwitch(key)) continue; // runtime switch, not config
             const rest = key["IFNH_".len..];
             if (rest.len == 0) continue;
             var parts: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -655,6 +707,34 @@ pub fn load(
 
     try store.validate();
     return store;
+}
+
+/// Result of checking a candidate config *file* body before writing it.
+pub const FileCheck = struct {
+    errors: []const ValidationError,
+    warnings: []const []const u8,
+};
+
+/// Validate one config file's text exactly as `load` would: parse, merge it
+/// over the builtin defaults, run the structural checks. `ifnh config set`
+/// refuses to write while `errors` is non-empty. All storage is arena-owned.
+pub fn validateFileText(arena: std.mem.Allocator, text: []const u8) !FileCheck {
+    const v = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch {
+        return .{ .errors = try arena.dupe(ValidationError, &.{.{ .path = "file", .message = "invalid JSON" }}), .warnings = &.{} };
+    };
+    var store = try Store.init(arena);
+    defer store.deinit();
+    try store.mergeValue(v, .{ .layer = .project, .origin = "candidate" });
+    try store.validate();
+
+    var errors: std.ArrayListUnmanaged(ValidationError) = .empty;
+    for (store.errors.items) |e| try errors.append(arena, .{
+        .path = try arena.dupe(u8, e.path),
+        .message = try arena.dupe(u8, e.message),
+    });
+    var warnings: std.ArrayListUnmanaged([]const u8) = .empty;
+    for (store.warnings.items) |w| try warnings.append(arena, try arena.dupe(u8, w));
+    return .{ .errors = errors.items, .warnings = warnings.items };
 }
 
 pub const max_config_bytes: usize = 256 * 1024;
@@ -796,6 +876,7 @@ test "trace runtime env switch is not a config key" {
     var env = std.process.Environ.Map.init(std.testing.allocator);
     defer env.deinit();
     try env.put(trace_mod.env_var, "1");
+    try env.put(wire_log.env_var, "/tmp/wire.ndjson");
 
     var store = try Store.init(std.testing.allocator);
     defer store.deinit();
@@ -814,7 +895,7 @@ fn applyEnvForTest(store: *Store, env: *const std.process.Environ.Map) !void {
     while (it.next()) |entry| {
         const key = entry.key_ptr.*;
         if (!std.mem.startsWith(u8, key, "IFNH_")) continue;
-        if (std.mem.eql(u8, key, trace_mod.env_var)) continue; // runtime switch, not config
+        if (isRuntimeSwitch(key)) continue; // runtime switch, not config
         const rest = key["IFNH_".len..];
         var parts: std.ArrayListUnmanaged([]const u8) = .empty;
         var sit = std.mem.splitSequence(u8, rest, "__");
@@ -1030,4 +1111,88 @@ test "setPath creates intermediate objects" {
     defer store.deinit();
     try store.setPath("a.b.c", .{ .integer = 7 });
     try std.testing.expectEqual(@as(i64, 7), store.get("a.b.c").?.integer);
+}
+
+test "config setPathIn mutates a file tree and keeps siblings" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tree = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\{ "model": { "provider": "anthropic" }, "ui": { "footer": true } }
+    , .{});
+    try setPathIn(arena, &tree, "model.model", .{ .string = "claude-sonnet-4" });
+    try std.testing.expectEqualStrings("claude-sonnet-4", tree.object.get("model").?.object.get("model").?.string);
+    try std.testing.expectEqualStrings("anthropic", tree.object.get("model").?.object.get("provider").?.string);
+    try std.testing.expect(tree.object.get("ui").?.object.get("footer").?.bool);
+
+    // A scalar on the path becomes an object rather than failing.
+    try setPathIn(arena, &tree, "ui.footer.mode", .{ .bool = false });
+    try std.testing.expect(!tree.object.get("ui").?.object.get("footer").?.object.get("mode").?.bool);
+}
+
+test "config cli overrides win over the profile at the cli layer" {
+    var store = try Store.init(std.testing.allocator);
+    defer store.deinit();
+    const json =
+        \\{ "profiles": { "fast": { "model": { "model": "fast-model", "temperature": 0.2 } } } }
+    ;
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, store.alloc(), json, .{});
+    try store.mergeValue(v, .{ .layer = .project, .origin = ".ifnh/config.json" });
+    try store.applyProfile("fast");
+    try std.testing.expectEqual(@as(f64, 0.2), store.get("model.temperature").?.float);
+
+    try store.applyCliOverrides(&.{
+        .{ .path = "model.model", .value = "flag-model", .origin = "--model" },
+        .{ .path = "model.temperature", .value = "0.7", .kind = .raw_json, .origin = "--temperature" },
+        .{ .path = "ui.footer", .kind = .boolean_false, .origin = "--no-footer" },
+    });
+    try std.testing.expect(store.errors.items.len == 0);
+    try std.testing.expectEqualStrings("flag-model", store.getString("model.model", ""));
+    try std.testing.expectEqual(@as(f64, 0.7), store.get("model.temperature").?.float);
+    try std.testing.expect(!store.get("ui.footer").?.bool);
+    const src = store.getSource("model.model").?;
+    try std.testing.expectEqual(Layer.cli, src.layer);
+    try std.testing.expectEqualStrings("--model", src.origin);
+}
+
+test "config cli override re-validates the merged tree" {
+    var store = try Store.init(std.testing.allocator);
+    defer store.deinit();
+    try store.applyCliOverrides(&.{
+        .{ .path = "permissions.default_mode", .value = "sometimes", .origin = "--permission-mode" },
+    });
+    try std.testing.expectEqual(@as(usize, 1), store.errors.items.len);
+    try std.testing.expectEqualStrings("permissions.default_mode", store.errors.items[0].path);
+}
+
+test "config warn reports each distinct message once" {
+    var store = try Store.init(std.testing.allocator);
+    defer store.deinit();
+    try store.warn("unknown config key '{s}' ignored", .{"a.b"});
+    try store.warn("unknown config key '{s}' ignored", .{"a.b"});
+    try store.warn("unknown config key '{s}' ignored", .{"c.d"});
+    try std.testing.expectEqual(@as(usize, 2), store.warnings.items.len);
+}
+
+test "config validateFileText rejects bad values and warns on unknown keys" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const bad = try validateFileText(arena, "{ \"permissions\": { \"default_mode\": \"always\" } }");
+    try std.testing.expectEqual(@as(usize, 1), bad.errors.len);
+    try std.testing.expectEqualStrings("permissions.default_mode", bad.errors[0].path);
+
+    const typo = try validateFileText(arena, "{ \"model\": { \"modle\": \"x\" } }");
+    try std.testing.expectEqual(@as(usize, 0), typo.errors.len);
+    try std.testing.expect(typo.warnings.len == 1);
+    try std.testing.expect(std.mem.indexOf(u8, typo.warnings[0], "model.modle") != null);
+
+    const broken = try validateFileText(arena, "{ not json");
+    try std.testing.expectEqual(@as(usize, 1), broken.errors.len);
+
+    const ok = try validateFileText(arena, "{ \"model\": { \"model\": \"m\" } }");
+    try std.testing.expectEqual(@as(usize, 0), ok.errors.len);
+    try std.testing.expectEqual(@as(usize, 0), ok.warnings.len);
 }

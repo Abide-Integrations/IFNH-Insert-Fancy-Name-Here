@@ -5,8 +5,14 @@
 //! silently ignored values.
 
 const std = @import("std");
+const config_mod = @import("../core/config/config.zig");
 
 pub const LogLevel = enum { err, info, debug, trace };
+
+/// Per-key config flags. `cli` may import `core`; the value kind decides
+/// whether the text is JSON, a string, or a fixed `false`.
+pub const Override = config_mod.CliOverride;
+pub const max_overrides = 8;
 
 pub const GlobalFlags = struct {
     json: bool = false,
@@ -20,6 +26,35 @@ pub const GlobalFlags = struct {
     /// `--profile <name>`: merge `profiles.<name>` over the loaded config
     /// and append its `prompt` fragment (D-03).
     profile: ?[]const u8 = null,
+    /// `--trace <path>`: NDJSON wire log of provider requests/responses (D-09).
+    trace: ?[]const u8 = null,
+    /// Per-key config flags (`--model`, `--temperature`, ...), applied after
+    /// `--profile` as the `.cli` layer (D-06).
+    overrides: [max_overrides]Override = undefined,
+    override_count: usize = 0,
+
+    pub fn overrideList(self: *const GlobalFlags) []const Override {
+        return self.overrides[0..self.override_count];
+    }
+
+    fn addOverride(self: *GlobalFlags, o: Override) ParseError!void {
+        if (self.override_count >= max_overrides) return error.TooManyArguments;
+        self.overrides[self.override_count] = o;
+        self.override_count += 1;
+    }
+};
+
+/// Table of per-key config flags: flag name, dotted config key, value kind.
+/// Adding a flag is a one-line change here (D-06).
+const key_flag_table = [_]struct { name: []const u8, path: []const u8, kind: config_mod.CliValueKind }{
+    .{ .name = "--model", .path = "model.model", .kind = .string },
+    .{ .name = "--provider", .path = "model.provider", .kind = .string },
+    .{ .name = "--base-url", .path = "model.base_url", .kind = .string },
+    .{ .name = "--temperature", .path = "model.temperature", .kind = .raw_json },
+    .{ .name = "--max-output-tokens", .path = "model.max_output_tokens", .kind = .raw_json },
+    .{ .name = "--context-tokens", .path = "context.max_context_tokens", .kind = .raw_json },
+    .{ .name = "--permission-mode", .path = "permissions.default_mode", .kind = .string },
+    .{ .name = "--no-footer", .path = "ui.footer", .kind = .boolean_false },
 };
 
 pub const Subcommand = enum {
@@ -34,6 +69,12 @@ pub const Subcommand = enum {
     doctor,
     fork,
     cleanup,
+    /// `ifnh debug-bundle [--out <path>]` (D-09).
+    @"debug-bundle",
+    /// `ifnh session export <id>` (D-09).
+    session,
+    /// `ifnh replay <file>` (D-09).
+    replay,
     /// `ifnh ask "<prompt>"`: headless one-shot turn (C-02).
     ask,
     unknown,
@@ -89,6 +130,10 @@ fn parseGlobal(argv: []const []const u8, i: *usize, result: *Parsed) ParseError!
         i.* += 1;
         if (i.* >= argv.len) return error.MissingFlagValue;
         result.flags.profile = argv[i.*];
+    } else if (std.mem.eql(u8, arg, "--trace")) {
+        i.* += 1;
+        if (i.* >= argv.len) return error.MissingFlagValue;
+        result.flags.trace = argv[i.*];
     } else if (std.mem.eql(u8, arg, "-p")) {
         i.* += 1;
         if (i.* >= argv.len) return error.MissingFlagValue;
@@ -98,6 +143,22 @@ fn parseGlobal(argv: []const []const u8, i: *usize, result: *Parsed) ParseError!
     } else if (std.mem.eql(u8, arg, "-V") or std.mem.eql(u8, arg, "--version")) {
         result.flags.version = true;
     } else {
+        for (key_flag_table) |entry| {
+            if (!std.mem.eql(u8, entry.name, arg)) continue;
+            if (entry.kind == .boolean_false) {
+                try result.flags.addOverride(.{ .path = entry.path, .kind = .boolean_false, .origin = entry.name });
+                return;
+            }
+            i.* += 1;
+            if (i.* >= argv.len) return error.MissingFlagValue;
+            const value = argv[i.*];
+            if (entry.kind == .raw_json) {
+                // `--temperature warm` is a usage error, not a config error.
+                _ = std.fmt.parseFloat(f64, value) catch return error.InvalidFlagValue;
+            }
+            try result.flags.addOverride(.{ .path = entry.path, .value = value, .kind = entry.kind, .origin = entry.name });
+            return;
+        }
         return error.UnknownFlag;
     }
 }
@@ -139,6 +200,12 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
         .fork
     else if (std.mem.eql(u8, cmd_name, "cleanup"))
         .cleanup
+    else if (std.mem.eql(u8, cmd_name, "debug-bundle"))
+        .@"debug-bundle"
+    else if (std.mem.eql(u8, cmd_name, "session"))
+        .session
+    else if (std.mem.eql(u8, cmd_name, "replay"))
+        .replay
     else if (std.mem.eql(u8, cmd_name, "ask"))
         .ask
     else
@@ -332,4 +399,60 @@ test "global -p applies unless ask names stdin" {
     try std.testing.expect(resolveAskPrompt("hi", try parseAsk(&.{"-"})) == null);
     try std.testing.expect(resolveAskPrompt("hi", try parseAsk(&.{ "-p", "-" })) == null);
     try std.testing.expect(resolveAskPrompt("-", try parseAsk(&.{})) == null);
+}
+
+test "cli per-key flags populate typed overrides in order" {
+    const p = try parse(&.{
+        "--model",             "gpt-5",
+        "--provider",          "anthropic",
+        "--base-url",          "http://localhost:8080/v1",
+        "--temperature",       "0.3",
+        "--max-output-tokens", "2048",
+        "--context-tokens",    "200000",
+        "--permission-mode",   "auto",
+        "--no-footer",
+    });
+    try std.testing.expectEqual(@as(usize, 0), p.args.len);
+    const list = p.flags.overrideList();
+    try std.testing.expectEqual(@as(usize, 8), list.len);
+    try std.testing.expectEqualStrings("model.model", list[0].path);
+    try std.testing.expectEqualStrings("gpt-5", list[0].value);
+    try std.testing.expectEqual(config_mod.CliValueKind.string, list[0].kind);
+    try std.testing.expectEqualStrings("--model", list[0].origin);
+    try std.testing.expectEqualStrings("model.temperature", list[3].path);
+    try std.testing.expectEqual(config_mod.CliValueKind.raw_json, list[3].kind);
+    try std.testing.expectEqualStrings("0.3", list[3].value);
+    try std.testing.expectEqualStrings("permissions.default_mode", list[6].path);
+    try std.testing.expectEqual(config_mod.CliValueKind.boolean_false, list[7].kind);
+    try std.testing.expectEqualStrings("ui.footer", list[7].path);
+}
+
+test "cli per-key flags reject bad numbers and missing values" {
+    try std.testing.expectError(error.InvalidFlagValue, parse(&.{ "--temperature", "warm" }));
+    try std.testing.expectError(error.InvalidFlagValue, parse(&.{ "--max-output-tokens", "many" }));
+    try std.testing.expectError(error.MissingFlagValue, parse(&.{"--model"}));
+    // `--no-footer` takes no value, so it is never a missing-value error.
+    try std.testing.expect((try parse(&.{"--no-footer"})).flags.override_count == 1);
+}
+
+test "cli per-key flags stop at the subcommand and apply as the cli layer" {
+    const p = try parse(&.{ "--model", "m", "ask", "--json", "hi" });
+    try std.testing.expectEqual(config_mod.CliValueKind.string, p.flags.overrideList()[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), p.flags.override_count);
+    try std.testing.expectEqual(Subcommand.ask, p.subcommand);
+    // An apply-only helper: the flags become the cli layer, nothing else moves.
+    var store = try config_mod.Store.init(std.testing.allocator);
+    defer store.deinit();
+    try store.applyCliOverrides(p.flags.overrideList());
+    try std.testing.expectEqualStrings("m", store.getString("model.model", ""));
+    try std.testing.expectEqual(config_mod.Layer.cli, store.getSource("model.model").?.layer);
+}
+
+test "cli trace flag takes a path before the subcommand" {
+    const p = try parse(&.{ "--trace", "/tmp/w.ndjson", "ask", "hi" });
+    try std.testing.expectEqualStrings("/tmp/w.ndjson", p.flags.trace.?);
+    try std.testing.expectEqual(Subcommand.ask, p.subcommand);
+    try std.testing.expectError(error.MissingFlagValue, parse(&.{"--trace"}));
+    try std.testing.expectEqual(Subcommand.replay, (try parse(&.{ "replay", "f" })).subcommand);
+    try std.testing.expectEqual(Subcommand.@"debug-bundle", (try parse(&.{"debug-bundle"})).subcommand);
 }

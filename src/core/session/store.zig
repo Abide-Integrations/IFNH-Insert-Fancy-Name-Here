@@ -491,7 +491,7 @@ pub const Session = struct {
         return (try self.readEventPage(arena, max_events)).records;
     }
 
-    fn parseRecord(arena: std.mem.Allocator, line: []const u8) !Record {
+    pub fn parseRecord(arena: std.mem.Allocator, line: []const u8) !Record {
         const v = try std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{});
         if (v != .object) return error.BadRecord;
         const o = v.object;

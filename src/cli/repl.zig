@@ -15,6 +15,7 @@ const instructions_mod = @import("../core/instructions.zig");
 const system_prompt = @import("../core/agent/system_prompt.zig");
 const subagent_mod = @import("../core/agent/subagent.zig");
 const session_runtime = @import("../core/agent/session_runtime.zig");
+const hooks_mod = @import("../core/hooks.zig");
 const git_mod = @import("../core/git.zig");
 const compaction_mod = @import("../core/compaction.zig");
 const lifecycle_mod = @import("../core/lifecycle.zig");
@@ -25,6 +26,7 @@ const tool_mod = @import("../tools/tool.zig");
 const openai = @import("../providers/openai.zig");
 const anthropic = @import("../providers/anthropic.zig");
 const trace_mod = @import("../core/trace.zig");
+const wire_log = @import("../core/wire_log.zig");
 const turn_cache_mod = @import("../core/turn_cache.zig");
 const budget_mod = @import("../core/budget.zig");
 const footer_mod = @import("../ui/footer.zig");
@@ -45,6 +47,11 @@ pub const Options = struct {
     /// `--profile <name>`: merge `profiles.<name>` and append its prompt
     /// fragment (D-03). Unknown names are a hard startup error.
     profile: ?[]const u8 = null,
+    /// Per-key config flags (`--model`, ...), applied after the profile as
+    /// the `.cli` layer (D-06).
+    overrides: []const config_mod.CliOverride = &.{},
+    /// Wire log owned by main (`--trace`, D-09).
+    wire: ?*wire_log.WireLog = null,
 };
 
 /// Terminal-facing state for the REPL: the palette, the streams and the
@@ -290,6 +297,13 @@ pub fn run(
         if (cfg.errors.items.len > 0) return error.InvalidConfig;
         for (cfg.warnings.items) |w| try out(io, "config warning: {s}\n", .{w});
     }
+    // Per-key flags are config like any other and outrank the profile (D-06).
+    if (opts.overrides.len > 0) {
+        try cfg.applyCliOverrides(opts.overrides);
+        for (cfg.errors.items) |e| try out(io, "config error [{s}]: {s}\n", .{ e.path, e.message });
+        if (cfg.errors.items.len > 0) return error.InvalidConfig;
+        for (cfg.warnings.items) |w| try out(io, "config warning: {s}\n", .{w});
+    }
 
     // ---- session state (zero-config: lazily create .ifnh) ----
     ensureIfnh(io, cwd) catch {};
@@ -301,6 +315,7 @@ pub fn run(
         .cwd_label = if (environ.get("PWD")) |pwd| pwd else ".",
         .trace = opts.trace,
         .profile = opts.profile,
+        .wire = opts.wire,
     });
     defer rt.deinit();
     if (rt.local_grants_warning) |warning| try out(io, "{s}", .{warning});
@@ -365,6 +380,13 @@ pub fn run(
             key_note,
         });
         try out(io, "{s}type a message, or /help for commands{s}\n", .{ palette.dim("", arena), "\x1b[0m" });
+    }
+
+    // `session_start` hooks run once the session exists and before any input
+    // is read (D-07); they are advisory, so a failure only prints.
+    {
+        const started = session_runtime.dispatchHook(&rt, arena, &cfg, .session_start);
+        if (started.output.len > 0) try out(io, "{s}\n", .{started.output});
     }
 
     // First paint is measured from process start, not from REPL setup.
@@ -479,6 +501,12 @@ pub fn run(
         const res = try rt.submitTurn(arena, &cfg, rt.providerConfig(&cfg), skill_prompt.text, skill_prompt.stable_len, line, cwd, &events);
         try renderTurn(io, arena, &ui, res);
         ui.endTurn(&rt, &cfg, res);
+    }
+
+    // `session_end` hooks fire once the input loop is over (D-07).
+    {
+        const ended = session_runtime.dispatchHook(&rt, arena, &cfg, .session_end);
+        if (ended.output.len > 0) try out(io, "{s}\n", .{ended.output});
     }
 }
 
@@ -923,7 +951,7 @@ fn handleCommand(
             \\  /quit                 exit ifnh
             \\  /model <name>         switch model for this session
             \\  /config               show resolved configuration
-            \\  /context              show assembled system prompt sources
+            \\  /context [--json]     context x-ray: bytes per source (est. tokens)
             \\  /undo                 undo last file-mutation group
             \\  /redo                 redo
             \\  /diff                 show git diff of the working tree
@@ -963,8 +991,13 @@ fn handleCommand(
         out(io, "permissions.default_mode: {s}\n", .{cfg.getString("permissions.default_mode", "")}) catch {};
         out(io, "agents.max_depth: {d}\n", .{cfg.getU32("agents.max_depth", 1)}) catch {};
     } else if (std.mem.eql(u8, cmd, "context")) {
-        out(io, "assembled context ({d} sources):\n", .{instr.sources.len}) catch {};
-        for (instr.sources) |s| out(io, "  [{s}] {s}\n", .{ s.layer, s.path }) catch {};
+        // Context x-ray (D-08): per-source bytes plus a labelled estimate.
+        const as_json = std.mem.indexOf(u8, rest, "--json") != null;
+        const report = instructions_mod.contextReport(arena, instr, as_json) catch {
+            out(io, "could not build the context report\n", .{}) catch {};
+            return .none;
+        };
+        out(io, "{s}\n", .{report}) catch {};
     } else if (std.mem.eql(u8, cmd, "undo")) {
         if (rt.journal.undo() catch null) |gid| {
             out(io, "undone group {d}\n", .{gid}) catch {};
@@ -1050,8 +1083,12 @@ fn handleCommand(
             },
             .session_hint = rt.store.manifest.id,
         };
+        var lc_hooks = hooks_mod.Engine.init(io, cwd, hooks_mod.Engine.fromConfig(arena, cfg.get("hooks")) catch &.{}, arena);
+        lc_hooks.environ = rt.process_environ;
         const outcomes = lifecycle_mod.run(arena, io, &host2, lc, start_stage, .{
             .ctx = io.userdata.?,
+            .hooks = &lc_hooks,
+            .session_id = rt.store.manifest.id,
             .on_stage_start = struct {
                 fn f(_: *anyopaque, stage: []const u8, role: []const u8) void {
                     _ = stage;

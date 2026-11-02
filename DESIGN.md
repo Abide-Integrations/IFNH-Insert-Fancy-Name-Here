@@ -213,6 +213,31 @@ pub const FileOp = union(enum) {
 
 `/undo` walks committed groups newest-first, applies inverse ops, marks them undone (append `undo` record); `/redo` replays. Non-reversible ops never enter the journal — they are refused at the approval gate instead (M185-188).
 
+### 3.7 Diagnostics: wire log and context estimate
+
+**Wire log (`src/core/wire_log.zig`, `--trace <path>` / `IFNH_TRACE_LOG`).** One
+NDJSON object per line, file mode 0600, appended:
+
+```json
+{"ts_ms":0,"kind":"request|response|error","provider":"openai|anthropic",
+ "model":"<id>","round":1,"url":"scheme://host/path","headers":{},"body":{}}
+```
+
+`round` counts provider requests in the run (retries included). `url` has no
+userinfo or query. `body` is the parsed JSON that was sent (request), the
+accumulated `{text,tool_calls,usage}` (response; never raw SSE) or the failure
+message (error). The sink is created by `main.zig`, carried as an optional
+pointer in `InitOptions` -> `SessionRuntime` -> `RunParams` -> `ModelRequest.wire`;
+null costs one check. Adapters log the request they build; `Provider.stream`
+wraps the sink to log the response or error. Redaction is applied at write
+time through `redact.zig`: exact secrets (key file, credential-named env, the
+request's own key), credential header values replaced, patterns over every
+body. A write failure warns once and disables the log.
+
+**`/context` estimate.** Sizes are bytes of what each source appended to the
+system prompt; tokens are `(bytes + 3) / 4` and always labelled estimates
+(`est.`). Text added after assembly is reported as `[other]`.
+
 ## 4. Config schema v1
 
 ```jsonc

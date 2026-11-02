@@ -13,6 +13,7 @@ const args_mod = @import("args.zig");
 const config_mod = @import("../core/config/config.zig");
 const instructions_mod = @import("../core/instructions.zig");
 const system_prompt = @import("../core/agent/system_prompt.zig");
+const wire_log = @import("../core/wire_log.zig");
 const session_runtime = @import("../core/agent/session_runtime.zig");
 const tool_mod = @import("../tools/tool.zig");
 
@@ -302,6 +303,7 @@ pub fn run(
     environ: *const std.process.Environ.Map,
     global: args_mod.GlobalFlags,
     ask: args_mod.AskArgs,
+    wire: ?*wire_log.WireLog,
 ) u8 {
     const json = ask.json or global.json;
     const cwd = std.Io.Dir.cwd();
@@ -338,11 +340,22 @@ pub fn run(
         if (cfg.errors.items.len > 0) return exitCode(.failed);
         for (cfg.warnings.items) |w| stderrPrint(io, "config warning: {s}\n", .{w});
     }
+    // Per-key flags are config like any other and outrank the profile (D-06).
+    if (global.override_count > 0) {
+        cfg.applyCliOverrides(global.overrideList()) catch |err| {
+            stderrPrint(io, "error: cannot apply flags: {s}\n", .{@errorName(err)});
+            return exitCode(.failed);
+        };
+        for (cfg.errors.items) |e| stderrPrint(io, "config error [{s}]: {s}\n", .{ e.path, e.message });
+        if (cfg.errors.items.len > 0) return exitCode(.failed);
+        for (cfg.warnings.items) |w| stderrPrint(io, "config warning: {s}\n", .{w});
+    }
 
     var rt = session_runtime.SessionRuntime.init(io, arena, environ, &cfg, cwd, .{
         .sessions_dir = sessionsDir(&cfg),
         .cwd_label = if (environ.get("PWD")) |pwd| pwd else ".",
         .profile = global.profile,
+        .wire = wire,
     }) catch |err| {
         stderrPrint(io, "error: cannot start a session: {s}\n", .{@errorName(err)});
         return exitCode(.failed);
@@ -350,6 +363,9 @@ pub fn run(
     defer rt.deinit();
     if (rt.local_grants_warning) |warning| stderrPrint(io, "{s}", .{warning});
     for (rt.custom_tools.warnings) |warning| stderrPrint(io, "{s}", .{warning});
+
+    // One-shot runs get the same lifecycle hooks as the REPL (D-07).
+    _ = session_runtime.dispatchHook(&rt, arena, &cfg, .session_start);
 
     var instr = instructions_mod.assemble(cwd, io, arena, system_prompt.system_prompt, &.{}) catch |err| {
         stderrPrint(io, "error: cannot assemble instructions: {s}\n", .{@errorName(err)});
@@ -391,6 +407,7 @@ pub fn run(
         "turn did not run"
     else
         "";
+    _ = session_runtime.dispatchHook(&rt, arena, &cfg, .session_end);
     sink.finish(facts, message);
     return exitCode(runStatus(facts));
 }

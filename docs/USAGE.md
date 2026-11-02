@@ -165,7 +165,7 @@ is not a terminal or `TERM` is `dumb`: then nothing at all is written.
 | `/help` | command list |
 | `/model <name>` | switch model for this session |
 | `/config` | show resolved configuration |
-| `/context` | show assembled instructions + sources |
+| `/context` | context x-ray: bytes and estimated tokens per source (`--json` for machines) |
 | `/undo` / `/redo` | step the file-mutation journal (works across restarts) |
 | `/diff` | git diff of the working tree |
 | `/plan <title>` | create a plan artifact in `.ifnh/plans/` |
@@ -262,8 +262,40 @@ Precedence (low to high): **built-in defaults < user < project < session <
 env < CLI**. Inspect any key:
 
 ```bash
-ifnh config explain model.model
+ifnh config explain model.model   # value, layer and source file
+ifnh config get model.model       # value only (script-friendly)
+ifnh config get ui.footer --json  # {"key","value","layer","source"}
+ifnh config path                  # user + project config paths
+ifnh config schema                # the published JSON Schema
 ifnh config validate
+```
+
+Edit without hand-editing JSON:
+
+```bash
+ifnh config set model.model gpt-5                 # project: .ifnh/config.json
+ifnh config set ui.footer false --global          # user config
+ifnh config set model.temperature 0.3 --json
+ifnh config edit                                  # $VISUAL / $EDITOR / vi
+```
+
+Values parse as JSON when they can (`false`, `0.3`, `["a"]`) and are stored as
+strings otherwise, so bare words work. `set` validates the whole file against
+the schema before writing and refuses on any error (`not written`), so a typo
+cannot break the next startup. `--global`/`--project` pick the file; the
+default is the project config. The schema itself lives in
+`docs/config.schema.json` and is embedded in the binary, so
+`ifnh config schema` always matches the defaults.
+
+Per-key flags are CLI-layer overrides, applied after `--profile`, so they win
+over everything:
+
+```bash
+ifnh --model qwen3-coder --temperature 0.2
+ifnh --provider anthropic --base-url https://example.test/v1
+ifnh --max-output-tokens 4096 --context-tokens 200000
+ifnh --permission-mode auto --no-footer
+ifnh --model m config get model.model   # shows layer: cli, source: --model
 ```
 
 - **User config:** `$XDG_CONFIG_HOME/ifnh/config.json` when `XDG_CONFIG_HOME`
@@ -394,6 +426,24 @@ Model aliases name a provider/model pair once and reuse it:
 - **`read_tool_result`** — page through oversized outputs stored as
   artifacts.
 
+`edit` replaces one occurrence of `old_string` by default and refuses zero
+or several matches. Three upgrades:
+
+- `replace_all: true` replaces every exact occurrence and reports the count
+  (zero matches still fails).
+- `edits: [{"old_string","new_string","replace_all"}, ...]` applies several
+  edits in order against one in-memory copy and writes the file once, through
+  one approval (whose diff is the final result) and one journal entry. If any
+  edit fails the file is untouched and the error names the index
+  (`[edits[1]]`). `edits` cannot be combined with `old_string`/`new_string`.
+- **Whitespace-tolerant fallback.** When `old_string` has no exact match, whole
+  lines are compared ignoring leading/trailing blanks and the length of
+  space/tab runs. A unique match is replaced, line for line, with
+  `new_string` exactly as given (its indentation is not adjusted) and the
+  result says `matched ignoring whitespace differences`. Several candidates
+  fail with the multiple-matches error plus a whitespace-insensitive hint.
+  An exact match always wins, and `replace_all` never uses the fallback.
+
 Policies in this section are enforced by the permission engine, never by
 the model's judgment. `.ifnh/` policy files are agent-write-denied; a
 mid-session policy change fails approvals closed.
@@ -442,13 +492,33 @@ The agent sees a budgeted catalog each turn and loads bodies with the
 ```jsonc
 { "hooks": {
     "before_agent": "echo starting | tee -a .ifnh/hook.log",
-    "after_agent":  "zig build test"     // non-zero exit BLOCKS before_* only
+    "after_agent":  "zig build test",           // non-zero exit BLOCKS before_* only
+    "before_tool": [
+      "echo audit >> .ifnh/hook.log",
+      { "command": "scripts/fmt-check.sh", "matcher": "edit|write", "timeout_s": 10 }
+    ]
 } }
 ```
 
-Events: `session_start/end`, `before/after_tool`, `before/after_agent`,
-`before/after_merge`. `before_*` hooks block on non-zero exit; everything
-runs under `/bin/sh` with a 30s timeout.
+Events (all ten of P212): `session_start/end`, `before/after_agent`,
+`before/after_stage`, `before/after_tool`, `before/after_merge`. Each event
+takes a command, a list of commands, or a list of objects with `command`,
+`matcher` (`|`-separated exact tool names, `*` or omitted = every tool) and
+`timeout_s` (1..300, default 30). Every hook runs under `/bin/sh` in the
+workspace.
+
+The event payload arrives as JSON on stdin and as `IFNH_EVENT`,
+`IFNH_SESSION_ID` and `IFNH_TOOL_NAME` in the environment. A `before_*`
+hook can steer the call from its stdout, using the last non-empty line:
+
+```jsonc
+{"decision": "deny", "reason": "no pushes on Fridays"}   // blocks the call
+{"decision": "rewrite", "arguments": {"path": "b.txt"}} // replaces tool input
+```
+
+Rewrites chain through the remaining `before_tool` hooks; `after_*` hooks
+never block, whatever they print. A non-zero exit or a timeout still blocks
+`before_*` and is advisory everywhere else. Hooks never trigger hooks.
 
 ## 11. Lifecycles
 
@@ -474,6 +544,35 @@ Run with `/lifecycle run .ifnh/lifecycle/ship.json` (resume with
 - `/usage` — session token totals; per-turn records in the session dir.
 - Logs: `--log-level err|info|debug|trace` (debug/trace redact secrets at
   write time).
+- `ifnh --trace <path> ask ...` (or `IFNH_TRACE_LOG=<path>`) — NDJSON wire log
+  of every provider request, response and failure, mode 0600, appended across
+  runs. Line shape: `{"ts_ms","kind":"request"|"response"|"error","provider",
+  "model","round","url","headers","body"}`. Requests carry the body actually
+  sent; responses carry the accumulated text, tool calls and final usage (not
+  raw SSE frames). Redaction is applied when each line is written: the
+  stored provider keys and credential-named environment values are scrubbed
+  exactly, `authorization`/`x-api-key`/`api-key`/`proxy-authorization` values
+  become `[REDACTED]`, and the usual token patterns (`sk-`, `ghp_`, JWTs,
+  `Bearer ...`) are masked in every body. A write failure prints one warning
+  and turns tracing off; it never fails the turn. Child agents and context
+  compaction requests are not traced yet.
+- `ifnh debug-bundle [--out <path>] [--json]` — one redacted JSON file for bug
+  reports (default `ifnh-debug-<utc>.json`, mode 0600): versions, platform,
+  the merged config without keys named `*api_key*`, `*token*`, `*secret*` or
+  `*password*` (model aliases keep only provider/model/base_url), where each
+  key came from, config errors and warnings, the doctor report, the last 200
+  lines of the trace log and `~/.local/state/ifnh/logs/*`, the last 20
+  sessions (id, times, turn count, no message text) and `IFNH_*`/`TERM`/`SHELL`
+  environment (secret-looking names redacted). `~/.config/ifnh/env` is never
+  read into it. Prints the path, or `{"path","bytes"}` with `--json`.
+- `ifnh session export <id> [--out <path>|-]` — a session's stored records as
+  NDJSON (one per line, original order), secrets redacted; stdout by default.
+  `<id>` may be a unique prefix; an unknown or ambiguous id exits 1.
+- `ifnh replay <file> [--json]` — print an exported session offline (no
+  provider, no config): `user:`, `assistant:`, `tool <name>: <status>` blocks,
+  tool output cut to 20 lines with `... (n more lines)`. `--json` re-emits the
+  records unchanged. Malformed input exits 2 with the line number on stderr
+  and nothing on stdout.
 
 ## 13. Distribution
 

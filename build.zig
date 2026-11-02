@@ -13,6 +13,11 @@ pub fn build(b: *std.Build) void {
         .error_tracing = false,
     });
 
+    // The published JSON Schema lives in docs/ (outside src/); embed it by import.
+    module.addAnonymousImport("config_schema", .{
+        .root_source_file = b.path("docs/config.schema.json"),
+    });
+
     const exe = b.addExecutable(.{
         .name = "ifnh",
         .root_module = module,

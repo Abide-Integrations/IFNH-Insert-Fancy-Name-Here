@@ -12,6 +12,8 @@ const provider_mod = @import("../../providers/provider.zig");
 const tool_mod = @import("../../tools/tool.zig");
 const redact_mod = @import("../redact.zig");
 const trace_mod = @import("../trace.zig");
+const wire_log = @import("../wire_log.zig");
+const hooks_mod = @import("../hooks.zig");
 
 pub const max_tool_rounds_default: usize = 25;
 /// Upper bound on a server-provided `Retry-After` delay. Keeps a misbehaving
@@ -173,6 +175,14 @@ pub const RunParams = struct {
     max_output_tokens: ?u32 = null,
     /// Optional per-session timing trace (B-01).
     trace: ?*trace_mod.Trace = null,
+    /// Wire log owned by the CLI run (`--trace`, D-09); null disables it.
+    wire: ?*wire_log.WireLog = null,
+    /// Hooks around every tool call (D-07); null disables them.
+    hook_engine: ?*hooks_mod.Engine = null,
+    /// Environment hooks inherit (the parent process env, never mutated).
+    hook_environ: ?*const std.process.Environ.Map = null,
+    /// Session id handed to hooks as `IFNH_SESSION_ID`.
+    session_id: []const u8 = "",
 };
 
 /// Builtin tool specs plus one spec per loaded custom tool (D-02).
@@ -244,6 +254,7 @@ pub fn runTurn(p: RunParams) !Outcome {
                 .provider_options = active.provider_options,
                 .cancel = p.cancel,
                 .trace = p.trace,
+                .wire = p.wire,
                 .client = active.client,
             }, .{ .ctx = &trace_sink, .emit_fn = TraceSink.emit });
             const failure = collector.failure orelse break;
@@ -656,6 +667,19 @@ fn isAgentCall(tc: core_types.ToolCall) bool {
 /// into `caller` before the scratch arena is deinited. `scratch_parent` must
 /// be an allocator that actually frees (not the caller's arena), otherwise
 /// the scratch memory would live as long as the caller.
+/// `git merge` run through the bash tool is the merge event (D-07).
+fn isGitMerge(tc: core_types.ToolCall) bool {
+    if (!std.mem.eql(u8, tc.name, "bash")) return false;
+    return std.mem.indexOf(u8, tc.arguments_json, "git merge") != null;
+}
+
+/// Denial text handed back to the model when a hook blocks a call.
+fn hookDenial(caller: std.mem.Allocator, event: hooks_mod.Event, result: hooks_mod.HookResult) tool_mod.ToolResult {
+    const reason = if (result.output.len > 0) result.output else "denied by a hook";
+    const msg = std.fmt.allocPrint(caller, "blocked by {s} hook: {s}", .{ event.name(), reason }) catch "";
+    return .{ .output = msg, .status = .denied };
+}
+
 fn executeWithScratch(
     p: RunParams,
     tc: core_types.ToolCall,
@@ -667,7 +691,46 @@ fn executeWithScratch(
     var ctx = p.tool_ctx.*;
     ctx.arena = scratch_state.allocator();
     ctx.cancel = p.cancel;
-    const raw = tool_mod.execute(tc.name, tc.arguments_json, &ctx);
+
+    // Hooks guard every tool call, including parallel batches: each call
+    // dispatches into its own scratch arena (D-07).
+    var arguments_json: []const u8 = tc.arguments_json;
+    var engine_opt: ?hooks_mod.Engine = null;
+    if (p.hook_engine) |shared| {
+        var he = shared.withAlloc(scratch_state.allocator());
+        he.environ = p.hook_environ;
+        const before = he.dispatchFor(.before_tool, .{
+            .session_id = p.session_id,
+            .tool_name = tc.name,
+            .tool_input_json = tc.arguments_json,
+        });
+        if (before.blocked) return hookDenial(caller, .before_tool, before);
+        // A rewrite replaces the arguments every later step sees.
+        if (before.decision == .rewrite and before.rewritten_json.len > 0) {
+            arguments_json = before.rewritten_json;
+        }
+        if (isGitMerge(tc)) {
+            const merge_pre = he.dispatchFor(.before_merge, .{
+                .session_id = p.session_id,
+                .tool_name = tc.name,
+                .tool_input_json = tc.arguments_json,
+            });
+            if (merge_pre.blocked) return hookDenial(caller, .before_merge, merge_pre);
+        }
+        engine_opt = he;
+    }
+
+    const raw = tool_mod.execute(tc.name, arguments_json, &ctx);
+    if (engine_opt) |*he| {
+        const status_json = std.fmt.allocPrint(scratch_state.allocator(), "{{\"status\":\"{s}\"}}", .{@tagName(raw.status)}) catch "";
+        _ = he.dispatchFor(.after_tool, .{
+            .session_id = p.session_id,
+            .tool_name = tc.name,
+            .tool_input_json = arguments_json,
+            .extra_json = status_json,
+        });
+        if (isGitMerge(tc)) _ = he.dispatchFor(.after_merge, .{ .session_id = p.session_id });
+    }
 
     // Copy first, then redact in the caller: the raw slice belongs to the
     // scratch arena and must not leak into ToolResult.

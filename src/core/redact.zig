@@ -63,9 +63,11 @@ pub fn redact(arena: std.mem.Allocator, text: []const u8, secrets: []const []con
         current = replaceAll(arena, current, s) catch return current;
     }
     // Pattern-based redaction: find candidate tokens and mask the rest.
+    // `copied_to` is the end of the text already moved into `out`; nothing
+    // is allocated until the first match.
     var out: std.ArrayListUnmanaged(u8) = .empty;
+    var copied_to: usize = 0;
     var i: usize = 0;
-    var copied = true;
     while (i < current.len) {
         var matched: ?usize = null;
         for (known_patterns) |pat| {
@@ -81,17 +83,16 @@ pub fn redact(arena: std.mem.Allocator, text: []const u8, secrets: []const []con
             }
         }
         if (matched) |end| {
+            out.appendSlice(arena, current[copied_to..i]) catch return current;
             out.appendSlice(arena, marker) catch return current;
             i = end;
-            copied = false;
+            copied_to = end;
         } else {
-            if (copied) {
-                out.append(arena, current[i]) catch return current;
-            }
             i += 1;
         }
     }
-    if (copied and out.items.len == current.len) return current;
+    if (copied_to == 0) return current;
+    out.appendSlice(arena, current[copied_to..]) catch return current;
     return out.items;
 }
 
@@ -118,4 +119,14 @@ test "plain text untouched" {
     const a = arena_state.allocator();
     const text = "const x = skynet_function(); // totally fine";
     try std.testing.expectEqualStrings(text, redact(a, text, &.{}));
+}
+
+test "redaction keeps the text around and between secrets" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const out = redact(a, "a sk-abc123def456ghi789 b ghp_abcdefghijklmnopqrstuvwxyz0123456789 c", &.{});
+    try std.testing.expectEqualStrings("a [REDACTED] b [REDACTED] c", out);
+    // A secret at the very start and the very end.
+    try std.testing.expectEqualStrings("[REDACTED] mid [REDACTED]", redact(a, "sk-abc123def456ghi789 mid sk-abc123def456ghi789", &.{}));
 }
