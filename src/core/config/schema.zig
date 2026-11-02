@@ -9,7 +9,7 @@
 const std = @import("std");
 const config_mod = @import("config.zig");
 
-pub const json_schema = @embedFile("../../../docs/config.schema.json");
+pub const json_schema = @embedFile("config_schema");
 
 /// Resolve a dotted path inside a parsed schema document.
 fn nodeAt(root: std.json.Value, dotted_path: []const u8) ?std.json.Value {

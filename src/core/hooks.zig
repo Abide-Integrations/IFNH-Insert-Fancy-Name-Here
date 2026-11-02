@@ -642,12 +642,12 @@ test "hook decisions parse from the last non-empty line only" {
     defer arena_state.deinit();
     const a = arena_state.allocator();
 
-    try std.testing.expectEqual(Decision.run, parseDecision(a, "plain output"));
-    try std.testing.expectEqual(Decision.run, parseDecision(a, ""));
-    try std.testing.expectEqual(Decision.run, parseDecision(a, "{\"decision\":\"run\"}"));
+    try std.testing.expectEqual(ParsedDecision.run, parseDecision(a, "plain output"));
+    try std.testing.expectEqual(ParsedDecision.run, parseDecision(a, ""));
+    try std.testing.expectEqual(ParsedDecision.run, parseDecision(a, "{\"decision\":\"run\"}"));
     const noisy = parseDecision(a, "thinking...\n{\"decision\":\"deny\",\"reason\":\"x\"}\n\n");
     try std.testing.expectEqualStrings("x", noisy.deny);
     const no_reason = parseDecision(a, "{\"decision\":\"deny\"}");
     try std.testing.expect(no_reason.deny.len > 0);
-    try std.testing.expectEqual(Decision.run, parseDecision(a, "{\"decision\":\"rewrite\",\"arguments\":3}"));
+    try std.testing.expectEqual(ParsedDecision.run, parseDecision(a, "{\"decision\":\"rewrite\",\"arguments\":3}"));
 }

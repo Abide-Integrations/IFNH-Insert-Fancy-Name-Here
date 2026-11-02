@@ -385,10 +385,10 @@ test "global -p applies unless ask names stdin" {
 
 test "cli per-key flags populate typed overrides in order" {
     const p = try parse(&.{
-        "--model",      "gpt-5",
-        "--provider",   "anthropic",
-        "--base-url",   "http://localhost:8080/v1",
-        "--temperature", "0.3",
+        "--model",             "gpt-5",
+        "--provider",          "anthropic",
+        "--base-url",          "http://localhost:8080/v1",
+        "--temperature",       "0.3",
         "--max-output-tokens", "2048",
         "--context-tokens",    "200000",
         "--permission-mode",   "auto",
