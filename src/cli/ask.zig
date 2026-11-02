@@ -13,6 +13,7 @@ const args_mod = @import("args.zig");
 const config_mod = @import("../core/config/config.zig");
 const instructions_mod = @import("../core/instructions.zig");
 const system_prompt = @import("../core/agent/system_prompt.zig");
+const wire_log = @import("../core/wire_log.zig");
 const session_runtime = @import("../core/agent/session_runtime.zig");
 const tool_mod = @import("../tools/tool.zig");
 
@@ -302,6 +303,7 @@ pub fn run(
     environ: *const std.process.Environ.Map,
     global: args_mod.GlobalFlags,
     ask: args_mod.AskArgs,
+    wire: ?*wire_log.WireLog,
 ) u8 {
     const json = ask.json or global.json;
     const cwd = std.Io.Dir.cwd();
@@ -353,6 +355,7 @@ pub fn run(
         .sessions_dir = sessionsDir(&cfg),
         .cwd_label = if (environ.get("PWD")) |pwd| pwd else ".",
         .profile = global.profile,
+        .wire = wire,
     }) catch |err| {
         stderrPrint(io, "error: cannot start a session: {s}\n", .{@errorName(err)});
         return exitCode(.failed);

@@ -86,6 +86,13 @@ pub const Git = struct {
         return r.stdout;
     }
 
+    /// Nearest tag reachable from HEAD (empty when there is none).
+    pub fn describeTag(self: Git, arena: std.mem.Allocator) []const u8 {
+        const r = self.run(arena, &.{ "git", "describe", "--tags", "--abbrev=0" }) orelse return "";
+        if (r.term != .exited or r.term.exited != 0) return "";
+        return std.mem.trim(u8, r.stdout, " \n\r\t");
+    }
+
     /// Current branch name (empty when detached/unknown).
     pub fn currentBranch(self: Git, arena: std.mem.Allocator) []const u8 {
         const r = self.run(arena, &.{ "git", "rev-parse", "--abbrev-ref", "HEAD" }) orelse return "";

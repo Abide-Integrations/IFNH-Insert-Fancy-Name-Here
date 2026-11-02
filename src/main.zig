@@ -15,6 +15,11 @@ const session_mod = @import("core/session/store.zig");
 const config_mod = @import("core/config/config.zig");
 const config_schema = @import("core/config/schema.zig");
 const trace_mod = @import("core/trace.zig");
+const wire_log = @import("core/wire_log.zig");
+const git_mod = @import("core/git.zig");
+const keys_mod = @import("core/config/keys.zig");
+const transcript = @import("core/session/transcript.zig");
+const debug_bundle = @import("core/debug_bundle.zig");
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -63,7 +68,7 @@ pub fn main(init: std.process.Init) !void {
         // A `-p` before the subcommand is the prompt when `ask` did not give
         // one; an explicit `ask -` still means stdin.
         ask.prompt = cli_args.resolveAskPrompt(parsed.flags.prompt, ask);
-        std.process.exit(ask_mod.run(io, arena, init.environ_map, parsed.flags, ask));
+        std.process.exit(ask_mod.run(io, arena, init.environ_map, parsed.flags, ask, openWire(io, arena, init.environ_map, parsed.flags)));
     }
 
     if (parsed.subcommand == .none) {
@@ -72,6 +77,7 @@ pub fn main(init: std.process.Init) !void {
             .trace = &startup_trace,
             .profile = parsed.flags.profile,
             .overrides = parsed.flags.overrideList(),
+            .wire = openWire(io, arena, init.environ_map, parsed.flags),
         }) catch |err| {
             if (err == error.AccessDenied) {
                 try printOut(io, arena, "error: permission denied\n" ++
@@ -116,6 +122,7 @@ fn dispatch(
                 .no_color = parsed.flags.no_color,
                 .profile = parsed.flags.profile,
                 .overrides = parsed.flags.overrideList(),
+                .wire = openWire(io, arena, environ, parsed.flags),
             });
             return;
         },
@@ -139,9 +146,13 @@ fn dispatch(
                 .no_color = parsed.flags.no_color,
                 .profile = parsed.flags.profile,
                 .overrides = parsed.flags.overrideList(),
+                .wire = openWire(io, arena, environ, parsed.flags),
             });
         },
         .doctor => try runDoctor(io, arena, environ),
+        .@"debug-bundle" => try runDebugBundle(io, arena, environ, parsed.flags, parsed.args),
+        .session => try runSession(io, arena, environ, parsed.args),
+        .replay => try runReplay(io, arena, parsed.flags, parsed.args),
         .unknown => {
             try printOut(io, arena, "error: unknown subcommand '{s}'\n(run `ifnh help` for usage)\n", .{parsed.args[0]});
             std.process.exit(2);
@@ -599,22 +610,30 @@ fn runCleanup(io: std.Io, arena: std.mem.Allocator, environ: *const std.process.
 
 /// `ifnh doctor` — environment health check (M1-T14, DECISIONS S259).
 fn runDoctor(io: std.Io, arena: std.mem.Allocator, environ: *const std.process.Environ.Map) !void {
-    const git_mod = @import("core/git.zig");
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const failed = try doctorReport(io, arena, environ, &aw.writer);
+    try printOut(io, arena, "{s}", .{aw.written()});
+    if (failed) std.process.exit(1);
+}
+
+/// The doctor text, written to `w` (also embedded in `debug-bundle`).
+/// Returns true when problems were found.
+fn doctorReport(io: std.Io, arena: std.mem.Allocator, environ: *const std.process.Environ.Map, w: *std.Io.Writer) !bool {
     const cwd = std.Io.Dir.cwd();
     var problems: usize = 0;
 
-    try printOut(io, arena, "ifnh doctor\n", .{});
+    try w.print("ifnh doctor\n", .{});
 
     // Config.
     var cfg = try config_mod.load(arena, io, environ, cwd);
     defer cfg.deinit();
     if (cfg.errors.items.len == 0) {
-        try printOut(io, arena, "  config: ok\n", .{});
+        try w.print("  config: ok\n", .{});
     } else {
         problems += cfg.errors.items.len;
-        for (cfg.errors.items) |e| try printOut(io, arena, "  config: ERROR [{s}] {s}\n", .{ e.path, e.message });
+        for (cfg.errors.items) |e| try w.print("  config: ERROR [{s}] {s}\n", .{ e.path, e.message });
     }
-    for (cfg.warnings.items) |w| try printOut(io, arena, "  config: warning {s}\n", .{w});
+    for (cfg.warnings.items) |warning| try w.print("  config: warning {s}\n", .{warning});
 
     // Model/provider.
     const provider_name = cfg.getString("model.provider", "openai");
@@ -623,7 +642,6 @@ fn runDoctor(io: std.Io, arena: std.mem.Allocator, environ: *const std.process.E
         (if (is_anthropic) "ANTHROPIC_API_KEY" else "OPENAI_API_KEY");
     // Key lookup uses the same merged view as sessions: process env +
     // stored keys (~/.config/ifnh/env).
-    const keys_mod = @import("core/config/keys.zig");
     var stored_keys = keys_mod.Keys.init(arena);
     stored_keys.load(io, arena, environ);
     const has_key = environ.get(key_env) != null or stored_keys.map.get(key_env) != null;
@@ -634,20 +652,20 @@ fn runDoctor(io: std.Io, arena: std.mem.Allocator, environ: *const std.process.E
             "environment"
         else
             keys_mod.Keys.path(arena, environ) orelse "the user env file";
-        try printOut(io, arena, "  provider: ok ({s} · {s}, key from {s})\n", .{ pd, cfg.getString("model.model", ""), key_where });
+        try w.print("  provider: ok ({s} · {s}, key from {s})\n", .{ pd, cfg.getString("model.model", ""), key_where });
     } else {
         problems += 1;
-        if (!has_model) try printOut(io, arena, "  provider: model.model not set (run `ifnh` — first-run setup will ask)\n", .{});
-        if (!has_key) try printOut(io, arena, "  provider: {s} not set (export it, or run `ifnh` -> /provider key {s})\n", .{ key_env, key_env });
+        if (!has_model) try w.print("  provider: model.model not set (run `ifnh` — first-run setup will ask)\n", .{});
+        if (!has_key) try w.print("  provider: {s} not set (export it, or run `ifnh` -> /provider key {s})\n", .{ key_env, key_env });
     }
 
     // Git.
     if (git_mod.discover(io, arena, cwd)) |ws| {
         if (ws.git) |g| {
             const dirty = g.dirtyCount(arena);
-            try printOut(io, arena, "  git: repository, branch {s}, {d} uncommitted changes\n", .{ g.currentBranch(arena), dirty });
+            try w.print("  git: repository, branch {s}, {d} uncommitted changes\n", .{ g.currentBranch(arena), dirty });
         } else {
-            try printOut(io, arena, "  git: not a repository (worktree isolation unavailable)\n", .{});
+            try w.print("  git: not a repository (worktree isolation unavailable)\n", .{});
         }
     }
 
@@ -655,26 +673,207 @@ fn runDoctor(io: std.Io, arena: std.mem.Allocator, environ: *const std.process.E
     const mcp_mod = @import("core/mcp.zig");
     var reg = try mcp_mod.Registry.init(io, arena, cfg.get("mcp_servers"));
     defer reg.deinit();
-    try printOut(io, arena, "  mcp: {d} servers configured\n", .{reg.configs.len});
+    try w.print("  mcp: {d} servers configured\n", .{reg.configs.len});
 
     // Hooks (D-07).
     const hooks_mod = @import("core/hooks.zig");
     const hook_defs = hooks_mod.Engine.fromConfig(arena, cfg.get("hooks")) catch &.{};
-    try printOut(io, arena, "  hooks: {d} configured\n", .{hook_defs.len});
+    try w.print("  hooks: {d} configured\n", .{hook_defs.len});
 
     // Session dir writability.
     cwd.createDirPath(io, ".ifnh/sessions") catch {
         problems += 1;
-        try printOut(io, arena, "  state: cannot create .ifnh/sessions (read-only checkout?)\n", .{});
-        return;
+        try w.print("  state: cannot create .ifnh/sessions (read-only checkout?)\n", .{});
+        return false; // unchanged: this path never exited non-zero
     };
-    try printOut(io, arena, "  state: .ifnh/sessions writable\n", .{});
+    try w.print("  state: .ifnh/sessions writable\n", .{});
 
     if (problems > 0) {
-        try printOut(io, arena, "{d} problem(s) found\n", .{problems});
-        std.process.exit(1);
+        try w.print("{d} problem(s) found\n", .{problems});
+        return true;
     }
-    try printOut(io, arena, "all checks passed\n", .{});
+    try w.print("all checks passed\n", .{});
+    return false;
+}
+
+/// Values to scrub from trace and bundle output: the stored key file plus any
+/// process-environment value whose name looks like a credential.
+fn liveSecrets(io: std.Io, arena: std.mem.Allocator, environ: *const std.process.Environ.Map) []const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var stored = keys_mod.Keys.init(arena);
+    stored.load(io, arena, environ);
+    var kit = stored.map.iterator();
+    while (kit.next()) |e| out.append(arena, e.value_ptr.*) catch {};
+    var eit = environ.iterator();
+    while (eit.next()) |e| {
+        if (debug_bundle.isSecretName(e.key_ptr.*) or std.ascii.indexOfIgnoreCase(e.key_ptr.*, "key") != null) {
+            out.append(arena, e.value_ptr.*) catch {};
+        }
+    }
+    return out.items;
+}
+
+/// `--trace <path>` (or `IFNH_TRACE_LOG`): the wire log for this run, or null.
+/// A log that cannot be opened is a warning, never a failed run.
+fn openWire(io: std.Io, arena: std.mem.Allocator, environ: *const std.process.Environ.Map, flags: cli_args.GlobalFlags) ?*wire_log.WireLog {
+    const path = tracePath(environ, flags) orelse return null;
+    const log = arena.create(wire_log.WireLog) catch return null;
+    log.* = wire_log.WireLog.open(io, arena, path, liveSecrets(io, arena, environ)) catch |err| {
+        printErr(io, arena, "warning: cannot open trace log {s}: {s}\n", .{ path, @errorName(err) }) catch {};
+        return null;
+    };
+    return log;
+}
+
+fn tracePath(environ: *const std.process.Environ.Map, flags: cli_args.GlobalFlags) ?[]const u8 {
+    if (flags.trace) |p| return p;
+    const env = environ.get(wire_log.env_var) orelse return null;
+    return if (env.len > 0) env else null;
+}
+
+/// `ifnh session export <id> [--out <path>|-]` (D-09).
+fn runSession(io: std.Io, arena: std.mem.Allocator, environ: *const std.process.Environ.Map, args: []const []const u8) !void {
+    if (args.len < 2 or !std.mem.eql(u8, args[0], "export")) {
+        try printErr(io, arena, "usage: ifnh session export <id> [--out <path>|-]\n", .{});
+        std.process.exit(2);
+    }
+    var out_path: []const u8 = "-";
+    var rest = args[2..];
+    while (rest.len > 0) {
+        if (std.mem.eql(u8, rest[0], "--out") and rest.len > 1) {
+            out_path = rest[1];
+            rest = rest[2..];
+        } else {
+            try printErr(io, arena, "usage: ifnh session export <id> [--out <path>|-]\n", .{});
+            std.process.exit(2);
+        }
+    }
+    const cwd = std.Io.Dir.cwd();
+    const sessions_rel = ".ifnh/sessions";
+    const summaries = session_mod.list(cwd, io, arena, sessions_rel) catch &.{};
+    const ids = try arena.alloc([]const u8, summaries.len);
+    for (summaries, 0..) |sm, i| ids[i] = sm.id;
+    const id = switch (transcript.resolveId(ids, args[1])) {
+        .ok => |id| id,
+        .unknown => {
+            try printErr(io, arena, "error: no session matches '{s}' (see `ifnh sessions list`)\n", .{args[1]});
+            std.process.exit(1);
+        },
+        .ambiguous => {
+            try printErr(io, arena, "error: '{s}' matches more than one session; give more characters\n", .{args[1]});
+            std.process.exit(1);
+        },
+    };
+    const rel = try std.fmt.allocPrint(arena, "{s}/{s}/events.jsonl", .{ sessions_rel, id });
+    const raw = fsutil.readSmallFile(cwd, io, arena, rel, session_mod.max_log_bytes) catch |err| {
+        try printErr(io, arena, "error: cannot read {s}: {s}\n", .{ rel, @errorName(err) });
+        std.process.exit(1);
+    };
+    const text = try transcript.exportText(arena, raw, liveSecrets(io, arena, environ));
+    if (std.mem.eql(u8, out_path, "-")) {
+        try std.Io.File.stdout().writeStreamingAll(io, text);
+        return;
+    }
+    try fsutil.atomicWriteFilePerm(cwd, io, arena, out_path, text, std.Io.File.Permissions.fromMode(0o600));
+    try printOut(io, arena, "exported {s} to {s}\n", .{ id, out_path });
+}
+
+/// `ifnh replay <file> [--json]` (D-09): offline, no provider, no config.
+fn runReplay(io: std.Io, arena: std.mem.Allocator, flags: cli_args.GlobalFlags, args: []const []const u8) !void {
+    if (args.len == 0) {
+        try printErr(io, arena, "usage: ifnh replay <file> [--json]\n", .{});
+        std.process.exit(2);
+    }
+    const json = wantsJson(&flags, args);
+    const input = fsutil.readSmallFile(std.Io.Dir.cwd(), io, arena, args[0], session_mod.max_log_bytes) catch |err| {
+        try printErr(io, arena, "error: cannot read {s}: {s}\n", .{ args[0], @errorName(err) });
+        std.process.exit(1);
+    };
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    var bad_line: usize = 0;
+    transcript.replay(arena, input, json, &aw.writer, &bad_line) catch |err| switch (err) {
+        error.Malformed => {
+            try printErr(io, arena, "error: {s}: line {d} is not a session record\n", .{ args[0], bad_line });
+            std.process.exit(2);
+        },
+        else => return err,
+    };
+    try std.Io.File.stdout().writeStreamingAll(io, aw.written());
+}
+
+/// `ifnh debug-bundle [--out <path>] [--json]` (D-09).
+fn runDebugBundle(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    environ: *const std.process.Environ.Map,
+    flags: cli_args.GlobalFlags,
+    args: []const []const u8,
+) !void {
+    var out_path: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--out") and i + 1 < args.len) {
+            i += 1;
+            out_path = args[i];
+        } else if (!std.mem.eql(u8, args[i], "--json")) {
+            try printErr(io, arena, "usage: ifnh debug-bundle [--out <path>] [--json]\n", .{});
+            std.process.exit(2);
+        }
+    }
+    const cwd = std.Io.Dir.cwd();
+    var cfg = try config_mod.load(arena, io, environ, cwd);
+    defer cfg.deinit();
+    try applyStartupOverrides(io, arena, &cfg, flags);
+
+    var doctor_aw: std.Io.Writer.Allocating = .init(arena);
+    _ = try doctorReport(io, arena, environ, &doctor_aw.writer);
+
+    var logs: std.ArrayList(debug_bundle.LogSource) = .empty;
+    if (tracePath(environ, flags)) |tp| {
+        if (fsutil.readSmallFile(cwd, io, arena, tp, 64 * 1024 * 1024)) |text| {
+            try logs.append(arena, .{ .name = tp, .text = text });
+        } else |_| {}
+    }
+    if (config_mod.userStateDir(arena, environ)) |state| {
+        const dir = try std.fmt.allocPrint(arena, "{s}/logs", .{state});
+        try logs.appendSlice(arena, debug_bundle.collectLogDir(arena, io, dir));
+    }
+    const tag = if (git_mod.discover(io, arena, cwd)) |ws| (if (ws.git) |g| g.describeTag(arena) else "") else "";
+
+    const doc = try debug_bundle.build(arena, .{
+        .version = version.version,
+        .git_tag = tag,
+        .cfg = &cfg,
+        .doctor = doctor_aw.written(),
+        .logs = logs.items,
+        .sessions = debug_bundle.collectSessions(arena, io, cwd, ".ifnh/sessions"),
+        .environ = environ,
+        .secrets = liveSecrets(io, arena, environ),
+    });
+    const path = out_path orelse try defaultBundleName(io, arena);
+    try debug_bundle.write(arena, io, cwd, path, doc);
+    if (wantsJson(&flags, args)) {
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        try aw.writer.writeAll("{\"path\":");
+        try std.json.Stringify.value(path, .{}, &aw.writer);
+        try aw.writer.print(",\"bytes\":{d}}}", .{doc.len});
+        try printOut(io, arena, "{s}\n", .{aw.written()});
+        return;
+    }
+    try printOut(io, arena, "{s}\n", .{path});
+}
+
+/// `ifnh-debug-<utc yyyymmddThhmmssZ>.json`
+fn defaultBundleName(io: std.Io, arena: std.mem.Allocator) ![]const u8 {
+    const secs: u64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_s));
+    const es = std.time.epoch.EpochSeconds{ .secs = secs };
+    const day = es.getEpochDay().calculateYearDay();
+    const md = day.calculateMonthDay();
+    const ds = es.getDaySeconds();
+    return std.fmt.allocPrint(arena, "ifnh-debug-{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z.json", .{
+        day.year,             md.month.numeric(),      md.day_index + 1,
+        ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
+    });
 }
 
 /// `ifnh init` — create the .ifnh/ skeleton (tracker M0-T38; minimal now).
@@ -756,6 +955,9 @@ const help_text =
     \\  resume      resume a previous session (M0)
     \\  ask         run one headless turn (prompt arg or stdin; --json NDJSON)
     \\  doctor      check environment health (M1)
+    \\  debug-bundle  write a redacted JSON bundle for bug reports (D-09)
+    \\  session     'ifnh session export <id> [--out <path>|-]' writes redacted NDJSON
+    \\  replay      'ifnh replay <file> [--json]' prints an exported session offline
     \\  help        show this text
     \\  version     print version
     \\
@@ -764,6 +966,7 @@ const help_text =
     \\  --no-color              disable color
     \\  --log-level <level>     err | info | debug | trace
     \\  --profile <name>        apply profiles.<name> from config (D-03)
+    \\  --trace <path>          write a redacted NDJSON wire log (or IFNH_TRACE_LOG)
     \\  --model <id>            per-key config flags, applied as the cli layer:
     \\  --provider <name>       --model --provider --base-url --temperature
     \\  --base-url <url>        --max-output-tokens --context-tokens
@@ -809,6 +1012,9 @@ test {
     _ = @import("core/diff.zig");
     _ = @import("core/instructions.zig");
     _ = @import("core/trace.zig");
+    _ = @import("core/wire_log.zig");
+    _ = @import("core/session/transcript.zig");
+    _ = @import("core/debug_bundle.zig");
     _ = @import("core/turn_cache.zig");
     _ = @import("core/agent/engine.zig");
     _ = @import("core/agent/testing.zig");

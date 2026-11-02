@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const trace_mod = @import("../trace.zig");
+const wire_log = @import("../wire_log.zig");
 const resolve_mod = @import("resolve.zig");
 
 pub const Layer = enum {
@@ -178,6 +179,11 @@ pub const unwired_defaults = [_][]const u8{
     "ui.verbosity", // no verbosity levels yet
     "debug.level", // std log level is comptime (`std_options`); no runtime logger
 };
+
+/// `IFNH_*` variables that switch runtime features and are not config keys.
+fn isRuntimeSwitch(key: []const u8) bool {
+    return std.mem.eql(u8, key, trace_mod.env_var) or std.mem.eql(u8, key, wire_log.env_var);
+}
 
 pub const Store = struct {
     arena_state: std.heap.ArenaAllocator,
@@ -672,7 +678,7 @@ pub fn load(
         while (it.next()) |entry| {
             const key = entry.key_ptr.*;
             if (!std.mem.startsWith(u8, key, "IFNH_")) continue;
-            if (std.mem.eql(u8, key, trace_mod.env_var)) continue; // runtime switch, not config
+            if (isRuntimeSwitch(key)) continue; // runtime switch, not config
             const rest = key["IFNH_".len..];
             if (rest.len == 0) continue;
             var parts: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -870,6 +876,7 @@ test "trace runtime env switch is not a config key" {
     var env = std.process.Environ.Map.init(std.testing.allocator);
     defer env.deinit();
     try env.put(trace_mod.env_var, "1");
+    try env.put(wire_log.env_var, "/tmp/wire.ndjson");
 
     var store = try Store.init(std.testing.allocator);
     defer store.deinit();
@@ -888,7 +895,7 @@ fn applyEnvForTest(store: *Store, env: *const std.process.Environ.Map) !void {
     while (it.next()) |entry| {
         const key = entry.key_ptr.*;
         if (!std.mem.startsWith(u8, key, "IFNH_")) continue;
-        if (std.mem.eql(u8, key, trace_mod.env_var)) continue; // runtime switch, not config
+        if (isRuntimeSwitch(key)) continue; // runtime switch, not config
         const rest = key["IFNH_".len..];
         var parts: std.ArrayListUnmanaged([]const u8) = .empty;
         var sit = std.mem.splitSequence(u8, rest, "__");

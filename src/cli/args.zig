@@ -26,6 +26,8 @@ pub const GlobalFlags = struct {
     /// `--profile <name>`: merge `profiles.<name>` over the loaded config
     /// and append its `prompt` fragment (D-03).
     profile: ?[]const u8 = null,
+    /// `--trace <path>`: NDJSON wire log of provider requests/responses (D-09).
+    trace: ?[]const u8 = null,
     /// Per-key config flags (`--model`, `--temperature`, ...), applied after
     /// `--profile` as the `.cli` layer (D-06).
     overrides: [max_overrides]Override = undefined,
@@ -67,6 +69,12 @@ pub const Subcommand = enum {
     doctor,
     fork,
     cleanup,
+    /// `ifnh debug-bundle [--out <path>]` (D-09).
+    @"debug-bundle",
+    /// `ifnh session export <id>` (D-09).
+    session,
+    /// `ifnh replay <file>` (D-09).
+    replay,
     /// `ifnh ask "<prompt>"`: headless one-shot turn (C-02).
     ask,
     unknown,
@@ -122,6 +130,10 @@ fn parseGlobal(argv: []const []const u8, i: *usize, result: *Parsed) ParseError!
         i.* += 1;
         if (i.* >= argv.len) return error.MissingFlagValue;
         result.flags.profile = argv[i.*];
+    } else if (std.mem.eql(u8, arg, "--trace")) {
+        i.* += 1;
+        if (i.* >= argv.len) return error.MissingFlagValue;
+        result.flags.trace = argv[i.*];
     } else if (std.mem.eql(u8, arg, "-p")) {
         i.* += 1;
         if (i.* >= argv.len) return error.MissingFlagValue;
@@ -188,6 +200,12 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
         .fork
     else if (std.mem.eql(u8, cmd_name, "cleanup"))
         .cleanup
+    else if (std.mem.eql(u8, cmd_name, "debug-bundle"))
+        .@"debug-bundle"
+    else if (std.mem.eql(u8, cmd_name, "session"))
+        .session
+    else if (std.mem.eql(u8, cmd_name, "replay"))
+        .replay
     else if (std.mem.eql(u8, cmd_name, "ask"))
         .ask
     else
@@ -428,4 +446,13 @@ test "cli per-key flags stop at the subcommand and apply as the cli layer" {
     try store.applyCliOverrides(p.flags.overrideList());
     try std.testing.expectEqualStrings("m", store.getString("model.model", ""));
     try std.testing.expectEqual(config_mod.Layer.cli, store.getSource("model.model").?.layer);
+}
+
+test "cli trace flag takes a path before the subcommand" {
+    const p = try parse(&.{ "--trace", "/tmp/w.ndjson", "ask", "hi" });
+    try std.testing.expectEqualStrings("/tmp/w.ndjson", p.flags.trace.?);
+    try std.testing.expectEqual(Subcommand.ask, p.subcommand);
+    try std.testing.expectError(error.MissingFlagValue, parse(&.{"--trace"}));
+    try std.testing.expectEqual(Subcommand.replay, (try parse(&.{ "replay", "f" })).subcommand);
+    try std.testing.expectEqual(Subcommand.@"debug-bundle", (try parse(&.{"debug-bundle"})).subcommand);
 }

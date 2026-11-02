@@ -26,6 +26,7 @@ const tool_mod = @import("../tools/tool.zig");
 const openai = @import("../providers/openai.zig");
 const anthropic = @import("../providers/anthropic.zig");
 const trace_mod = @import("../core/trace.zig");
+const wire_log = @import("../core/wire_log.zig");
 const turn_cache_mod = @import("../core/turn_cache.zig");
 const budget_mod = @import("../core/budget.zig");
 const footer_mod = @import("../ui/footer.zig");
@@ -49,6 +50,8 @@ pub const Options = struct {
     /// Per-key config flags (`--model`, ...), applied after the profile as
     /// the `.cli` layer (D-06).
     overrides: []const config_mod.CliOverride = &.{},
+    /// Wire log owned by main (`--trace`, D-09).
+    wire: ?*wire_log.WireLog = null,
 };
 
 /// Terminal-facing state for the REPL: the palette, the streams and the
@@ -312,6 +315,7 @@ pub fn run(
         .cwd_label = if (environ.get("PWD")) |pwd| pwd else ".",
         .trace = opts.trace,
         .profile = opts.profile,
+        .wire = opts.wire,
     });
     defer rt.deinit();
     if (rt.local_grants_warning) |warning| try out(io, "{s}", .{warning});

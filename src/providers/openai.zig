@@ -52,6 +52,11 @@ pub fn streamFn(
         try std.fmt.allocPrint(arena, "Bearer {s}", .{req.api_key})
     else
         "";
+    if (req.wire) |w| w.request("openai", url, &.{
+        .{ .name = "authorization", .value = auth_header },
+        .{ .name = "content-type", .value = "application/json" },
+        .{ .name = "accept", .value = "text/event-stream" },
+    }, body, req.api_key);
 
     const connection = transport.openConnection(client, uri, transport.default_limits) catch |err| {
         sink.emit(.{ .failure = transport.failureFor(err, null) });

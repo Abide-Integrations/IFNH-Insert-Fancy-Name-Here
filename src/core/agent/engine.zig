@@ -12,6 +12,7 @@ const provider_mod = @import("../../providers/provider.zig");
 const tool_mod = @import("../../tools/tool.zig");
 const redact_mod = @import("../redact.zig");
 const trace_mod = @import("../trace.zig");
+const wire_log = @import("../wire_log.zig");
 const hooks_mod = @import("../hooks.zig");
 
 pub const max_tool_rounds_default: usize = 25;
@@ -174,6 +175,8 @@ pub const RunParams = struct {
     max_output_tokens: ?u32 = null,
     /// Optional per-session timing trace (B-01).
     trace: ?*trace_mod.Trace = null,
+    /// Wire log owned by the CLI run (`--trace`, D-09); null disables it.
+    wire: ?*wire_log.WireLog = null,
     /// Hooks around every tool call (D-07); null disables them.
     hook_engine: ?*hooks_mod.Engine = null,
     /// Environment hooks inherit (the parent process env, never mutated).
@@ -251,6 +254,7 @@ pub fn runTurn(p: RunParams) !Outcome {
                 .provider_options = active.provider_options,
                 .cancel = p.cancel,
                 .trace = p.trace,
+                .wire = p.wire,
                 .client = active.client,
             }, .{ .ctx = &trace_sink, .emit_fn = TraceSink.emit });
             const failure = collector.failure orelse break;

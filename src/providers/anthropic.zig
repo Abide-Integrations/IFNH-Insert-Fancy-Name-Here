@@ -47,6 +47,12 @@ pub fn streamFn(
         .{ .name = "anthropic-version", .value = anthropic_version },
         .{ .name = "accept", .value = "text/event-stream" },
     };
+    if (req.wire) |w| w.request("anthropic", url, &.{
+        .{ .name = "x-api-key", .value = req.api_key },
+        .{ .name = "anthropic-version", .value = anthropic_version },
+        .{ .name = "content-type", .value = "application/json" },
+        .{ .name = "accept", .value = "text/event-stream" },
+    }, body, req.api_key);
 
     const connection = transport.openConnection(client, uri, transport.default_limits) catch |err| {
         sink.emit(.{ .failure = transport.failureFor(err, null) });

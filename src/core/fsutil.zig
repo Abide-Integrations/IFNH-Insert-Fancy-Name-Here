@@ -16,6 +16,19 @@ pub fn atomicWriteFile(
     sub_path: []const u8,
     data: []const u8,
 ) !void {
+    return atomicWriteFilePerm(dir, io, alloc, sub_path, data, .default_file);
+}
+
+/// `atomicWriteFile` with explicit permissions on the temp file, so a private
+/// file (0600) is never observable with wider access.
+pub fn atomicWriteFilePerm(
+    dir: std.Io.Dir,
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    sub_path: []const u8,
+    data: []const u8,
+    permissions: std.Io.File.Permissions,
+) !void {
     var name_buf: [64]u8 = undefined;
     var rand_bytes: [8]u8 = undefined;
     io.random(&rand_bytes);
@@ -23,7 +36,7 @@ pub fn atomicWriteFile(
     const tmp_path = try std.mem.concat(alloc, u8, &.{ sub_path, suffix });
     defer alloc.free(tmp_path);
 
-    const file = try dir.createFile(io, tmp_path, .{ .truncate = true });
+    const file = try dir.createFile(io, tmp_path, .{ .truncate = true, .permissions = permissions });
     var closed = false;
     defer if (!closed) file.close(io);
     try file.writeStreamingAll(io, data);

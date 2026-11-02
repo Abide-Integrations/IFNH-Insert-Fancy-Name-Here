@@ -31,6 +31,7 @@ const core_types = @import("../types.zig");
 const openai = @import("../../providers/openai.zig");
 const anthropic = @import("../../providers/anthropic.zig");
 const trace_mod = @import("../trace.zig");
+const wire_log = @import("../wire_log.zig");
 const fsutil = @import("../fsutil.zig");
 const turn_cache_mod = @import("../turn_cache.zig");
 const budget_mod = @import("../budget.zig");
@@ -71,6 +72,8 @@ pub const InitOptions = struct {
     trace: ?*trace_mod.Trace = null,
     /// `--profile` name, re-applied after config re-reads (D-03).
     profile: ?[]const u8 = null,
+    /// Wire log owned by the CLI run (`--trace`, D-09).
+    wire: ?*wire_log.WireLog = null,
 };
 
 /// Result of one turn. `ran` is false when the turn never reached the
@@ -133,6 +136,8 @@ pub const SessionRuntime = struct {
     /// `--profile` name: the `.cli` layer it merged must survive config
     /// re-reads at turn boundaries (D-03).
     profile: ?[]const u8 = null,
+    /// Wire log borrowed from the CLI run (D-09).
+    wire: ?*wire_log.WireLog = null,
 
     /// Build a runtime: load provider keys, create or open the session
     /// store, and discover skills, background executions and MCP servers.
@@ -182,6 +187,7 @@ pub const SessionRuntime = struct {
             .process_environ = process_environ,
             .environ = merged_env,
             .profile = opts.profile,
+            .wire = opts.wire,
         };
 
         switch (local_grants.load(arena, io, cwd)) {
@@ -589,6 +595,7 @@ pub const SessionRuntime = struct {
             .max_tool_rounds = cfg.getU32("agents.max_tool_rounds", 25),
             .redactions = redactionsFor(arena, cfg.getBool("debug.redact", true), pcfg.api_key),
             .trace = self.trace,
+            .wire = self.wire,
             .hook_engine = &hook_engine,
             .hook_environ = self.process_environ,
             .session_id = self.store.manifest.id,
