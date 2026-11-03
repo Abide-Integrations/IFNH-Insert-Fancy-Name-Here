@@ -1482,7 +1482,7 @@ test "grep peak outstanding memory stays bounded on large files" {
     var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
     defer tmp.cleanup();
 
-    const line = "x" ** 1023 ++ "\n";
+    const line = &@as([1023]u8, @splat('x')) ++ "\n";
     var data: std.ArrayListUnmanaged(u8) = .empty;
     defer data.deinit(std.testing.allocator);
     while (data.items.len < 1000 * 1024) {

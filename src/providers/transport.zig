@@ -31,7 +31,7 @@ pub fn openConnection(
     limits: Limits,
 ) !*std.http.Client.Connection {
     var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-    const host = try uri.getHost(&host_buffer);
+    const host = try std.Io.net.HostName.fromUri(uri, &host_buffer);
     const protocol = std.http.Client.Protocol.fromUri(uri) orelse
         return error.UnsupportedUriScheme;
     const port: u16 = uri.port orelse switch (protocol) {

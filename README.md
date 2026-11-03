@@ -48,7 +48,7 @@ lifecycles.
 
 ## Build
 
-Requires [Zig 0.16.0](https://ziglang.org/download/):
+Requires [Zig 0.17.1](https://ziglang.org/download/):
 
 ```bash
 zig build -Doptimize=ReleaseSafe

@@ -277,7 +277,7 @@ pub const Client = struct {
 
         var redirect_buf: [8192]u8 = undefined;
         var response = try creq.receiveHead(&redirect_buf);
-        const status = @intFromEnum(response.head.status);
+        const status = @backingInt(response.head.status);
         if (response.head.status.class() != .success) {
             self.detail = try std.fmt.allocPrint(self.alloc, "HTTP {d}", .{status});
             return error.ServerRejected;

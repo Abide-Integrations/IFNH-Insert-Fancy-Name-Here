@@ -8,8 +8,8 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
-        .strip = optimize != .Debug,
-        .omit_frame_pointer = optimize != .Debug,
+        .strip = optimize != .debug,
+        .omit_frame_pointer = optimize != .debug,
         .error_tracing = false,
     });
 
@@ -27,7 +27,7 @@ pub fn build(b: *std.Build) void {
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     const run_step = b.step("run", "Run ifnh");
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
     run_step.dependOn(&run_cmd.step);
 
     // `zig build check`: analyze the whole program without emitting a binary

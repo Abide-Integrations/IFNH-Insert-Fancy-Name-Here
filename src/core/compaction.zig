@@ -215,12 +215,12 @@ const redact_mod_redact = @import("redact.zig").redact;
 
 test "token estimate and plan thresholds" {
     try std.testing.expect(estimateTokens("") == 1);
-    try std.testing.expectEqual(@as(usize, 26), estimateTokens("x" ** 100));
+    try std.testing.expectEqual(@as(usize, 26), estimateTokens(&@as([100]u8, @splat('x'))));
 
     var history: std.ArrayListUnmanaged(core_types.ChatMessage) = .empty;
     defer history.deinit(std.testing.allocator);
     for (0..10) |_| {
-        try history.append(std.testing.allocator, .{ .role = .user, .content = "y" ** 4000 });
+        try history.append(std.testing.allocator, .{ .role = .user, .content = &@as([4000]u8, @splat('y')) });
     }
     const plan = planCompaction(history.items, 1000, 0.8);
     try std.testing.expect(plan.should_compact);
@@ -265,9 +265,9 @@ test "compaction never splits an assistant tool round" {
 
 test "compaction refuses when the only turn is the last one" {
     const history = [_]core_types.ChatMessage{
-        .{ .role = .user, .content = "u" ** 4000 },
+        .{ .role = .user, .content = &@as([4000]u8, @splat('u')) },
         .{ .role = .assistant, .content = "", .tool_calls_json = "[{\"id\":\"t1\",\"name\":\"read\"}]" },
-        .{ .role = .tool, .content = "r" ** 4000, .tool_call_id = "t1" },
+        .{ .role = .tool, .content = &@as([4000]u8, @splat('r')), .tool_call_id = "t1" },
     };
     const plan = planCompaction(&history, 100, 0.8);
     try std.testing.expect(!plan.should_compact);
@@ -294,7 +294,7 @@ test "compaction fails cleanly when provider fails" {
 
     var history: std.ArrayListUnmanaged(core_types.ChatMessage) = .empty;
     for (0..6) |_| {
-        try history.append(arena, .{ .role = .user, .content = "z" ** 3000 });
+        try history.append(arena, .{ .role = .user, .content = &@as([3000]u8, @splat('z')) });
     }
     try std.testing.expectError(error.CompactionFailed, compact(arena, io, .{
         .provider = fake.provider(),

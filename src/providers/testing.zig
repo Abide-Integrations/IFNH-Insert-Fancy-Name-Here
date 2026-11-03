@@ -89,7 +89,7 @@ pub const FakeServer = struct {
         self.head_len = head_len;
         @memcpy(self.head_buf[0..head_len], head_accum[0..head_len]);
         if (head_end > 0) {
-            if (std.ascii.indexOfIgnoreCase(head_accum[0..head_end], "content-length:")) |pos| {
+            if (std.ascii.findIgnoreCase(head_accum[0..head_end], "content-length:")) |pos| {
                 const rest = head_accum[pos + "content-length:".len .. head_end];
                 content_length = std.fmt.parseInt(usize, std.mem.trim(u8, rest[0 .. std.mem.indexOfScalar(u8, rest, '\r') orelse rest.len], " \t"), 10) catch 0;
             }

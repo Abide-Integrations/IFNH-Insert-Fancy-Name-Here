@@ -39,7 +39,7 @@ pub const Inputs = struct {
 };
 
 fn containsIgnoreCase(hay: []const u8, needle: []const u8) bool {
-    return std.ascii.indexOfIgnoreCase(hay, needle) != null;
+    return std.ascii.findIgnoreCase(hay, needle) != null;
 }
 
 /// `api_key`, `token`, `secret`, `password` in the name. Plural `*_tokens`

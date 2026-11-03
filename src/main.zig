@@ -816,7 +816,7 @@ fn liveSecrets(io: std.Io, arena: std.mem.Allocator, environ: *const std.process
     while (kit.next()) |e| out.append(arena, e.value_ptr.*) catch {};
     var eit = environ.iterator();
     while (eit.next()) |e| {
-        if (debug_bundle.isSecretName(e.key_ptr.*) or std.ascii.indexOfIgnoreCase(e.key_ptr.*, "key") != null) {
+        if (debug_bundle.isSecretName(e.key_ptr.*) or std.ascii.findIgnoreCase(e.key_ptr.*, "key") != null) {
             out.append(arena, e.value_ptr.*) catch {};
         }
     }

@@ -685,7 +685,7 @@ test "journal refuses unsafe paths and oversized images" {
 
     try std.testing.expectError(error.PathUnsafe, j.apply("x", &.{.{ .create = .{ .path = "../evil.txt", .after = "pwn" } }}));
     try std.testing.expectError(error.PathUnsafe, j.apply("x", &.{.{ .create = .{ .path = "/abs/path.txt", .after = "pwn" } }}));
-    const big = "x" ** (max_before_image_bytes + 1);
+    const big = &@as([(max_before_image_bytes + 1)]u8, @splat('x'));
     try std.testing.expectError(error.NotJournalable, j.apply("x", &.{.{ .create = .{ .path = "big.txt", .after = big } }}));
 }
 

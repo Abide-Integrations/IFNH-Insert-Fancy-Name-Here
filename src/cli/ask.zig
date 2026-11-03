@@ -22,7 +22,7 @@ const image_mod = @import("../core/image.zig");
 pub const Exit = enum(u8) { ok = 0, failed = 1, usage = 2, denied = 3, budget = 4, interrupted = 130 };
 
 /// Usage errors (bad flag, missing/empty prompt, conflicting approvals).
-pub const exit_usage: u8 = @intFromEnum(Exit.usage);
+pub const exit_usage: u8 = @backingInt(Exit.usage);
 
 /// Facts about a finished run. Several may hold at once; `runStatus` applies
 /// the documented precedence.
@@ -48,8 +48,8 @@ pub fn runStatus(facts: Facts) RunStatus {
 
 /// Exit code for a finished run (`null` is a usage error).
 pub fn exitCodeFor(status: ?RunStatus) u8 {
-    const s = status orelse return @intFromEnum(Exit.usage);
-    return @intFromEnum(switch (s) {
+    const s = status orelse return @backingInt(Exit.usage);
+    return @backingInt(switch (s) {
         .ok => Exit.ok,
         .failed => Exit.failed,
         .denied => Exit.denied,
@@ -449,7 +449,7 @@ test "exit-code mapping table covers usage and every run status" {
     };
     for (cases) |c| try std.testing.expectEqual(c.code, exitCodeFor(c.status));
     try std.testing.expectEqual(@as(u8, 2), exit_usage);
-    try std.testing.expectEqual(@as(u8, 130), @intFromEnum(Exit.interrupted));
+    try std.testing.expectEqual(@as(u8, 130), @backingInt(Exit.interrupted));
 }
 
 test "run status precedence: interrupted > budget > failed > denied > ok" {

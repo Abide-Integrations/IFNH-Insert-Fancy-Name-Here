@@ -7,7 +7,7 @@ decisions live in PLAN.md/DECISIONS.md; architecture in DESIGN.md.
 
 ## 1. Build
 
-Requires [Zig 0.16.0](https://ziglang.org/download/). No other toolchain.
+Requires [Zig 0.17.1](https://ziglang.org/download/). No other toolchain.
 
 ```bash
 zig build -Doptimize=ReleaseSafe     # -> zig-out/bin/ifnh (~1.7 MiB)

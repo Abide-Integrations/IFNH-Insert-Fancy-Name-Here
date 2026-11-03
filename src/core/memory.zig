@@ -180,7 +180,7 @@ pub const FileAdapter = struct {
                 continue;
             };
             if (full) continue; // keep counting malformed lines
-            if (query.len > 0 and std.ascii.indexOfIgnoreCase(stored.text, query) == null) continue;
+            if (query.len > 0 and std.ascii.findIgnoreCase(stored.text, query) == null) continue;
             if (out.items.len >= opts.max_snippets or budget + stored.text.len > opts.max_bytes) {
                 full = true;
                 continue;
@@ -570,7 +570,7 @@ test "memory recall: newest first, 8 snippet cap, 4 KiB budget" {
     // Byte budget: 1500-byte entries, three would be 4500 > 4096.
     _ = try a.forget(arena, io, &diag, .project, null);
     for (0..4) |n| {
-        const text = try std.fmt.allocPrint(arena, "big{d}{s}", .{ n, "x" ** 1496 });
+        const text = try std.fmt.allocPrint(arena, "big{d}{s}", .{ n, &@as([1496]u8, @splat('x')) });
         _ = try a.remember(arena, io, &diag, .{ .text = text }, .project);
     }
     const big = try a.recall(arena, io, &diag, "", .project, .{});
@@ -648,9 +648,9 @@ test "memory remember rejects empty and oversized text; user scope needs a direc
     var diag = Diag{};
     try testing.expectError(error.EmptyText, a.remember(arena, io, &diag, .{ .text = " \n" }, .project));
     try testing.expectEqualStrings("memory text is empty", diag.message);
-    try testing.expectError(error.TextTooLarge, a.remember(arena, io, &diag, .{ .text = "x" ** (max_text_bytes + 1) }, .project));
+    try testing.expectError(error.TextTooLarge, a.remember(arena, io, &diag, .{ .text = &@as([(max_text_bytes + 1)]u8, @splat('x')) }, .project));
     try testing.expect(std.mem.indexOf(u8, diag.message, "4096") != null);
-    _ = try a.remember(arena, io, &diag, .{ .text = "y" ** max_text_bytes }, .project); // exactly the limit
+    _ = try a.remember(arena, io, &diag, .{ .text = &@as([max_text_bytes]u8, @splat('y')) }, .project); // exactly the limit
     try testing.expectError(error.NoUserDir, a.remember(arena, io, &diag, .{ .text = "z" }, .user));
     try testing.expect(std.mem.indexOf(u8, diag.message, "HOME") != null);
     // Nothing was written for the rejected texts.

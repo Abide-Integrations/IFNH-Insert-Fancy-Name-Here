@@ -182,7 +182,7 @@ fn setBit(set: *[32]u8, c: u8) void {
 }
 
 fn parseClass(pattern: []const u8, i: *usize) CompileError![32]u8 {
-    var set = [_]u8{0} ** 32;
+    var set: [32]u8 = @splat(0);
     var p = i.* + 1;
     var negated = false;
     if (p < pattern.len and pattern[p] == '^') {

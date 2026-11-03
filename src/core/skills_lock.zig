@@ -171,8 +171,8 @@ test "skills lock writer is byte-stable: sorted names, fixed fields, trailing ne
     const arena = arena_state.allocator();
 
     var lock = Lock{};
-    try lock.put(arena, "zeta", .{ .source = "https://example.com/z.git", .commit = "b" ** 40, .installed_at = "2026-11-03T12:00:00Z" });
-    try lock.put(arena, "alpha", .{ .source = "git@example.com:o/a.git", .ref = "v1", .commit = "a" ** 40, .installed_at = "2026-11-03T11:00:00Z" });
+    try lock.put(arena, "zeta", .{ .source = "https://example.com/z.git", .commit = &@as([40]u8, @splat('b')), .installed_at = "2026-11-03T12:00:00Z" });
+    try lock.put(arena, "alpha", .{ .source = "git@example.com:o/a.git", .ref = "v1", .commit = &@as([40]u8, @splat('a')), .installed_at = "2026-11-03T11:00:00Z" });
     const text = try lock.render(arena);
     try testing.expectEqualStrings(
         \\{
@@ -248,13 +248,13 @@ test "skills lock put replaces, remove reports presence, shortCommit" {
     const arena = arena_state.allocator();
 
     var lock = Lock{};
-    try lock.put(arena, "s", .{ .source = "u1", .commit = "1" ** 40 });
-    try lock.put(arena, "s", .{ .source = "u2", .commit = "2" ** 40 });
+    try lock.put(arena, "s", .{ .source = "u1", .commit = &@as([40]u8, @splat('1')) });
+    try lock.put(arena, "s", .{ .source = "u2", .commit = &@as([40]u8, @splat('2')) });
     try testing.expectEqual(@as(usize, 1), lock.entries.items.len);
     try testing.expectEqualStrings("u2", lock.get("s").?.source);
     try testing.expect(lock.remove("s"));
     try testing.expect(!lock.remove("s"));
-    try testing.expectEqualStrings("2222222", shortCommit("2" ** 40));
+    try testing.expectEqualStrings("2222222", shortCommit(&@as([40]u8, @splat('2'))));
     try testing.expectEqualStrings("-", shortCommit(null));
     try testing.expectEqualStrings("-", shortCommit(""));
 }
