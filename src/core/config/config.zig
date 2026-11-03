@@ -430,8 +430,10 @@ pub const Store = struct {
             try self.addError("permissions.default_mode", "must be \"ask\" or \"auto\", got \"{s}\"", .{mode});
         }
         const provider = self.getString("model.provider", "openai");
-        if (!std.mem.eql(u8, provider, "openai") and !std.mem.eql(u8, provider, "anthropic")) {
-            try self.addError("model.provider", "must be \"openai\" or \"anthropic\", got \"{s}\"", .{provider});
+        if (!std.mem.eql(u8, provider, "openai") and !std.mem.eql(u8, provider, "anthropic") and
+            !std.mem.eql(u8, provider, "openai-responses"))
+        {
+            try self.addError("model.provider", "must be \"openai\", \"anthropic\" or \"openai-responses\", got \"{s}\"", .{provider});
         }
         if (self.get("tools.external")) |value| {
             if (value != .bool) try self.addError("tools.external", "must be true or false", .{});
@@ -824,6 +826,22 @@ test "defaults parse and validate" {
     try std.testing.expectEqual(@as(u32, 120), store.getU32("agents.timeout_tool_s", 0));
     try std.testing.expect(store.getBool("tools.external", false));
     try std.testing.expect(store.errors.items.len == 0);
+}
+
+test "model.provider accepts the three adapters and names them on error" {
+    for ([_][]const u8{ "\"openai\"", "\"anthropic\"", "\"openai-responses\"" }) |value| {
+        var store = try Store.init(std.testing.allocator);
+        defer store.deinit();
+        try store.applyOverride("model.provider", value, .{ .layer = .project, .origin = "test" });
+        try store.validate();
+        try std.testing.expectEqual(@as(usize, 0), store.errors.items.len);
+    }
+    var bad = try Store.init(std.testing.allocator);
+    defer bad.deinit();
+    try bad.applyOverride("model.provider", "\"gemini\"", .{ .layer = .project, .origin = "test" });
+    try bad.validate();
+    try std.testing.expectEqual(@as(usize, 1), bad.errors.items.len);
+    try std.testing.expectEqualStrings("must be \"openai\", \"anthropic\" or \"openai-responses\", got \"gemini\"", bad.errors.items[0].message);
 }
 
 test "tools.external must be a boolean" {

@@ -38,7 +38,7 @@ pub fn compile(arena: std.mem.Allocator, provider: []const u8, raw_json: []const
     while (it.next()) |entry| {
         const key = entry.key_ptr.*;
         const v = entry.value_ptr.*;
-        if (std.mem.eql(u8, provider, "openai") and try openaiOption(arena, &warnings, key, v)) {
+        if (isOpenAiFamily(provider) and try openaiOption(arena, &warnings, key, v)) {
             try kept.put(arena, key, v);
         } else if (std.mem.eql(u8, provider, "anthropic") and try anthropicOption(arena, &warnings, key, v)) {
             try kept.put(arena, key, v);
@@ -65,8 +65,13 @@ pub fn splice(w: *std.Io.Writer, json: []const u8) !void {
     try w.writeAll(members);
 }
 
+/// Chat Completions and Responses share the same option keys.
+fn isOpenAiFamily(provider: []const u8) bool {
+    return std.mem.eql(u8, provider, "openai") or std.mem.eql(u8, provider, "openai-responses");
+}
+
 fn isKnown(key: []const u8, provider: []const u8) bool {
-    if (std.mem.eql(u8, provider, "openai")) {
+    if (isOpenAiFamily(provider)) {
         return std.mem.eql(u8, key, "reasoning_effort") or std.mem.eql(u8, key, "reasoning");
     }
     if (std.mem.eql(u8, provider, "anthropic")) {
@@ -156,6 +161,16 @@ test "provider_options: openai keeps reasoning_effort and reasoning, drops the r
     try testing.expectEqual(@as(usize, 2), res.warnings.len);
     try testing.expect(std.mem.indexOf(u8, res.warnings[0], "thinking") != null);
     try testing.expect(std.mem.indexOf(u8, res.warnings[1], "temperature") != null);
+}
+
+test "provider_options: openai-responses implements the same keys as openai" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const res = try compileFor(arena_state.allocator(), "openai-responses",
+        \\{"reasoning_effort":"low","reasoning":{"summary":"auto"},"thinking":{"type":"enabled"}}
+    );
+    try testing.expectEqualStrings("{\"reasoning_effort\":\"low\",\"reasoning\":{\"summary\":\"auto\"}}", res.json);
+    try testing.expectEqual(@as(usize, 1), res.warnings.len);
 }
 
 test "provider_options: anthropic keeps thinking and top_k only" {

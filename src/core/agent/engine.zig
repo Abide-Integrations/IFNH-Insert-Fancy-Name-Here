@@ -69,6 +69,9 @@ pub const Callbacks = struct {
     /// Optional: an assistant message (text plus any tool calls) was appended
     /// to history. Persistent UIs record it here, not from `on_text`.
     on_assistant_message: ?*const fn (ctx: *anyopaque, content: []const u8, tool_calls_json: ?[]const u8) void = null,
+    /// Optional: a streaming reasoning (thinking / summary) delta. Valid only
+    /// for the call. Unset means reasoning is accumulated but not shown.
+    on_reasoning: ?*const fn (ctx: *anyopaque, text: []const u8) void = null,
 };
 
 pub const Status = enum { completed, failed, cancelled };
@@ -93,6 +96,9 @@ const Collector = struct {
     tool_calls: std.ArrayListUnmanaged(core_types.ToolCall) = .empty,
     usage: core_types.Usage = .{},
     failure: ?core_types.ProviderFailure = null,
+    /// First completed thinking block of the round. It goes back on the
+    /// assistant message so the next request can echo it (Anthropic).
+    reasoning: ?core_types.ReasoningBlock = null,
 
     fn emit(ctx_ptr: *anyopaque, ev: core_types.StreamEvent) void {
         const self: *Collector = @ptrCast(@alignCast(ctx_ptr));
@@ -103,7 +109,18 @@ const Collector = struct {
                 // write it immediately.
                 self.callbacks.on_text(self.callbacks.ctx, d);
             },
-            .reasoning_delta => {},
+            .reasoning_delta => |d| {
+                if (self.callbacks.on_reasoning) |cb| cb(self.callbacks.ctx, d);
+            },
+            .reasoning_block => |b| {
+                // Only the first block fits the single slot on ChatMessage.
+                if (self.reasoning != null) return;
+                self.reasoning = .{
+                    .text = self.arena.dupe(u8, b.text) catch return,
+                    .signature = self.arena.dupe(u8, b.signature) catch return,
+                    .redacted = b.redacted,
+                };
+            },
             .tool_call => |tc| {
                 const duped_id = self.arena.dupe(u8, tc.id) catch return;
                 const duped_name = self.arena.dupe(u8, tc.name) catch return;
@@ -198,6 +215,17 @@ fn advertisedTools(arena: std.mem.Allocator, ctx: *const tool_mod.ToolContext) s
         });
     }
     return out.items;
+}
+
+/// `msg` carrying the round's thinking block, if any. Reasoning is kept in
+/// memory for the turn only: the session record has no field for it.
+fn withReasoning(msg: core_types.ChatMessage, block: ?core_types.ReasoningBlock) core_types.ChatMessage {
+    const b = block orelse return msg;
+    var out = msg;
+    out.reasoning = b.text;
+    out.reasoning_signature = b.signature;
+    out.reasoning_redacted = b.redacted;
+    return out;
 }
 
 /// Run one agent turn. Appends assistant/tool messages to `history`.
@@ -311,7 +339,7 @@ pub fn runTurn(p: RunParams) !Outcome {
         }
 
         if (collector.tool_calls.items.len == 0) {
-            try p.history.append(p.arena, .{ .role = .assistant, .content = reply });
+            try p.history.append(p.arena, withReasoning(.{ .role = .assistant, .content = reply }, collector.reasoning));
             if (p.callbacks.on_assistant_message) |cb| cb(p.callbacks.ctx, reply, null);
             return .{ .status = .completed, .reply = reply, .tool_rounds = rounds + 1, .tool_calls = total_calls, .usage = total_usage, .last_round = last_round };
         }
@@ -333,11 +361,11 @@ pub fn runTurn(p: RunParams) !Outcome {
         try w.writeByte(']');
         const tc_json = aw.written();
 
-        try p.history.append(p.arena, .{
+        try p.history.append(p.arena, withReasoning(.{
             .role = .assistant,
             .content = reply,
             .tool_calls_json = tc_json,
-        });
+        }, collector.reasoning));
         if (p.callbacks.on_assistant_message) |cb| cb(p.callbacks.ctx, reply, tc_json);
 
         // Execute tool calls; consecutive read-only or `agent` calls run in
@@ -1488,4 +1516,89 @@ test "grep peak outstanding memory stays bounded on large files" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "g1.txt:1001: needle") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "g3.txt:1001: needle") != null);
     try std.testing.expect(counting.peak < 512 * 1024);
+}
+
+test "reasoning reaches on_reasoning and the thinking block rides the assistant message" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = "alpha\n" });
+
+    var fake = testing.Fake{ .script = &.{
+        &.{
+            .{ .reasoning = "hm " },
+            .{ .reasoning = "ok" },
+            .{ .reasoning_block = .{ .text = "hm ok", .signature = "SIG" } },
+            .{ .tool_call = .{ .id = "c1", .name = "read", .arguments_json = "{\"path\":\"f.txt\"}" } },
+        },
+        &.{.{ .text = "done" }},
+    } };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var perm_engine = @import("../permissions/engine.zig").Engine.init(arena, .auto);
+    var tool_ctx: tool_mod.ToolContext = .{
+        .io = io,
+        .arena = arena,
+        .workspace = tmp.dir,
+        .engine = &perm_engine,
+        .journal = null,
+        .max_file_read_bytes = 64 * 1024,
+        .approval_ctx = undefined,
+        .approval_fn = struct {
+            fn approve(_: *anyopaque, _: tool_mod.ApprovalRequest) tool_mod.ApprovalResponse {
+                return .denied;
+            }
+        }.approve,
+    };
+    var history: std.ArrayListUnmanaged(core_types.ChatMessage) = .empty;
+    try history.append(arena, .{ .role = .user, .content = "go" });
+
+    const Log = struct {
+        reasoning: std.ArrayListUnmanaged(u8) = .empty,
+        arena: std.mem.Allocator,
+        fn noop(_: *anyopaque, _: []const u8) void {}
+    };
+    var log = Log{ .arena = arena };
+    const cbs = Callbacks{
+        .ctx = &log,
+        .on_text = Log.noop,
+        .on_tool_start = struct {
+            fn f(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) void {}
+        }.f,
+        .on_tool_result = struct {
+            fn f(_: *anyopaque, _: []const u8, _: []const u8, _: tool_mod.Status, _: []const u8) void {}
+        }.f,
+        .on_notice = Log.noop,
+        .on_reasoning = struct {
+            fn f(ctx: *anyopaque, text: []const u8) void {
+                const l: *Log = @ptrCast(@alignCast(ctx));
+                l.reasoning.appendSlice(l.arena, text) catch {};
+            }
+        }.f,
+    };
+
+    var cancel = std.atomic.Value(bool).init(false);
+    const outcome = try runTurn(.{
+        .io = io,
+        .arena = arena,
+        .pcfg = .{ .provider = fake.provider(), .model = "fake", .base_url = "", .api_key = "" },
+        .system = "s",
+        .history = &history,
+        .tool_ctx = &tool_ctx,
+        .callbacks = cbs,
+        .cancel = &cancel,
+    });
+    try std.testing.expectEqual(Status.completed, outcome.status);
+    try std.testing.expectEqualStrings("hm ok", log.reasoning.items);
+
+    // user, assistant(tool call + thinking), tool result, assistant(final).
+    try std.testing.expectEqual(@as(usize, 4), history.items.len);
+    const first = history.items[1];
+    try std.testing.expectEqualStrings("hm ok", first.reasoning.?);
+    try std.testing.expectEqualStrings("SIG", first.reasoning_signature.?);
+    try std.testing.expect(!first.reasoning_redacted);
+    try std.testing.expect(history.items[3].reasoning == null);
 }

@@ -127,6 +127,12 @@ pub fn streamFn(
     var tools: [16]ToolAcc = undefined;
     var tool_count: usize = 0;
     var usage: core_types.Usage = .{};
+    // The thinking block being streamed (extended thinking): one at a time,
+    // emitted whole when its content block closes.
+    var think_index: ?u64 = null;
+    var think_text: std.ArrayListUnmanaged(u8) = .empty;
+    var think_sig: std.ArrayListUnmanaged(u8) = .empty;
+    var think_redacted = false;
 
     while (true) {
         const maybe_payload = parser.next(arena) catch |err| {
@@ -156,7 +162,16 @@ pub fn streamFn(
             if (cb != .object) continue;
             const index = intOf(o.get("index")) orelse continue;
             if (cb.object.get("type")) |t| {
-                if (t == .string and std.mem.eql(u8, t.string, "tool_use")) {
+                if (t == .string and (std.mem.eql(u8, t.string, "thinking") or std.mem.eql(u8, t.string, "redacted_thinking"))) {
+                    think_index = index;
+                    think_redacted = std.mem.eql(u8, t.string, "redacted_thinking");
+                    think_text.clearRetainingCapacity();
+                    think_sig.clearRetainingCapacity();
+                    // A redacted block arrives whole: `data` is echoed back
+                    // in place of a signature.
+                    const initial = strOrEmpty(cb.object.get(if (think_redacted) "data" else "signature"));
+                    try think_sig.appendSlice(arena, initial);
+                } else if (t == .string and std.mem.eql(u8, t.string, "tool_use")) {
                     if (index < tools.len) {
                         while (tool_count <= index) : (tool_count += 1) tools[tool_count] = .{};
                         if (cb.object.get("id")) |idv| {
@@ -178,6 +193,14 @@ pub fn streamFn(
                 if (d.get("text")) |t| {
                     if (t == .string and t.string.len > 0) sink.emit(.{ .content_delta = t.string });
                 }
+            } else if (std.mem.eql(u8, dt.string, "thinking_delta")) {
+                const piece = strOrEmpty(d.get("thinking"));
+                if (piece.len > 0) {
+                    try think_text.appendSlice(arena, piece);
+                    sink.emit(.{ .reasoning_delta = piece });
+                }
+            } else if (std.mem.eql(u8, dt.string, "signature_delta")) {
+                try think_sig.appendSlice(arena, strOrEmpty(d.get("signature")));
             } else if (std.mem.eql(u8, dt.string, "input_json_delta")) {
                 if (d.get("partial_json")) |pj| {
                     if (pj == .string) {
@@ -190,6 +213,15 @@ pub fn streamFn(
             // A tool_use block is complete here. A text block's stop finds no
             // named accumulator and emits nothing.
             const index = intOf(o.get("index")) orelse continue;
+            if (think_index != null and think_index.? == index) {
+                think_index = null;
+                // Unsigned thinking cannot be sent back, so it is not kept.
+                if (think_sig.items.len > 0) sink.emit(.{ .reasoning_block = .{
+                    .text = think_text.items,
+                    .signature = think_sig.items,
+                    .redacted = think_redacted,
+                } });
+            }
             if (index < tool_count) try tools[index].emit(arena, sink);
         } else if (std.mem.eql(u8, ev, "message_delta")) {
             if (o.get("usage")) |u| {
@@ -256,7 +288,12 @@ fn buildBody(arena: std.mem.Allocator, req: provider.ModelRequest) ![]u8 {
 
     try w.writeAll("{\"model\":");
     try std.json.Stringify.value(req.model, .{}, w);
-    try w.print(",\"max_tokens\":{d},\"stream\":true", .{req.max_output_tokens orelse limits.defaultMaxOutputTokens(req.model) orelse 4096});
+    const thinking_budget = thinkingBudget(arena, req.provider_options);
+    var max_tokens = req.max_output_tokens orelse limits.defaultMaxOutputTokens(req.model) orelse 4096;
+    // Extended thinking: the cap must leave room for the answer after the
+    // thinking budget, and a smaller one is rejected by the API.
+    if (thinking_budget) |budget| max_tokens = @max(max_tokens, std.math.add(u32, budget, 1024) catch std.math.maxInt(u32));
+    try w.print(",\"max_tokens\":{d},\"stream\":true", .{max_tokens});
 
     if (req.system.len > 0) {
         // Prompt caching (B-03): when the caller reports a stable prefix,
@@ -321,6 +358,23 @@ fn buildBody(arena: std.mem.Allocator, req: provider.ModelRequest) ![]u8 {
                 issued = .empty;
                 var blocks: std.Io.Writer.Allocating = .init(arena);
                 var block_count: usize = 0;
+                // A thinking block goes back first and unmodified; without a
+                // signature the API would reject it, so it is dropped. The
+                // leading block alone never makes a message non-empty.
+                var lead_blocks: std.Io.Writer.Allocating = .init(arena);
+                if (msg.reasoning_signature) |sig| {
+                    if (msg.reasoning_redacted) {
+                        try lead_blocks.writer.writeAll("{\"type\":\"redacted_thinking\",\"data\":");
+                        try std.json.Stringify.value(sig, .{}, &lead_blocks.writer);
+                        try lead_blocks.writer.writeByte('}');
+                    } else if (msg.reasoning) |thinking| {
+                        try lead_blocks.writer.writeAll("{\"type\":\"thinking\",\"thinking\":");
+                        try std.json.Stringify.value(thinking, .{}, &lead_blocks.writer);
+                        try lead_blocks.writer.writeAll(",\"signature\":");
+                        try std.json.Stringify.value(sig, .{}, &lead_blocks.writer);
+                        try lead_blocks.writer.writeByte('}');
+                    }
+                }
                 if (msg.content.len > 0) {
                     try blocks.writer.writeAll("{\"type\":\"text\",\"text\":");
                     try std.json.Stringify.value(msg.content, .{}, &blocks.writer);
@@ -356,6 +410,10 @@ fn buildBody(arena: std.mem.Allocator, req: provider.ModelRequest) ![]u8 {
                 if (!first) try w.writeByte(',');
                 first = false;
                 try w.writeAll("{\"role\":\"assistant\",\"content\":[");
+                if (lead_blocks.written().len > 0) {
+                    try w.writeAll(lead_blocks.written());
+                    try w.writeByte(',');
+                }
                 try w.writeAll(blocks.written());
                 try w.writeAll("]}");
             },
@@ -365,7 +423,22 @@ fn buildBody(arena: std.mem.Allocator, req: provider.ModelRequest) ![]u8 {
                 if (!first) try w.writeByte(',');
                 first = false;
                 try w.writeAll("{\"role\":\"user\",\"content\":");
-                try std.json.Stringify.value(msg.content, .{}, w);
+                if (msg.role == .user and msg.images.len > 0) {
+                    // Image blocks first, one per image, then the text.
+                    try w.writeByte('[');
+                    for (msg.images) |img| {
+                        try w.writeAll("{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":");
+                        try std.json.Stringify.value(img.media_type, .{}, w);
+                        try w.writeAll(",\"data\":");
+                        try std.json.Stringify.value(img.data_base64, .{}, w);
+                        try w.writeAll("}},");
+                    }
+                    try w.writeAll("{\"type\":\"text\",\"text\":");
+                    try std.json.Stringify.value(msg.content, .{}, w);
+                    try w.writeAll("}]");
+                } else {
+                    try std.json.Stringify.value(msg.content, .{}, w);
+                }
                 try w.writeByte('}');
             },
         }
@@ -386,13 +459,29 @@ fn buildBody(arena: std.mem.Allocator, req: provider.ModelRequest) ![]u8 {
         }
         try w.writeByte(']');
     }
+    // The API rejects a temperature other than 1 while thinking is on.
     if (req.temperature) |t| {
-        try w.print(",\"temperature\":{d}", .{t});
+        if (thinking_budget == null) try w.print(",\"temperature\":{d}", .{t});
     }
     // Provider-specific options (D-05), only for keys this adapter compiles.
     try options_mod.splice(w, req.provider_options);
     try w.writeByte('}');
     return aw.written();
+}
+
+/// `budget_tokens` of an enabled (or adaptive) `thinking` option, or null when
+/// extended thinking is off. Without a budget the temperature is still
+/// dropped, but `max_tokens` is left alone.
+fn thinkingBudget(arena: std.mem.Allocator, options_json: []const u8) ?u32 {
+    if (options_json.len == 0) return null;
+    const v = std.json.parseFromSliceLeaky(std.json.Value, arena, options_json, .{}) catch return null;
+    if (v != .object) return null;
+    const t = v.object.get("thinking") orelse return null;
+    if (t != .object) return null;
+    const kind = strOrEmpty(t.object.get("type"));
+    if (!std.mem.eql(u8, kind, "enabled") and !std.mem.eql(u8, kind, "adaptive")) return null;
+    const budget = intOf(t.object.get("budget_tokens")) orelse return 0;
+    return std.math.cast(u32, budget) orelse std.math.maxInt(u32);
 }
 
 fn indexOfStr(items: []const []const u8, needle: []const u8) ?usize {
@@ -647,4 +736,130 @@ test "usage parses cache read and write tokens" {
     try std.testing.expectEqual(@as(u64, 5), v.input_tokens);
     try std.testing.expectEqual(@as(u64, 0), v.cache_read_tokens);
     try std.testing.expectEqual(@as(u64, 0), v.cache_write_tokens);
+}
+
+const tiny_png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+test "wire golden anthropic body with thinking is byte-stable" {
+    const msgs = [_]core_types.ChatMessage{
+        .{ .role = .user, .content = "first" },
+        .{
+            .role = .assistant,
+            .content = "checking",
+            .reasoning = "hmm",
+            .reasoning_signature = "SIG==",
+            .tool_calls_json = "[{\"id\":\"t1\",\"name\":\"read\",\"arguments_json\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}]",
+        },
+        .{ .role = .tool, .content = "alpha", .tool_call_id = "t1" },
+    };
+    const tools = [_]core_types.ToolSpec{
+        .{ .name = "read", .description = "Read a file", .parameters_json = "{\"type\":\"object\"}" },
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var req = testRequest(&msgs, &tools);
+    req.system = "stable tail";
+    req.system_stable_len = "stable".len;
+    req.temperature = 0.7;
+    req.provider_options = "{\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":4096}}";
+    const body = try buildBody(arena, req);
+    const expected =
+        \\{"model":"claude-test","max_tokens":5120,"stream":true,"system":[{"type":"text","text":"stable","cache_control":{"type":"ephemeral"}},{"type":"text","text":" tail"}],"messages":[{"role":"user","content":"first"},{"role":"assistant","content":[{"type":"thinking","thinking":"hmm","signature":"SIG=="},{"type":"text","text":"checking"},{"type":"tool_use","id":"t1","name":"read","input":{"path":"a.txt"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"alpha"}]}],"tools":[{"name":"read","description":"Read a file","input_schema":{"type":"object"}}],"thinking":{"type":"enabled","budget_tokens":4096}}
+    ;
+    try std.testing.expectEqualStrings(expected, body);
+}
+
+test "body omits temperature when thinking is enabled" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var req = testRequest(&.{.{ .role = .user, .content = "hi" }}, &.{});
+    req.temperature = 0.3;
+    try std.testing.expect(std.mem.indexOf(u8, try buildBody(arena, req), "\"temperature\":0.3") != null);
+    req.provider_options = "{\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":2048}}";
+    try std.testing.expect(std.mem.indexOf(u8, try buildBody(arena, req), "temperature") == null);
+    // Thinking switched off keeps the temperature.
+    req.provider_options = "{\"thinking\":{\"type\":\"disabled\"}}";
+    try std.testing.expect(std.mem.indexOf(u8, try buildBody(arena, req), "\"temperature\":0.3") != null);
+}
+
+test "thinking raises max_tokens to budget + 1024 and never lowers a larger one" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var req = testRequest(&.{.{ .role = .user, .content = "hi" }}, &.{});
+    req.model = "claude-sonnet-4-6"; // default cap 8192
+    req.provider_options = "{\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":16000}}";
+    try std.testing.expect(std.mem.indexOf(u8, try buildBody(arena, req), "\"max_tokens\":17024,") != null);
+    // A configured cap below the budget is raised too.
+    req.max_output_tokens = 2000;
+    try std.testing.expect(std.mem.indexOf(u8, try buildBody(arena, req), "\"max_tokens\":17024,") != null);
+    // Already larger than budget + 1024: unchanged.
+    req.max_output_tokens = 32000;
+    try std.testing.expect(std.mem.indexOf(u8, try buildBody(arena, req), "\"max_tokens\":32000,") != null);
+    req.max_output_tokens = null;
+    req.provider_options = "{\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":1024}}";
+    try std.testing.expect(std.mem.indexOf(u8, try buildBody(arena, req), "\"max_tokens\":8192,") != null);
+}
+
+test "thinking block round-trips first, with the signature byte-exact" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const sig = "EqQBCkYIAxgCIkD/+a==\\n\"q\"";
+    const msgs = [_]core_types.ChatMessage{
+        .{ .role = .user, .content = "q" },
+        .{ .role = .assistant, .content = "answer", .reasoning = "step 1\nstep 2", .reasoning_signature = sig },
+        // Reasoning without a signature is not sent back.
+        .{ .role = .assistant, .content = "plain", .reasoning = "unsigned" },
+        // A thinking block alone never makes an empty message valid.
+        .{ .role = .assistant, .content = "", .reasoning = "x", .reasoning_signature = "s" },
+        .{ .role = .assistant, .content = "r", .reasoning_signature = "OPAQUE", .reasoning_redacted = true },
+    };
+    const body = try buildBody(arena, testRequest(&msgs, &.{}));
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{});
+    const m = parsed.object.get("messages").?.array.items;
+    try std.testing.expectEqual(@as(usize, 4), m.len);
+
+    const first = m[1].object.get("content").?.array.items;
+    try std.testing.expectEqualStrings("thinking", first[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("step 1\nstep 2", first[0].object.get("thinking").?.string);
+    try std.testing.expectEqualStrings(sig, first[0].object.get("signature").?.string);
+    try std.testing.expectEqualStrings("text", first[1].object.get("type").?.string);
+
+    const unsigned = m[2].object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), unsigned.len);
+    try std.testing.expectEqualStrings("text", unsigned[0].object.get("type").?.string);
+
+    const redacted = m[3].object.get("content").?.array.items;
+    try std.testing.expectEqualStrings("redacted_thinking", redacted[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("OPAQUE", redacted[0].object.get("data").?.string);
+}
+
+test "body sends user images as image blocks before the text" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const imgs = [_]core_types.ImagePart{
+        .{ .media_type = "image/png", .data_base64 = tiny_png },
+        .{ .media_type = "image/jpeg", .data_base64 = "QUJD" },
+    };
+    const msgs = [_]core_types.ChatMessage{.{ .role = .user, .content = "what is this", .images = &imgs }};
+    var req = testRequest(&msgs, &.{});
+    req.system = "";
+    const body = try buildBody(arena, req);
+    try std.testing.expectEqualStrings(
+        "{\"model\":\"claude-test\",\"max_tokens\":4096,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":[" ++
+            "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"" ++ tiny_png ++ "\"}}," ++
+            "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/jpeg\",\"data\":\"QUJD\"}}," ++
+            "{\"type\":\"text\",\"text\":\"what is this\"}]}]}",
+        body,
+    );
 }

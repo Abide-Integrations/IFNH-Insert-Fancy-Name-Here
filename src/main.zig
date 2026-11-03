@@ -981,6 +981,7 @@ const help_text =
     \\  --deny-all              deny every permission ask
     \\  --policy <ask|allow|deny>  default: ask (/dev/tty when stdin is a tty)
     \\  -p <prompt>             prompt text; '-' or omitted reads stdin
+    \\  --image <path>          attach a png/jpg/gif/webp (<= 5 MiB) to the prompt; repeat up to 8x
     \\  (exit: 0 ok, 1 failed, 2 usage, 3 denied, 4 budget spent, 130 interrupted)
     \\
 ;
@@ -988,6 +989,7 @@ const help_text =
 test {
     _ = @import("version.zig");
     _ = @import("core/types.zig");
+    _ = @import("core/image.zig");
     _ = @import("core/fsutil.zig");
     _ = @import("cli/args.zig");
     _ = @import("core/config/config.zig");
@@ -1006,6 +1008,7 @@ test {
     _ = @import("providers/sse.zig");
     _ = @import("providers/openai.zig");
     _ = @import("providers/anthropic.zig");
+    _ = @import("providers/openai_responses.zig");
     _ = @import("providers/limits.zig");
     _ = @import("providers/pricing.zig");
     _ = @import("core/budget.zig");

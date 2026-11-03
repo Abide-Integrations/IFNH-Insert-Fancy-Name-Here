@@ -17,7 +17,7 @@
       "properties": {
         "provider": {
           "type": "string",
-          "enum": ["openai", "anthropic"]
+          "enum": ["openai", "anthropic", "openai-responses"]
         },
         "model": {
           "type": "string",

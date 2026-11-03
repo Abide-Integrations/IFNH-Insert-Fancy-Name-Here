@@ -227,7 +227,7 @@ pub fn streamFn(
     sink.emit(.done);
 }
 
-fn trimSlash(s: []const u8) []const u8 {
+pub fn trimSlash(s: []const u8) []const u8 {
     return if (std.mem.endsWith(u8, s, "/")) s[0 .. s.len - 1] else s;
 }
 
@@ -248,7 +248,7 @@ fn parseUsage(u: std.json.Value) core_types.Usage {
     return out;
 }
 
-fn intOf(v: ?std.json.Value) ?u64 {
+pub fn intOf(v: ?std.json.Value) ?u64 {
     const val = v orelse return null;
     return switch (val) {
         .integer => |i| if (i >= 0) @intCast(i) else null,
@@ -257,7 +257,7 @@ fn intOf(v: ?std.json.Value) ?u64 {
     };
 }
 
-fn extractErrorMessage(arena: std.mem.Allocator, body: []const u8) ![]const u8 {
+pub fn extractErrorMessage(arena: std.mem.Allocator, body: []const u8) ![]const u8 {
     const v = try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{});
     if (v == .object) {
         if (v.object.get("error")) |e| {
@@ -272,12 +272,12 @@ fn extractErrorMessage(arena: std.mem.Allocator, body: []const u8) ![]const u8 {
     return error.NotFound;
 }
 
-fn strOrEmpty(v: ?std.json.Value) []const u8 {
+pub fn strOrEmpty(v: ?std.json.Value) []const u8 {
     const val = v orelse return "";
     return if (val == .string) val.string else "";
 }
 
-fn indexOfStr(items: []const []const u8, needle: []const u8) ?usize {
+pub fn indexOfStr(items: []const []const u8, needle: []const u8) ?usize {
     for (items, 0..) |item, idx| {
         if (std.mem.eql(u8, item, needle)) return idx;
     }
@@ -286,7 +286,7 @@ fn indexOfStr(items: []const []const u8, needle: []const u8) ?usize {
 
 /// `arguments` is a JSON *string* on the OpenAI wire. Malformed or non-object
 /// arguments degrade to "{}" so one bad call does not break the request.
-fn toolArguments(arena: std.mem.Allocator, args: ?std.json.Value) []const u8 {
+pub fn toolArguments(arena: std.mem.Allocator, args: ?std.json.Value) []const u8 {
     const raw = args orelse return "{}";
     if (raw != .string or raw.string.len == 0) return "{}";
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, raw.string, .{}) catch return "{}";
@@ -320,7 +320,21 @@ fn buildBody(arena: std.mem.Allocator, req: provider.ModelRequest) ![]u8 {
                 try w.writeAll("{\"role\":");
                 try std.json.Stringify.value(@tagName(msg.role), .{}, w);
                 try w.writeAll(",\"content\":");
-                try std.json.Stringify.value(msg.content, .{}, w);
+                if (msg.role == .user and msg.images.len > 0) {
+                    try w.writeAll("[{\"type\":\"text\",\"text\":");
+                    try std.json.Stringify.value(msg.content, .{}, w);
+                    try w.writeByte('}');
+                    for (msg.images) |img| {
+                        try w.writeAll(",{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:");
+                        try w.writeAll(img.media_type);
+                        try w.writeAll(";base64,");
+                        try w.writeAll(img.data_base64);
+                        try w.writeAll("\"}}");
+                    }
+                    try w.writeByte(']');
+                } else {
+                    try std.json.Stringify.value(msg.content, .{}, w);
+                }
                 try w.writeByte('}');
             },
             .assistant => {
@@ -566,4 +580,26 @@ test "usage parses prompt_tokens_details.cached_tokens" {
     const v = parseUsage(plain);
     try std.testing.expectEqual(@as(u64, 5), v.input_tokens);
     try std.testing.expectEqual(@as(u64, 0), v.cache_read_tokens);
+}
+
+test "body sends user images as an image_url content array" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const imgs = [_]core_types.ImagePart{.{ .media_type = "image/png", .data_base64 = "QUJD" }};
+    const msgs = [_]core_types.ChatMessage{
+        .{ .role = .user, .content = "what is this", .images = &imgs },
+        // Images on other roles are ignored.
+        .{ .role = .assistant, .content = "a cat", .images = &imgs },
+    };
+    var req = testRequest(&msgs, &.{});
+    req.system = "";
+    const body = try buildBody(arena, req);
+    try std.testing.expectEqualStrings(
+        "{\"model\":\"gpt-test\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":[" ++
+            "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"what is this\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,QUJD\"}}]}," ++
+            "{\"role\":\"assistant\",\"content\":\"a cat\"}]}",
+        body,
+    );
 }

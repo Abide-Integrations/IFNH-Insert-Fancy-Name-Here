@@ -14,6 +14,7 @@ const options_mod = @import("../../providers/options.zig");
 const provider_mod = @import("../../providers/provider.zig");
 const openai = @import("../../providers/openai.zig");
 const anthropic = @import("../../providers/anthropic.zig");
+const openai_responses = @import("../../providers/openai_responses.zig");
 
 pub const roles = [_][]const u8{ "parent", "research", "implement", "review" };
 
@@ -27,7 +28,7 @@ const alias_keys = [_][]const u8{
 
 pub const ResolvedModel = struct {
     provider: provider_mod.Provider,
-    /// Adapter name: "openai" or "anthropic" (options compile needs it).
+    /// Adapter name: "openai", "openai-responses" or "anthropic" (options compile needs it).
     provider_name: []const u8,
     model: []const u8,
     base_url: []const u8,
@@ -44,8 +45,9 @@ pub const ResolvedModel = struct {
 
 pub const Error = error{ UnknownAlias, InvalidAlias, UnknownRole, Cycle };
 
-fn providerFor(name: []const u8) ?provider_mod.Provider {
+pub fn providerFor(name: []const u8) ?provider_mod.Provider {
     if (std.mem.eql(u8, name, "openai")) return openai.instance;
+    if (std.mem.eql(u8, name, "openai-responses")) return openai_responses.instance;
     if (std.mem.eql(u8, name, "anthropic")) return anthropic.instance;
     return null;
 }
@@ -300,7 +302,7 @@ fn validateAlias(store: *config_mod.Store, path: []const u8, alias: std.json.Val
     }
     if (objectItem(alias, "provider")) |p| {
         if (p != .string or providerFor(p.string) == null) {
-            try store.addError(try std.fmt.allocPrint(arena, "{s}.provider", .{path}), "must be \"openai\" or \"anthropic\"", .{});
+            try store.addError(try std.fmt.allocPrint(arena, "{s}.provider", .{path}), "must be \"openai\", \"anthropic\" or \"openai-responses\"", .{});
         }
     }
     const string_keys = [_][]const u8{ "base_url", "api_key_env" };
@@ -480,6 +482,28 @@ test "alias inherits same-provider settings and overrides params" {
     try testing.expectEqualStrings("MY_KEY", m.api_key_env);
     try testing.expectEqual(@as(?f64, 0.2), m.temperature);
     try testing.expectEqual(@as(?u32, 512), m.max_output_tokens);
+}
+
+test "openai-responses resolves to its own adapter with the OpenAI defaults" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try storeWith(
+        \\{"model":{"provider":"openai-responses","model":"gpt-5.1"},
+        \\ "models":{"aliases":{"chat":{"provider":"openai","model":"gpt-4o"}}}}
+    );
+    defer store.deinit();
+
+    const m = try resolveAlias(&store, arena, "default");
+    try testing.expectEqualStrings("openai-responses", m.provider_name);
+    try testing.expectEqualStrings("https://api.openai.com/v1", m.base_url);
+    try testing.expectEqualStrings("OPENAI_API_KEY", m.api_key_env);
+    try testing.expectEqual(@intFromPtr(openai_responses.instance.stream_fn), @intFromPtr(m.provider.stream_fn));
+    try testing.expect(@intFromPtr(openai.instance.stream_fn) != @intFromPtr(m.provider.stream_fn));
+    // An alias on the sibling adapter keeps the Chat Completions one.
+    const chat = try resolveAlias(&store, arena, "chat");
+    try testing.expectEqual(@intFromPtr(openai.instance.stream_fn), @intFromPtr(chat.provider.stream_fn));
 }
 
 test "switching provider in an alias drops the base url and key" {

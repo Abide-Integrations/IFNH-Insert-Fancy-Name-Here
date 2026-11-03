@@ -29,7 +29,6 @@ const interrupt_mod = @import("../interrupt.zig");
 const tool_mod = @import("../../tools/tool.zig");
 const core_types = @import("../types.zig");
 const openai = @import("../../providers/openai.zig");
-const anthropic = @import("../../providers/anthropic.zig");
 const trace_mod = @import("../trace.zig");
 const wire_log = @import("../wire_log.zig");
 const fsutil = @import("../fsutil.zig");
@@ -260,7 +259,7 @@ pub const SessionRuntime = struct {
         const api_key_env = cfg.getOptionalString("model.api_key_env") orelse
             (if (is_anthropic) "ANTHROPIC_API_KEY" else "OPENAI_API_KEY");
         return .{
-            .provider = if (is_anthropic) anthropic.instance else openai.instance,
+            .provider = resolve_mod.providerFor(provider_name) orelse openai.instance,
             .model = cfg.getString("model.model", ""),
             .base_url = base_url,
             .api_key = self.keyFor(api_key_env),
@@ -404,6 +403,9 @@ pub const SessionRuntime = struct {
         /// Byte length of the byte-stable prefix of `system` (B-03).
         system_stable_len: usize,
         user_text: []const u8,
+        /// Images attached to this turn's user message. They live in memory
+        /// only: the session record keeps the text.
+        images: []const core_types.ImagePart,
         cwd: std.Io.Dir,
         events: *const Events,
     ) !TurnOutcome {
@@ -418,7 +420,7 @@ pub const SessionRuntime = struct {
             }
         }
         if (pcfg.model.len == 0) {
-            statusFmt(events, .plain, "no model configured — run /provider set <openai|anthropic> <model> [base_url] [key_env]\n", .{});
+            statusFmt(events, .plain, "no model configured — run /provider set <openai|anthropic|openai-responses> <model> [base_url] [key_env]\n", .{});
             return .{};
         }
         if (pcfg.api_key.len == 0) {
@@ -593,7 +595,7 @@ pub const SessionRuntime = struct {
         // rollback snapshot is never invalidated by history rewriting.
         const history_start = self.history.items.len;
         _ = try self.store.append(.{ .user = .{ .text = user_text } });
-        try self.history.append(arena, .{ .role = .user, .content = user_text });
+        try self.history.append(arena, .{ .role = .user, .content = user_text, .images = images });
 
         const outcome = agent_engine.runTurn(.{
             .io = io,

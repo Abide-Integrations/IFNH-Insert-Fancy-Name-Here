@@ -16,6 +16,8 @@ const system_prompt = @import("../core/agent/system_prompt.zig");
 const wire_log = @import("../core/wire_log.zig");
 const session_runtime = @import("../core/agent/session_runtime.zig");
 const tool_mod = @import("../tools/tool.zig");
+const core_types = @import("../core/types.zig");
+const image_mod = @import("../core/image.zig");
 
 pub const Exit = enum(u8) { ok = 0, failed = 1, usage = 2, denied = 3, budget = 4, interrupted = 130 };
 
@@ -317,6 +319,22 @@ pub fn run(
         return exit_usage;
     }
 
+    // A bad --image is a usage error, reported before anything else starts.
+    var images: std.ArrayListUnmanaged(core_types.ImagePart) = .empty;
+    for (ask.images()) |path| {
+        const loaded = image_mod.load(arena, io, cwd, path) catch |err| {
+            stderrPrint(io, "error: cannot read image '{s}': {s}\n", .{ path, @errorName(err) });
+            return exit_usage;
+        };
+        switch (loaded) {
+            .ok => |part| images.append(arena, part) catch return exitCode(.failed),
+            .err => |message| {
+                stderrPrint(io, "error: {s}\n", .{message});
+                return exit_usage;
+            },
+        }
+    }
+
     var cfg = config_mod.load(arena, io, environ, cwd) catch |err| {
         stderrPrint(io, "error: {s}\n(run 'ifnh doctor' for diagnostics)\n", .{@errorName(err)});
         return exitCode(.failed);
@@ -388,7 +406,7 @@ pub fn run(
     const pcfg = rt.providerConfig(&cfg);
     if (json) sink.emit(.{ .start = .{ .session = rt.store.manifest.id, .model = pcfg.model } });
 
-    const outcome = rt.submitTurn(arena, &cfg, pcfg, instr.text, instr.stable_len, prompt, cwd, &events) catch |err| {
+    const outcome = rt.submitTurn(arena, &cfg, pcfg, instr.text, instr.stable_len, prompt, images.items, cwd, &events) catch |err| {
         sink.finish(.{ .failed = true }, @errorName(err));
         return exitCode(.failed);
     };
