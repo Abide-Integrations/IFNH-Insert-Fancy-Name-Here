@@ -175,6 +175,7 @@ pub fn compact(
         .model = pcfg.model,
         .base_url = pcfg.base_url,
         .api_key = pcfg.api_key,
+        .auth = pcfg.auth,
         .system = compaction_instructions,
         .messages = msgs[0..],
         .temperature = pcfg.temperature,

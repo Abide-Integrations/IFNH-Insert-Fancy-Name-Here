@@ -18,6 +18,7 @@ const trace_mod = @import("core/trace.zig");
 const wire_log = @import("core/wire_log.zig");
 const git_mod = @import("core/git.zig");
 const keys_mod = @import("core/config/keys.zig");
+const resolve_mod = @import("core/config/resolve.zig");
 const transcript = @import("core/session/transcript.zig");
 const debug_bundle = @import("core/debug_bundle.zig");
 
@@ -637,9 +638,8 @@ fn doctorReport(io: std.Io, arena: std.mem.Allocator, environ: *const std.proces
 
     // Model/provider.
     const provider_name = cfg.getString("model.provider", "openai");
-    const is_anthropic = std.mem.eql(u8, provider_name, "anthropic");
-    const key_env = cfg.getOptionalString("model.api_key_env") orelse
-        (if (is_anthropic) "ANTHROPIC_API_KEY" else "OPENAI_API_KEY");
+    const key_env = cfg.getConfiguredString("model.api_key_env") orelse
+        resolve_mod.defaultKeyEnv(provider_name);
     // Key lookup uses the same merged view as sessions: process env +
     // stored keys (~/.config/ifnh/env).
     var stored_keys = keys_mod.Keys.init(arena);
@@ -1008,6 +1008,7 @@ test {
     _ = @import("providers/sse.zig");
     _ = @import("providers/openai.zig");
     _ = @import("providers/anthropic.zig");
+    _ = @import("providers/gemini.zig");
     _ = @import("providers/openai_responses.zig");
     _ = @import("providers/limits.zig");
     _ = @import("providers/pricing.zig");

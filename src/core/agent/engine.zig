@@ -34,6 +34,8 @@ pub const ProviderConfig = struct {
     model: []const u8,
     base_url: []const u8,
     api_key: []const u8,
+    /// How the key is presented to the endpoint (`provider.Auth`).
+    auth: provider_mod.Auth = .api_key,
     /// Session-owned client shared by every round (B-02).
     client: ?*std.http.Client = null,
     /// Alias that produced this config (D44); "" for an unaliased model.
@@ -273,6 +275,7 @@ pub fn runTurn(p: RunParams) !Outcome {
                 .model = active.model,
                 .base_url = active.base_url,
                 .api_key = active.api_key,
+                .auth = active.auth,
                 .system = p.system,
                 .system_stable_len = p.system_stable_len,
                 .messages = p.history.items,

@@ -107,6 +107,10 @@ pub const default_config_json =
     \\  },
     \\  "debug": {
     \\    "redact": true
+    \\  },
+    \\  "memory": {
+    \\    "adapter": "none",
+    \\    "scope": "project"
     \\  }
     \\}
 ;
@@ -116,7 +120,7 @@ pub const default_config_json =
 pub const known_sections = [_][]const u8{
     "schema_version", "model", "models", "routing", "profiles",
     "permissions",    "git",   "agents", "tools",   "context",
-    "sessions",       "ui",    "debug",
+    "sessions",       "ui",    "debug",  "memory",
 };
 
 /// Subtrees keyed by user-chosen names (alias names, model ids, profile
@@ -138,6 +142,9 @@ pub const extra_top_level_keys = [_][]const u8{ "hooks", "mcp_servers" };
 pub const extra_section_keys = [_][]const u8{
     "model.provider_label",
     "model.tools_enabled",
+    "model.auth",
+    "memory.server",
+    "memory.tools",
     "context.max_context_tokens",
 };
 
@@ -161,7 +168,8 @@ pub const wired_defaults = [_][]const u8{
     "ui.colors",                   "ui.footer",
     "debug.redact",                "routing.parent",
     "routing.research",            "routing.implement",
-    "routing.review",
+    "routing.review",              "memory.adapter",
+    "memory.scope",
 };
 
 /// `IFNH_*` variables that switch runtime features and are not config keys.
@@ -282,6 +290,15 @@ pub const Store = struct {
             .null => null,
             else => null,
         };
+    }
+
+    /// Like `getOptionalString`, but null unless a user, project, session, env
+    /// or cli layer set the key. The builtin default of `model.api_key_env`
+    /// names OpenAI's variable and must not stand in for another provider's.
+    pub fn getConfiguredString(self: *const Store, path: []const u8) ?[]const u8 {
+        const src = self.sources.get(path) orelse return null;
+        if (src.layer == .builtin) return null;
+        return self.getOptionalString(path);
     }
 
     pub fn getBool(self: *const Store, path: []const u8, default: bool) bool {
@@ -431,10 +448,13 @@ pub const Store = struct {
             try self.addError("permissions.default_mode", "must be \"ask\" or \"auto\", got \"{s}\"", .{mode});
         }
         const provider = self.getString("model.provider", "openai");
-        if (!std.mem.eql(u8, provider, "openai") and !std.mem.eql(u8, provider, "anthropic") and
-            !std.mem.eql(u8, provider, "openai-responses"))
-        {
-            try self.addError("model.provider", "must be \"openai\", \"anthropic\" or \"openai-responses\", got \"{s}\"", .{provider});
+        if (resolve_mod.providerFor(provider) == null) {
+            try self.addError("model.provider", "must be \"openai\", \"anthropic\", \"openai-responses\" or \"gemini\", got \"{s}\"", .{provider});
+        }
+        if (self.get("model.auth")) |a| {
+            if (a != .null and (a != .string or resolve_mod.parseAuth(a.string) == null)) {
+                try self.addError("model.auth", "must be \"api_key\" or \"oauth\"", .{});
+            }
         }
         if (self.get("tools.external")) |value| {
             if (value != .bool) try self.addError("tools.external", "must be true or false", .{});
@@ -443,6 +463,37 @@ pub const Store = struct {
         // other by name; check the references (D44/D45/D49).
         try resolve_mod.validateConfig(self);
         try self.validateMcpServers();
+        try self.validateMemory();
+    }
+
+    /// `memory.*`: adapter and scope are closed sets; the MCP adapter needs a
+    /// `server` that exists in `mcp_servers`; `tools` names three MCP tools.
+    fn validateMemory(self: *Store) !void {
+        const adapter = self.getString("memory.adapter", "none");
+        const known_adapter = std.mem.eql(u8, adapter, "none") or std.mem.eql(u8, adapter, "file") or std.mem.eql(u8, adapter, "mcp");
+        if (!known_adapter) {
+            try self.addError("memory.adapter", "must be \"none\", \"file\" or \"mcp\", got \"{s}\"", .{adapter});
+        }
+        const scope = self.getString("memory.scope", "project");
+        if (!std.mem.eql(u8, scope, "project") and !std.mem.eql(u8, scope, "user")) {
+            try self.addError("memory.scope", "must be \"project\" or \"user\", got \"{s}\"", .{scope});
+        }
+        if (self.get("memory.tools")) |tools| {
+            var ok = tools == .object;
+            if (ok) {
+                var it = tools.object.iterator();
+                while (it.next()) |kv| {
+                    if (kv.value_ptr.* != .string or kv.value_ptr.string.len == 0) ok = false;
+                }
+            }
+            if (!ok) try self.addError("memory.tools", "must be an object of tool names {{recall, remember, forget}}", .{});
+        }
+        if (!std.mem.eql(u8, adapter, "mcp")) return;
+        const server = self.getOptionalString("memory.server") orelse
+            return self.addError("memory.server", "required when memory.adapter is \"mcp\"", .{});
+        const servers = self.get("mcp_servers");
+        const listed = if (servers) |sv| sv == .object and sv.object.get(server) != null else false;
+        if (!listed) try self.addError("memory.server", "\"{s}\" is not an entry of mcp_servers", .{server});
     }
 
     /// `mcp_servers.<name>`: exactly one of `command` (stdio) or `url` (HTTP),
@@ -888,8 +939,8 @@ test "defaults parse and validate" {
     try std.testing.expect(store.errors.items.len == 0);
 }
 
-test "model.provider accepts the three adapters and names them on error" {
-    for ([_][]const u8{ "\"openai\"", "\"anthropic\"", "\"openai-responses\"" }) |value| {
+test "model.provider accepts the four adapters and names them on error" {
+    for ([_][]const u8{ "\"openai\"", "\"anthropic\"", "\"openai-responses\"", "\"gemini\"" }) |value| {
         var store = try Store.init(std.testing.allocator);
         defer store.deinit();
         try store.applyOverride("model.provider", value, .{ .layer = .project, .origin = "test" });
@@ -898,10 +949,63 @@ test "model.provider accepts the three adapters and names them on error" {
     }
     var bad = try Store.init(std.testing.allocator);
     defer bad.deinit();
-    try bad.applyOverride("model.provider", "\"gemini\"", .{ .layer = .project, .origin = "test" });
+    try bad.applyOverride("model.provider", "\"bedrock\"", .{ .layer = .project, .origin = "test" });
     try bad.validate();
     try std.testing.expectEqual(@as(usize, 1), bad.errors.items.len);
-    try std.testing.expectEqualStrings("must be \"openai\", \"anthropic\" or \"openai-responses\", got \"gemini\"", bad.errors.items[0].message);
+    try std.testing.expectEqualStrings("must be \"openai\", \"anthropic\", \"openai-responses\" or \"gemini\", got \"bedrock\"", bad.errors.items[0].message);
+}
+
+test "model.auth accepts api_key and oauth only, naming the key" {
+    for ([_][]const u8{ "\"api_key\"", "\"oauth\"" }) |value| {
+        var store = try Store.init(std.testing.allocator);
+        defer store.deinit();
+        try store.applyOverride("model.auth", value, .{ .layer = .project, .origin = "test" });
+        try store.validate();
+        try std.testing.expectEqual(@as(usize, 0), store.errors.items.len);
+        try std.testing.expectEqual(@as(usize, 0), store.warnings.items.len);
+    }
+    var bad = try Store.init(std.testing.allocator);
+    defer bad.deinit();
+    try bad.applyOverride("model.auth", "\"token\"", .{ .layer = .project, .origin = "test" });
+    try bad.validate();
+    try std.testing.expectEqual(@as(usize, 1), bad.errors.items.len);
+    try std.testing.expectEqualStrings("model.auth", bad.errors.items[0].path);
+}
+
+test "memory: unknown adapter and scope are startup errors naming the key" {
+    var store = try mcpStore("{\"memory\":{\"adapter\":\"redis\",\"scope\":\"team\"}}");
+    defer store.deinit();
+    try std.testing.expectEqual(@as(usize, 2), store.errors.items.len);
+    try std.testing.expectEqualStrings("memory.adapter", store.errors.items[0].path);
+    try std.testing.expectEqualStrings("memory.scope", store.errors.items[1].path);
+
+    var ok = try mcpStore("{\"memory\":{\"adapter\":\"file\",\"scope\":\"user\"}}");
+    defer ok.deinit();
+    try std.testing.expectEqual(@as(usize, 0), ok.errors.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ok.warnings.items.len);
+}
+
+test "memory: adapter mcp needs a server that exists in mcp_servers" {
+    var missing = try mcpStore("{\"memory\":{\"adapter\":\"mcp\"},\"mcp_servers\":{\"honcho\":{\"command\":\"x\"}}}");
+    defer missing.deinit();
+    try std.testing.expectEqual(@as(usize, 1), missing.errors.items.len);
+    try std.testing.expectEqualStrings("memory.server", missing.errors.items[0].path);
+
+    var absent = try mcpStore("{\"memory\":{\"adapter\":\"mcp\",\"server\":\"nope\"},\"mcp_servers\":{\"honcho\":{\"command\":\"x\"}}}");
+    defer absent.deinit();
+    try std.testing.expectEqual(@as(usize, 1), absent.errors.items.len);
+    try std.testing.expectEqualStrings("memory.server", absent.errors.items[0].path);
+    try std.testing.expect(std.mem.indexOf(u8, absent.errors.items[0].message, "nope") != null);
+
+    var ok = try mcpStore("{\"memory\":{\"adapter\":\"mcp\",\"server\":\"honcho\",\"tools\":{\"recall\":\"r\"}},\"mcp_servers\":{\"honcho\":{\"command\":\"x\"}}}");
+    defer ok.deinit();
+    try std.testing.expectEqual(@as(usize, 0), ok.errors.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ok.warnings.items.len);
+
+    var bad_tools = try mcpStore("{\"memory\":{\"adapter\":\"file\",\"tools\":{\"recall\":3}}}");
+    defer bad_tools.deinit();
+    try std.testing.expectEqual(@as(usize, 1), bad_tools.errors.items.len);
+    try std.testing.expectEqualStrings("memory.tools", bad_tools.errors.items[0].path);
 }
 
 fn mcpStore(json: []const u8) !Store {

@@ -12,6 +12,9 @@ pub const FakeServer = struct {
     response: []const u8,
     port: u16,
     done: std.atomic.Value(bool) = .init(false),
+    /// Request line and headers of the one request served; valid after `wait`.
+    head_buf: [8192]u8 = undefined,
+    head_len: usize = 0,
 
     /// Start the server with `body` as the HTTP response payload.
     /// `status_line`/`headers` default to a 200 text/event-stream.
@@ -83,6 +86,8 @@ pub const FakeServer = struct {
                 break :drain;
             }
         }
+        self.head_len = head_len;
+        @memcpy(self.head_buf[0..head_len], head_accum[0..head_len]);
         if (head_end > 0) {
             if (std.ascii.indexOfIgnoreCase(head_accum[0..head_end], "content-length:")) |pos| {
                 const rest = head_accum[pos + "content-length:".len .. head_end];
@@ -101,6 +106,11 @@ pub const FakeServer = struct {
         var w = conn.writer(self.io, &wbuf);
         w.interface.writeAll(self.response) catch {};
         w.interface.flush() catch {};
+    }
+
+    /// The request head the server received. Call after `wait`.
+    pub fn requestHead(self: *const FakeServer) []const u8 {
+        return self.head_buf[0..self.head_len];
     }
 
     pub fn wait(self: *FakeServer) void {
@@ -140,7 +150,7 @@ pub const Collector = struct {
     usage: ?core_types.Usage = null,
     done: bool = false,
 
-    fn emit(ctx: *anyopaque, ev: core_types.StreamEvent) void {
+    pub fn emit(ctx: *anyopaque, ev: core_types.StreamEvent) void {
         const self: *Collector = @ptrCast(@alignCast(ctx));
         const kind: EventKind = switch (ev) {
             .content_delta => .content_delta,
@@ -155,10 +165,16 @@ pub const Collector = struct {
         switch (ev) {
             .content_delta => |d| self.text.appendSlice(self.arena, d) catch {},
             .tool_call => |tc| {
-                self.tool_calls.append(self.arena, tc) catch {};
+                // Copied like the engine's collector does: adapters free the
+                // arena that owns these slices when the stream call returns.
+                self.tool_calls.append(self.arena, .{
+                    .id = self.arena.dupe(u8, tc.id) catch "",
+                    .name = self.arena.dupe(u8, tc.name) catch "",
+                    .arguments_json = self.arena.dupe(u8, tc.arguments_json) catch "",
+                }) catch {};
             },
             .failure => |f| {
-                self.failure = f.message;
+                self.failure = self.arena.dupe(u8, f.message) catch "";
                 self.failure_kind = f.kind;
                 self.retry_after_s = f.retry_after_s;
             },

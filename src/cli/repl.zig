@@ -366,8 +366,8 @@ pub fn run(
     {
         const provider_display = cfg.getOptionalString("model.provider_label") orelse provider_name;
         const key_note = if (pcfg.api_key.len == 0) blk: {
-            const key_env = cfg.getOptionalString("model.api_key_env") orelse
-                (if (std.mem.eql(u8, provider_name, "anthropic")) "ANTHROPIC_API_KEY" else "OPENAI_API_KEY");
+            const key_env = cfg.getConfiguredString("model.api_key_env") orelse
+                resolve_mod.defaultKeyEnv(provider_name);
             break :blk std.fmt.allocPrint(arena, " — {s}run /provider key {s} <value>{s}", .{ palette.warn("", arena), key_env, "\x1b[0m" }) catch ", no api key";
         } else "";
         try out(io, "{s}ifnh session{s} {s} ({s}{s} · {s}{s}){s}\n", .{
@@ -628,7 +628,7 @@ fn persistProjectConfig(
 // -------------------------------------------------------------- first-run setup
 
 pub const ProviderPreset = struct {
-    /// Wire protocol: "openai" (any OpenAI-compatible endpoint) | "anthropic".
+    /// Wire protocol: "openai" (any OpenAI-compatible endpoint) | "anthropic" | "gemini".
     id: []const u8,
     /// Human-readable provider name (display only).
     label: []const u8,
@@ -643,6 +643,7 @@ pub const ProviderPreset = struct {
 pub const presets = [_]ProviderPreset{
     .{ .id = "openai", .label = "OpenRouter", .base_url = "https://openrouter.ai/api/v1", .key_env = "OPENROUTER_API_KEY", .default_model = "openrouter/auto", .needs_key = true },
     .{ .id = "anthropic", .label = "Anthropic", .base_url = "https://api.anthropic.com", .key_env = "ANTHROPIC_API_KEY", .default_model = "claude-sonnet-4-6", .needs_key = true },
+    .{ .id = "gemini", .label = "Google Gemini", .base_url = "https://generativelanguage.googleapis.com/v1beta", .key_env = "GEMINI_API_KEY", .default_model = "gemini-2.5-pro", .needs_key = true },
     .{ .id = "openai", .label = "OpenAI", .base_url = "https://api.openai.com/v1", .key_env = "OPENAI_API_KEY", .default_model = "gpt-5.1", .needs_key = true },
     .{ .id = "openai", .label = "xAI (Grok)", .base_url = "https://api.x.ai/v1", .key_env = "XAI_API_KEY", .default_model = "grok-4", .needs_key = true },
     .{ .id = "openai", .label = "Groq", .base_url = "https://api.groq.com/openai/v1", .key_env = "GROQ_API_KEY", .default_model = "llama-3.3-70b-versatile", .needs_key = true },
@@ -740,7 +741,7 @@ fn runFirstRunSetup(
 
     // Live model list; typed fallback when unavailable.
     var model_name: []const u8 = preset.default_model;
-    const models_res = models_mod.fetchModels(arena, io, base_url, key_value, std.mem.eql(u8, preset.id, "anthropic"));
+    const models_res = models_mod.fetchModels(arena, io, base_url, key_value, std.meta.stringToEnum(models_mod.Style, preset.id) orelse .openai);
     switch (models_res) {
         .models => |list| {
             try out(io, "{s}({d} models available — enter a number, or type a model id){s}\n", .{
@@ -1172,7 +1173,7 @@ fn handleCommand(
                 show_label,
                 pcfg_now.model,
                 pcfg_now.base_url,
-                cfg.getOptionalString("model.api_key_env") orelse "(default)",
+                cfg.getConfiguredString("model.api_key_env") orelse "(default)",
                 key_state,
                 tools_state,
                 if (cw != null) std.fmt.allocPrint(arena, ", compaction threshold {d} tokens", .{cw.?}) catch "" else "",

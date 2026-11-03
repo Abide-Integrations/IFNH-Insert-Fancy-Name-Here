@@ -28,7 +28,7 @@ zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl   # static
 ```bash
 cd your/project
 ifnh init                 # optional: creates .ifnh/ skeleton (never overwrites)
-export ANTHROPIC_API_KEY=sk-ant-...   # or OPENAI_API_KEY
+export ANTHROPIC_API_KEY=sk-ant-...   # or OPENAI_API_KEY / GEMINI_API_KEY
 ifnh doctor               # verifies config, key, git, MCP, state dirs
 ```
 
@@ -320,7 +320,8 @@ The full annotated default lives in `src/core/config/config.zig`
   "schema_version": 1,
   "model": {
     "provider": "openai",          // "openai" = any OpenAI-compatible API (Chat Completions)
-                                   // "openai-responses" = OpenAI Responses API; "anthropic" = Messages
+                                   // "openai-responses" = OpenAI Responses API; "anthropic" = Messages;
+                                   // "gemini" = Google Gemini (generateContent)
     "model": "qwen3-coder",
     "base_url": "http://localhost:11434/v1",   // Ollama, llama.cpp, vLLM...
     "api_key_env": "OLLAMA_KEY"    // optional for local servers
@@ -411,7 +412,7 @@ Model aliases name a provider/model pair once and reuse it:
 - `provider_options` is per adapter and only implemented keys survive:
   `openai` accepts `reasoning_effort` (`minimal|low|medium|high`) and
   `reasoning` (object); `anthropic` accepts `thinking` (object) and `top_k`
-  (integer). Anything else is dropped with a config warning. Precedence is
+  (integer); `gemini` accepts `thinking` (object). Anything else is dropped with a config warning. Precedence is
   alias > `models.provider_options.<model id>` > `model.provider_options`,
   merged key by key.
 
@@ -427,6 +428,32 @@ reasoning events.
 { "model": { "provider": "openai-responses", "model": "gpt-5.1",
              "provider_options": { "reasoning": { "effort": "medium", "summary": "auto" } } } }
 ```
+
+### Google Gemini
+
+`"provider": "gemini"` streams from
+`{base_url}/models/<model>:streamGenerateContent?alt=sse` (default `base_url`
+`https://generativelanguage.googleapis.com/v1beta`, key from
+`GEMINI_API_KEY`, sent as `x-goog-api-key`). Model ids may not contain `/` or
+`?`.
+
+```jsonc
+{ "model": { "provider": "gemini", "model": "gemini-2.5-pro",
+             "provider_options": { "thinking": { "budget_tokens": 2048, "include_thoughts": true } } } }
+```
+
+- `thinking` maps to `generationConfig.thinkingConfig` (`budget_tokens` is a
+  non-negative integer, `include_thoughts` a boolean); thought parts stream
+  as reasoning events. It is the only option the adapter implements.
+- `"auth": "oauth"` (on `model` or on an alias; default `"api_key"`) sends the
+  value of `api_key_env` as `Authorization: Bearer <token>` instead of
+  `x-goog-api-key`, for a Google OAuth access token. There is no login flow:
+  export the token (for example `GEMINI_API_KEY=$(gcloud auth print-access-token)`)
+  or store it with `/provider key`. Access tokens expire after about an hour.
+  Any other `auth` value is a startup error naming the key.
+- A reply cut off by `MAX_TOKENS` ends normally; a refusal (`SAFETY`,
+  `RECITATION`, ...) or a blocked prompt is reported as a failure.
+- No Gemini context caching: the system prompt is always sent as one block.
 
 ### Anthropic extended thinking
 

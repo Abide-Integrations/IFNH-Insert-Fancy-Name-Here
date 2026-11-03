@@ -15,6 +15,7 @@ const provider_mod = @import("../../providers/provider.zig");
 const openai = @import("../../providers/openai.zig");
 const anthropic = @import("../../providers/anthropic.zig");
 const openai_responses = @import("../../providers/openai_responses.zig");
+const gemini = @import("../../providers/gemini.zig");
 
 pub const roles = [_][]const u8{ "parent", "research", "implement", "review" };
 
@@ -22,17 +23,19 @@ pub const roles = [_][]const u8{ "parent", "research", "implement", "review" };
 /// Keys an alias may set (D44). Fallbacks live in `models.fallbacks` and a
 /// profile prompt in `profiles.<name>.prompt`, not inside the alias.
 const alias_keys = [_][]const u8{
-    "model",       "provider",          "base_url",         "api_key_env",
-    "temperature", "max_output_tokens", "provider_options",
+    "model", "provider",    "base_url",          "api_key_env",
+    "auth",  "temperature", "max_output_tokens", "provider_options",
 };
 
 pub const ResolvedModel = struct {
     provider: provider_mod.Provider,
-    /// Adapter name: "openai", "openai-responses" or "anthropic" (options compile needs it).
+    /// Adapter name: "openai", "openai-responses", "anthropic" or "gemini" (options compile needs it).
     provider_name: []const u8,
     model: []const u8,
     base_url: []const u8,
     api_key_env: []const u8,
+    /// How the key is presented ("auth": "api_key" | "oauth"); see `provider.Auth`.
+    auth: provider_mod.Auth = .api_key,
     temperature: ?f64 = null,
     max_output_tokens: ?u32 = null,
     /// Compiled provider options as a JSON object ("" when none).
@@ -49,15 +52,25 @@ pub fn providerFor(name: []const u8) ?provider_mod.Provider {
     if (std.mem.eql(u8, name, "openai")) return openai.instance;
     if (std.mem.eql(u8, name, "openai-responses")) return openai_responses.instance;
     if (std.mem.eql(u8, name, "anthropic")) return anthropic.instance;
+    if (std.mem.eql(u8, name, "gemini")) return gemini.instance;
     return null;
 }
 
-fn defaultBaseUrl(name: []const u8) []const u8 {
-    return if (std.mem.eql(u8, name, "anthropic")) "https://api.anthropic.com" else "https://api.openai.com/v1";
+pub fn defaultBaseUrl(name: []const u8) []const u8 {
+    if (std.mem.eql(u8, name, "anthropic")) return "https://api.anthropic.com";
+    if (std.mem.eql(u8, name, "gemini")) return "https://generativelanguage.googleapis.com/v1beta";
+    return "https://api.openai.com/v1";
 }
 
-fn defaultKeyEnv(name: []const u8) []const u8 {
-    return if (std.mem.eql(u8, name, "anthropic")) "ANTHROPIC_API_KEY" else "OPENAI_API_KEY";
+pub fn defaultKeyEnv(name: []const u8) []const u8 {
+    if (std.mem.eql(u8, name, "anthropic")) return "ANTHROPIC_API_KEY";
+    if (std.mem.eql(u8, name, "gemini")) return "GEMINI_API_KEY";
+    return "OPENAI_API_KEY";
+}
+
+/// Credential modes accepted by the `auth` key.
+pub fn parseAuth(text: []const u8) ?provider_mod.Auth {
+    return std.meta.stringToEnum(provider_mod.Auth, text);
 }
 
 fn inList(list: []const []const u8, key: []const u8) bool {
@@ -156,10 +169,19 @@ fn resolveShallow(store: *config_mod.Store, arena: std.mem.Allocator, name: []co
     };
     const api_key_env = optionalString(alias, "api_key_env") orelse blk: {
         if (same) {
-            if (store.getOptionalString("model.api_key_env")) |env| break :blk env;
+            if (store.getConfiguredString("model.api_key_env")) |env| break :blk env;
         }
         break :blk defaultKeyEnv(provider_name);
     };
+    // An invalid value is a startup error (`validateAlias`/`Store.validate`);
+    // resolving falls back to the default mode.
+    const auth_text = optionalString(alias, "auth") orelse blk: {
+        if (same) {
+            if (store.getOptionalString("model.auth")) |a| break :blk a;
+        }
+        break :blk "api_key";
+    };
+    const auth = parseAuth(auth_text) orelse .api_key;
     const temperature = optionalNumber(alias, "temperature") orelse
         (if (same) store.getOptionalF64("model.temperature") else null);
     const max_output_tokens = optionalInt(alias, "max_output_tokens") orelse
@@ -174,6 +196,7 @@ fn resolveShallow(store: *config_mod.Store, arena: std.mem.Allocator, name: []co
         .model = model,
         .base_url = base_url,
         .api_key_env = api_key_env,
+        .auth = auth,
         .temperature = temperature,
         .max_output_tokens = max_output_tokens,
         .provider_options = compiled.json,
@@ -302,7 +325,12 @@ fn validateAlias(store: *config_mod.Store, path: []const u8, alias: std.json.Val
     }
     if (objectItem(alias, "provider")) |p| {
         if (p != .string or providerFor(p.string) == null) {
-            try store.addError(try std.fmt.allocPrint(arena, "{s}.provider", .{path}), "must be \"openai\", \"anthropic\" or \"openai-responses\"", .{});
+            try store.addError(try std.fmt.allocPrint(arena, "{s}.provider", .{path}), "must be \"openai\", \"anthropic\", \"openai-responses\" or \"gemini\"", .{});
+        }
+    }
+    if (objectItem(alias, "auth")) |a| {
+        if (a != .string or parseAuth(a.string) == null) {
+            try store.addError(try std.fmt.allocPrint(arena, "{s}.auth", .{path}), "must be \"api_key\" or \"oauth\"", .{});
         }
     }
     const string_keys = [_][]const u8{ "base_url", "api_key_env" };
@@ -504,6 +532,46 @@ test "openai-responses resolves to its own adapter with the OpenAI defaults" {
     // An alias on the sibling adapter keeps the Chat Completions one.
     const chat = try resolveAlias(&store, arena, "chat");
     try testing.expectEqual(@intFromPtr(openai.instance.stream_fn), @intFromPtr(chat.provider.stream_fn));
+}
+
+test "gemini resolves to its own adapter with Gemini defaults; auth follows the provider" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var store = try storeWith(
+        \\{"model":{"provider":"gemini","model":"gemini-2.5-pro","auth":"oauth","provider_options":{"thinking":{"budget_tokens":512}}},
+        \\ "models":{"aliases":{"oai":{"provider":"openai","model":"gpt-4o"},"g2":{"model":"gemini-2.5-flash","auth":"api_key"}}}}
+    );
+    defer store.deinit();
+
+    const m = try resolveAlias(&store, arena, "default");
+    try testing.expectEqualStrings("gemini", m.provider_name);
+    try testing.expectEqualStrings("https://generativelanguage.googleapis.com/v1beta", m.base_url);
+    try testing.expectEqualStrings("GEMINI_API_KEY", m.api_key_env);
+    try testing.expectEqual(provider_mod.Auth.oauth, m.auth);
+    try testing.expectEqualStrings("{\"thinkingConfig\":{\"thinkingBudget\":512}}", m.provider_options);
+    try testing.expectEqual(@intFromPtr(gemini.instance.stream_fn), @intFromPtr(m.provider.stream_fn));
+    // `auth` inherits from model.auth only for the same provider.
+    try testing.expectEqual(provider_mod.Auth.api_key, (try resolveAlias(&store, arena, "oai")).auth);
+    try testing.expectEqual(provider_mod.Auth.api_key, (try resolveAlias(&store, arena, "g2")).auth);
+}
+
+test "an invalid auth value is a startup error naming the key" {
+    var store = try storeWith(
+        \\{"model":{"provider":"gemini","model":"g","auth":"password"},
+        \\ "models":{"aliases":{"x":{"provider":"gemini","model":"g","auth":"nope"}}}}
+    );
+    defer store.deinit();
+    try store.validate();
+    try testing.expectEqual(@as(usize, 2), store.errors.items.len);
+    var model_err = false;
+    var alias_err = false;
+    for (store.errors.items) |e| {
+        if (std.mem.eql(u8, e.path, "model.auth")) model_err = true;
+        if (std.mem.eql(u8, e.path, "models.aliases.x.auth")) alias_err = true;
+    }
+    try testing.expect(model_err and alias_err);
 }
 
 test "switching provider in an alias drops the base url and key" {

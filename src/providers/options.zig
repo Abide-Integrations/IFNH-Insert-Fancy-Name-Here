@@ -42,6 +42,8 @@ pub fn compile(arena: std.mem.Allocator, provider: []const u8, raw_json: []const
             try kept.put(arena, key, v);
         } else if (std.mem.eql(u8, provider, "anthropic") and try anthropicOption(arena, &warnings, key, v)) {
             try kept.put(arena, key, v);
+        } else if (std.mem.eql(u8, provider, "gemini") and try geminiOption(arena, &warnings, key, v, &kept)) {
+            // `geminiOption` stored the translated member itself.
         } else if (!isKnown(key, provider)) {
             try warnf(arena, &warnings, "provider_options: unknown key '{s}' for {s}; ignored", .{ key, provider });
         }
@@ -57,12 +59,18 @@ pub fn compile(arena: std.mem.Allocator, provider: []const u8, raw_json: []const
 /// already open, each prefixed with `,`. Options text that is not an object
 /// (never produced by `compile`) adds nothing.
 pub fn splice(w: *std.Io.Writer, json: []const u8) !void {
-    const text = std.mem.trim(u8, json, " \t\r\n");
-    if (text.len < 2 or text[0] != '{' or text[text.len - 1] != '}') return;
-    const members = std.mem.trim(u8, text[1 .. text.len - 1], " \t\r\n");
-    if (members.len == 0) return;
+    const m = members(json);
+    if (m.len == 0) return;
     try w.writeByte(',');
-    try w.writeAll(members);
+    try w.writeAll(m);
+}
+
+/// The text between the braces of a compiled options object, or "" when it
+/// is empty or not an object. Gemini nests them inside `generationConfig`.
+pub fn members(json: []const u8) []const u8 {
+    const text = std.mem.trim(u8, json, " \t\r\n");
+    if (text.len < 2 or text[0] != '{' or text[text.len - 1] != '}') return "";
+    return std.mem.trim(u8, text[1 .. text.len - 1], " \t\r\n");
 }
 
 /// Chat Completions and Responses share the same option keys.
@@ -77,6 +85,7 @@ fn isKnown(key: []const u8, provider: []const u8) bool {
     if (std.mem.eql(u8, provider, "anthropic")) {
         return std.mem.eql(u8, key, "thinking") or std.mem.eql(u8, key, "top_k");
     }
+    if (std.mem.eql(u8, provider, "gemini")) return std.mem.eql(u8, key, "thinking");
     return false;
 }
 
@@ -129,6 +138,48 @@ fn anthropicOption(
         return true;
     }
     return false;
+}
+
+/// Gemini `thinking` -> `generationConfig.thinkingConfig`:
+/// `{"budget_tokens": n, "include_thoughts": b}` becomes
+/// `{"thinkingBudget": n, "includeThoughts": b}`. The translated member is
+/// stored in `kept` under its wire name; returns true when one was kept.
+fn geminiOption(
+    arena: std.mem.Allocator,
+    warnings: *std.ArrayListUnmanaged([]const u8),
+    key: []const u8,
+    v: std.json.Value,
+    kept: *std.json.ObjectMap,
+) !bool {
+    if (!std.mem.eql(u8, key, "thinking")) return false;
+    if (v != .object) {
+        try warnf(arena, warnings, "provider_options: thinking must be an object; ignored", .{});
+        return false;
+    }
+    var cfg = try std.json.ObjectMap.init(arena, &.{}, &.{});
+    if (v.object.get("budget_tokens")) |b| {
+        if (b == .integer and b.integer >= 0) {
+            try cfg.put(arena, "thinkingBudget", b);
+        } else {
+            try warnf(arena, warnings, "provider_options: thinking.budget_tokens must be a non-negative integer; ignored", .{});
+        }
+    }
+    if (v.object.get("include_thoughts")) |t| {
+        if (t == .bool) {
+            try cfg.put(arena, "includeThoughts", t);
+        } else {
+            try warnf(arena, warnings, "provider_options: thinking.include_thoughts must be true or false; ignored", .{});
+        }
+    }
+    var it = v.object.iterator();
+    while (it.next()) |entry| {
+        const k = entry.key_ptr.*;
+        if (std.mem.eql(u8, k, "budget_tokens") or std.mem.eql(u8, k, "include_thoughts")) continue;
+        try warnf(arena, warnings, "provider_options: unknown key 'thinking.{s}' for gemini; ignored", .{k});
+    }
+    if (cfg.count() == 0) return false;
+    try kept.put(arena, "thinkingConfig", .{ .object = cfg });
+    return true;
 }
 
 fn warnf(
@@ -222,4 +273,26 @@ test "provider_options: a fully filtered object compiles to empty text" {
     // Nothing kept -> "" so the adapter adds no bytes to the body.
     const res = try compileFor(arena, "anthropic", "{\"reasoning_effort\":\"high\"}");
     try testing.expectEqualStrings("", res.json);
+}
+
+test "provider_options: gemini maps thinking to thinkingConfig and warns on the rest" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const res = try compileFor(arena, "gemini",
+        \\{"thinking":{"budget_tokens":1024,"include_thoughts":true,"level":"high"},"top_k":5}
+    );
+    try testing.expectEqualStrings("{\"thinkingConfig\":{\"thinkingBudget\":1024,\"includeThoughts\":true}}", res.json);
+    try testing.expectEqual(@as(usize, 2), res.warnings.len);
+    try testing.expect(std.mem.indexOf(u8, res.warnings[0], "thinking.level") != null);
+    try testing.expect(std.mem.indexOf(u8, res.warnings[1], "top_k") != null);
+
+    const bad = try compileFor(arena, "gemini", "{\"thinking\":{\"budget_tokens\":-1,\"include_thoughts\":\"yes\"}}");
+    try testing.expectEqualStrings("", bad.json);
+    try testing.expectEqual(@as(usize, 2), bad.warnings.len);
+
+    const not_object = try compileFor(arena, "gemini", "{\"thinking\":3}");
+    try testing.expectEqualStrings("", not_object.json);
+    try testing.expectEqual(@as(usize, 1), not_object.warnings.len);
 }

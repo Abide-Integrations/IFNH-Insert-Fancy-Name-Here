@@ -253,11 +253,8 @@ pub const SessionRuntime = struct {
         } else |_| {}
 
         const provider_name = cfg.getString("model.provider", "openai");
-        const is_anthropic = std.mem.eql(u8, provider_name, "anthropic");
-        const base_url = cfg.getOptionalString("model.base_url") orelse
-            (if (is_anthropic) "https://api.anthropic.com" else "https://api.openai.com/v1");
-        const api_key_env = cfg.getOptionalString("model.api_key_env") orelse
-            (if (is_anthropic) "ANTHROPIC_API_KEY" else "OPENAI_API_KEY");
+        const base_url = cfg.getOptionalString("model.base_url") orelse resolve_mod.defaultBaseUrl(provider_name);
+        const api_key_env = cfg.getConfiguredString("model.api_key_env") orelse resolve_mod.defaultKeyEnv(provider_name);
         return .{
             .provider = resolve_mod.providerFor(provider_name) orelse openai.instance,
             .model = cfg.getString("model.model", ""),
@@ -284,6 +281,7 @@ pub const SessionRuntime = struct {
             .model = resolved.model,
             .base_url = resolved.base_url,
             .api_key = self.keyFor(resolved.api_key_env),
+            .auth = resolved.auth,
             .api_key_env = resolved.api_key_env,
             .client = &self.http,
             .label = resolved.alias,
@@ -420,14 +418,14 @@ pub const SessionRuntime = struct {
             }
         }
         if (pcfg.model.len == 0) {
-            statusFmt(events, .plain, "no model configured — run /provider set <openai|anthropic|openai-responses> <model> [base_url] [key_env]\n", .{});
+            statusFmt(events, .plain, "no model configured — run /provider set <openai|anthropic|openai-responses|gemini> <model> [base_url] [key_env]\n", .{});
             return .{};
         }
         if (pcfg.api_key.len == 0) {
             const key_env = if (pcfg.api_key_env.len > 0)
                 pcfg.api_key_env
             else
-                (cfg.getOptionalString("model.api_key_env") orelse "OPENAI_API_KEY");
+                (cfg.getConfiguredString("model.api_key_env") orelse resolve_mod.defaultKeyEnv(cfg.getString("model.provider", "openai")));
             statusFmt(events, .plain, "note: no api key — run /provider key {s} <value> (or export it) before sending a message\n", .{key_env});
         }
 
@@ -453,6 +451,7 @@ pub const SessionRuntime = struct {
                 .model = resolved.model,
                 .base_url = resolved.base_url,
                 .api_key = self.keyFor(resolved.api_key_env),
+                .auth = resolved.auth,
                 .provider_options = resolved.provider_options,
                 .temperature = resolved.temperature,
                 .max_output_tokens = resolved.max_output_tokens,
@@ -474,6 +473,7 @@ pub const SessionRuntime = struct {
                 .model = resolved.model,
                 .base_url = resolved.base_url,
                 .api_key = self.keyFor(resolved.api_key_env),
+                .auth = resolved.auth,
                 .provider_options = resolved.provider_options,
                 .temperature = resolved.temperature,
                 .max_output_tokens = resolved.max_output_tokens,
@@ -487,6 +487,7 @@ pub const SessionRuntime = struct {
             .provider = pcfg.provider,
             .base_url = pcfg.base_url,
             .api_key = pcfg.api_key,
+            .auth = pcfg.auth,
             .default_model = pcfg.model,
             .client = &self.http,
             .mode = self.engine.mode,
