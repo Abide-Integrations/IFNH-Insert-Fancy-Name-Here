@@ -40,8 +40,10 @@ ifnh                               # start an agentic session
 ```
 
 Works with any OpenAI-compatible endpoint (Ollama, llama.cpp, vLLM,
-OpenRouter) via `model.base_url`. See the [usage guide](docs/USAGE.md)
-for configuration, permissions, subagents, MCP, skills, hooks, and
+OpenRouter) via `model.base_url`, and natively with Anthropic, the OpenAI
+Responses API and Google Gemini (`model.provider`). See the [usage guide](docs/USAGE.md)
+for configuration, permissions, subagents, MCP, skills (`/skills install`
+from git, pinned in a lockfile), opt-in advisory memory, hooks, and
 lifecycles.
 
 ## Build

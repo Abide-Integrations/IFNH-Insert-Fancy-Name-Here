@@ -22,6 +22,7 @@ const subagent_mod = @import("subagent.zig");
 const git_mod = @import("../git.zig");
 const mcp_mod = @import("../mcp.zig");
 const skills_mod = @import("../skills.zig");
+const memory_mod = @import("../memory.zig");
 const hooks_mod = @import("../hooks.zig");
 const compaction_mod = @import("../compaction.zig");
 const executions_mod = @import("../executions.zig");
@@ -232,6 +233,13 @@ pub const SessionRuntime = struct {
         return self;
     }
 
+    /// Re-run skill discovery so `/skills install` and `/skills remove` take
+    /// effect without a restart. The catalog lives in `arena` (REPL lifetime).
+    pub fn rescanSkills(self: *SessionRuntime, arena: std.mem.Allocator, cwd: std.Io.Dir) void {
+        const user_dir = config_mod.userSkillsDir(arena, self.process_environ) orelse return;
+        self.skills = skills_mod.discover(cwd, self.io, arena, user_dir) catch return;
+    }
+
     pub fn deinit(self: *SessionRuntime) void {
         if (self.executions) |reg| reg.deinit(); // kill background children (I125)
         if (self.mcp_registry) |reg| reg.deinit();
@@ -253,11 +261,8 @@ pub const SessionRuntime = struct {
         } else |_| {}
 
         const provider_name = cfg.getString("model.provider", "openai");
-        const is_anthropic = std.mem.eql(u8, provider_name, "anthropic");
-        const base_url = cfg.getOptionalString("model.base_url") orelse
-            (if (is_anthropic) "https://api.anthropic.com" else "https://api.openai.com/v1");
-        const api_key_env = cfg.getOptionalString("model.api_key_env") orelse
-            (if (is_anthropic) "ANTHROPIC_API_KEY" else "OPENAI_API_KEY");
+        const base_url = cfg.getOptionalString("model.base_url") orelse resolve_mod.defaultBaseUrl(provider_name);
+        const api_key_env = cfg.getConfiguredString("model.api_key_env") orelse resolve_mod.defaultKeyEnv(provider_name);
         return .{
             .provider = resolve_mod.providerFor(provider_name) orelse openai.instance,
             .model = cfg.getString("model.model", ""),
@@ -284,6 +289,7 @@ pub const SessionRuntime = struct {
             .model = resolved.model,
             .base_url = resolved.base_url,
             .api_key = self.keyFor(resolved.api_key_env),
+            .auth = resolved.auth,
             .api_key_env = resolved.api_key_env,
             .client = &self.http,
             .label = resolved.alias,
@@ -420,14 +426,14 @@ pub const SessionRuntime = struct {
             }
         }
         if (pcfg.model.len == 0) {
-            statusFmt(events, .plain, "no model configured — run /provider set <openai|anthropic|openai-responses> <model> [base_url] [key_env]\n", .{});
+            statusFmt(events, .plain, "no model configured — run /provider set <openai|anthropic|openai-responses|gemini> <model> [base_url] [key_env]\n", .{});
             return .{};
         }
         if (pcfg.api_key.len == 0) {
             const key_env = if (pcfg.api_key_env.len > 0)
                 pcfg.api_key_env
             else
-                (cfg.getOptionalString("model.api_key_env") orelse "OPENAI_API_KEY");
+                (cfg.getConfiguredString("model.api_key_env") orelse resolve_mod.defaultKeyEnv(cfg.getString("model.provider", "openai")));
             statusFmt(events, .plain, "note: no api key — run /provider key {s} <value> (or export it) before sending a message\n", .{key_env});
         }
 
@@ -453,6 +459,7 @@ pub const SessionRuntime = struct {
                 .model = resolved.model,
                 .base_url = resolved.base_url,
                 .api_key = self.keyFor(resolved.api_key_env),
+                .auth = resolved.auth,
                 .provider_options = resolved.provider_options,
                 .temperature = resolved.temperature,
                 .max_output_tokens = resolved.max_output_tokens,
@@ -474,12 +481,16 @@ pub const SessionRuntime = struct {
                 .model = resolved.model,
                 .base_url = resolved.base_url,
                 .api_key = self.keyFor(resolved.api_key_env),
+                .auth = resolved.auth,
                 .provider_options = resolved.provider_options,
                 .temperature = resolved.temperature,
                 .max_output_tokens = resolved.max_output_tokens,
             } }) catch {};
         }
         child_models.aliases = alias_models.items;
+        // Advisory memory (E-05a): opened once per turn from the current
+        // config; null while `memory.adapter` is "none".
+        const memory_handle = memory_mod.open(arena, io, cwd, self.process_environ, memory_mod.settingsFrom(cfg), self.mcp_registry);
         var host = subagent_mod.Host{
             .io = io,
             .workspace = cwd,
@@ -487,6 +498,7 @@ pub const SessionRuntime = struct {
             .provider = pcfg.provider,
             .base_url = pcfg.base_url,
             .api_key = pcfg.api_key,
+            .auth = pcfg.auth,
             .default_model = pcfg.model,
             .client = &self.http,
             .mode = self.engine.mode,
@@ -523,6 +535,7 @@ pub const SessionRuntime = struct {
             },
             .session_hint = self.store.manifest.id,
             .mcp = self.mcp_registry,
+            .memory = memory_handle,
         };
         var tool_ctx = tool_mod.ToolContext{
             .io = io,
@@ -544,6 +557,10 @@ pub const SessionRuntime = struct {
             .mcp_call_fn = mcpCallHook,
             .mcp_describe_fn = mcpDescribeHook,
             .mcp_ctx = self.mcp_registry orelse mcp_registry_sentinel,
+            .memory_recall_fn = if (memory_handle != null) memory_mod.recallHook else null,
+            .memory_remember_fn = if (memory_handle != null) memory_mod.rememberHook else null,
+            .memory_forget_fn = if (memory_handle != null) memory_mod.forgetHook else null,
+            .memory_ctx = memory_handle,
             .skill_load_fn = skillLoadHook,
             .skill_ctx = self,
             .exec_start_fn = execStartHook,

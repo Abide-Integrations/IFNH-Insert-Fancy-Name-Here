@@ -146,14 +146,14 @@ test "config schema covers the providers and the MCP server keys the loader read
     const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), json_schema, .{});
 
     const providers = nodeAt(schema, "model.provider").?.object.get("enum").?.array;
-    for ([_][]const u8{ "openai", "anthropic", "openai-responses" }) |name| {
+    for ([_][]const u8{ "openai", "anthropic", "openai-responses", "gemini" }) |name| {
         var found = false;
         for (providers.items) |item| {
             if (std.mem.eql(u8, item.string, name)) found = true;
         }
         try std.testing.expect(found);
     }
-    try std.testing.expectEqual(@as(usize, 3), providers.items.len);
+    try std.testing.expectEqual(@as(usize, 4), providers.items.len);
 
     const server = nodeAt(schema, "mcp_servers").?.object.get("additionalProperties").?;
     const props = server.object.get("properties").?.object;

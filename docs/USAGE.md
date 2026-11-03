@@ -28,7 +28,7 @@ zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl   # static
 ```bash
 cd your/project
 ifnh init                 # optional: creates .ifnh/ skeleton (never overwrites)
-export ANTHROPIC_API_KEY=sk-ant-...   # or OPENAI_API_KEY
+export ANTHROPIC_API_KEY=sk-ant-...   # or OPENAI_API_KEY / GEMINI_API_KEY
 ifnh doctor               # verifies config, key, git, MCP, state dirs
 ```
 
@@ -173,6 +173,7 @@ is not a terminal or `TERM` is `dumb`: then nothing at all is written.
 | `/agents` | subagent reports |
 | `/skills` | installed skills |
 | `/mcp` | MCP servers/tools |
+| `/memory` | memory scope, entry count and the newest notes (`/memory purge` deletes them, after approval) |
 | `/exec` | background executions |
 | `/usage` | session token and dollar totals, with the budget and a per-model line when several models were used |
 | `/compact` | force context compaction |
@@ -320,7 +321,8 @@ The full annotated default lives in `src/core/config/config.zig`
   "schema_version": 1,
   "model": {
     "provider": "openai",          // "openai" = any OpenAI-compatible API (Chat Completions)
-                                   // "openai-responses" = OpenAI Responses API; "anthropic" = Messages
+                                   // "openai-responses" = OpenAI Responses API; "anthropic" = Messages;
+                                   // "gemini" = Google Gemini (generateContent)
     "model": "qwen3-coder",
     "base_url": "http://localhost:11434/v1",   // Ollama, llama.cpp, vLLM...
     "api_key_env": "OLLAMA_KEY"    // optional for local servers
@@ -411,7 +413,7 @@ Model aliases name a provider/model pair once and reuse it:
 - `provider_options` is per adapter and only implemented keys survive:
   `openai` accepts `reasoning_effort` (`minimal|low|medium|high`) and
   `reasoning` (object); `anthropic` accepts `thinking` (object) and `top_k`
-  (integer). Anything else is dropped with a config warning. Precedence is
+  (integer); `gemini` accepts `thinking` (object). Anything else is dropped with a config warning. Precedence is
   alias > `models.provider_options.<model id>` > `model.provider_options`,
   merged key by key.
 
@@ -427,6 +429,32 @@ reasoning events.
 { "model": { "provider": "openai-responses", "model": "gpt-5.1",
              "provider_options": { "reasoning": { "effort": "medium", "summary": "auto" } } } }
 ```
+
+### Google Gemini
+
+`"provider": "gemini"` streams from
+`{base_url}/models/<model>:streamGenerateContent?alt=sse` (default `base_url`
+`https://generativelanguage.googleapis.com/v1beta`, key from
+`GEMINI_API_KEY`, sent as `x-goog-api-key`). Model ids may not contain `/` or
+`?`.
+
+```jsonc
+{ "model": { "provider": "gemini", "model": "gemini-2.5-pro",
+             "provider_options": { "thinking": { "budget_tokens": 2048, "include_thoughts": true } } } }
+```
+
+- `thinking` maps to `generationConfig.thinkingConfig` (`budget_tokens` is a
+  non-negative integer, `include_thoughts` a boolean); thought parts stream
+  as reasoning events. It is the only option the adapter implements.
+- `"auth": "oauth"` (on `model` or on an alias; default `"api_key"`) sends the
+  value of `api_key_env` as `Authorization: Bearer <token>` instead of
+  `x-goog-api-key`, for a Google OAuth access token. There is no login flow:
+  export the token (for example `GEMINI_API_KEY=$(gcloud auth print-access-token)`)
+  or store it with `/provider key`. Access tokens expire after about an hour.
+  Any other `auth` value is a startup error naming the key.
+- A reply cut off by `MAX_TOKENS` ends normally; a refusal (`SAFETY`,
+  `RECITATION`, ...) or a blocked prompt is reported as a failure.
+- No Gemini context caching: the system prompt is always sent as one block.
 
 ### Anthropic extended thinking
 
@@ -471,6 +499,8 @@ recorded in the session log.
 - **`bash` with `background: true`** — long commands return an execution
   handle; poll with the `exec` tool or `/exec` (status/output/stop).
 - **`skill`** — load installed skills (see below).
+- **`memory_recall` / `memory_remember` / `memory_forget`** — only when
+  `memory.adapter` is not `none` (see Memory).
 - **`mcp_list` / `mcp_describe` / `mcp_call`** — MCP servers (see below).
 - **`read_tool_result`** — page through oversized outputs stored as
   artifacts.
@@ -585,7 +615,88 @@ The agent sees a budgeted catalog each turn and loads bodies with the
 `skill` tool. First-party examples ship in this repo under `skills/`
 (reconnaissance, create-skill) — copy them into a skills directory to use.
 
-## 10. Hooks
+### Installing skills from git
+
+```
+/skills                                         # [scope] name commit: description
+/skills install <git-url> [name] [--ref <ref>] [--force]
+/skills remove <name>                           # asks first
+```
+
+`install` accepts `https://…`, `ssh://…` and `git@host:path` sources only
+(`file://`, `git://`, plain paths and anything starting with `-` are
+refused). It runs `git clone --depth 1 [--branch <ref>]` into
+`.ifnh/skills/.tmp-<name>`, then moves the result to `.ifnh/skills/<name>`;
+the name defaults to the repository name and must match `[A-Za-z0-9._-]+`.
+An existing `<name>` is refused unless you pass `--force`, which swaps the
+whole directory (it is never half-replaced). The clone's `.git` directory is
+dropped; the commit is pinned in `.ifnh/skills.lock.json`:
+
+```json
+{
+  "version": 1,
+  "skills": {
+    "pdf-review": {
+      "source": "https://github.com/o/pdf-review.git",
+      "ref": "",
+      "commit": "0123456789abcdef0123456789abcdef01234567",
+      "installed_at": "2026-11-03T12:00:00Z"
+    }
+  }
+}
+```
+
+The file is written deterministically (names sorted) so it diffs cleanly;
+commit it to share exact versions. If it is not valid JSON, `install` and
+`remove` stop with `skills lockfile is not valid JSON: .ifnh/skills.lock.json`
+and leave it alone; `/skills` lists without commits. `--ref` takes a branch
+or tag (not a bare commit id). An installed repository must keep its
+`SKILL.md` at the top level for the catalog to pick it up; when none is found
+within two directory levels, `install` still keeps the files but prints
+`warning: no SKILL.md found in <name>`. The catalog is rescanned right
+away. Skills never gain permissions from being installed (K153), but their
+text goes to the model, so install only sources you trust.
+
+## 10. Memory
+
+Optional, advisory notes that survive between sessions. **Off by default**
+(`memory.adapter: "none"`): nothing is stored, no tool is advertised.
+
+```jsonc
+{ "memory": { "adapter": "file",      // "none" | "file" | "mcp"
+              "scope": "project" } }  // "project" | "user"
+```
+
+- **What gets stored:** only what the model saves with an explicit
+  `memory_remember` call (a text of at most 4096 bytes, approved like any
+  other write; `permissions` MCP rules apply as `memory.remember` and
+  `memory.forget`). Entries are never added to the prompt automatically; the
+  model reads them by calling `memory_recall`, and treats them as hints, not
+  instructions (DECISIONS Q231). `memory_forget` deletes one note by id, or
+  the whole scope without an id.
+- **`file` adapter:** JSONL, one `{"id","ts","scope","text","source"}` object
+  per line, in `.ifnh/memory/project.jsonl` (project scope; commit it or add
+  it to `.ifnh/.gitignore`, as you prefer) or `<config dir>/memory/user.jsonl`
+  (user scope). Recall is a case-insensitive substring match, newest first,
+  at most 8 notes and 4 KiB per call; malformed lines are skipped and
+  reported.
+- **`mcp` adapter:** `{"adapter": "mcp", "server": "honcho"}` forwards to an
+  entry of `mcp_servers`, calling the server's `memory_recall`,
+  `memory_remember` and `memory_forget` tools with `{query, scope, limit}`,
+  `{text, scope}` and `{scope, id}`. Rename them with
+  `"tools": {"recall": "...", "remember": "...", "forget": "..."}`. A missing
+  server or tool is reported as an error; the server's text reply is passed
+  through. `adapter: "mcp"` without a `server` that exists in `mcp_servers`
+  is a startup error.
+- **Inspect and clear:** `ifnh memory list [--scope project|user] [--json]`
+  prints one line per note; `ifnh memory purge [--scope ...] [--yes]` deletes
+  them (without `--yes` it asks on a terminal and refuses when stdin is not
+  one). In the REPL, `/memory` and `/memory purge`. With memory off, all of
+  them print `memory is off (memory.adapter)`.
+- Subagents share the parent's adapter; `research` and `review` children get
+  `memory_recall` only.
+
+## 11. Hooks
 
 ```jsonc
 { "hooks": {
@@ -618,7 +729,7 @@ Rewrites chain through the remaining `before_tool` hooks; `after_*` hooks
 never block, whatever they print. A non-zero exit or a timeout still blocks
 `before_*` and is advisory everywhere else. Hooks never trigger hooks.
 
-## 11. Lifecycles
+## 12. Lifecycles
 
 ```jsonc
 // .ifnh/lifecycle/ship.json
@@ -636,7 +747,7 @@ Run with `/lifecycle run .ifnh/lifecycle/ship.json` (resume with
 `--from <stage-index>`). Failed reviews stop the pipeline (D008); only
 `/review override <reason>` — recorded as an audit artifact — bypasses.
 
-## 12. Observability
+## 13. Observability
 
 - `ifnh doctor` — environment health.
 - `/usage` — session token totals; per-turn records in the session dir.
@@ -672,7 +783,7 @@ Run with `/lifecycle run .ifnh/lifecycle/ship.json` (resume with
   records unchanged. Malformed input exits 2 with the line number on stderr
   and nothing on stdout.
 
-## 13. Distribution
+## 14. Distribution
 
 One-liner (after the repo is on GitHub and a tag is released):
 
@@ -712,7 +823,7 @@ the GitHub release with sha256sums. For a single machine:
 zig build -Doptimize=ReleaseSafe && scripts/install.sh
 ```
 
-## 14. Project layout inside `.ifnh/`
+## 15. Project layout inside `.ifnh/`
 
 ```
 .ifnh/
@@ -720,7 +831,9 @@ zig build -Doptimize=ReleaseSafe && scripts/install.sh
 ├── config.d/            # committed — split config
 ├── instructions/        # committed — extra project instructions
 ├── commands/            # committed — custom slash commands
-├── skills/              # committed — project skills
+├── skills/              # committed — project skills (`/skills install` clones here)
+├── skills.lock.json     # committed — pinned source/commit of installed skills
+├── memory/              # advisory notes of the file memory adapter (opt-in)
 ├── lifecycle/           # committed — lifecycle definitions
 ├── tool-notes/          # committed — per-CLI guidance for agents
 ├── plans/               # plan artifacts

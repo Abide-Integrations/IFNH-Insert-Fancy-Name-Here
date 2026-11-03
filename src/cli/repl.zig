@@ -26,6 +26,9 @@ const tool_mod = @import("../tools/tool.zig");
 const openai = @import("../providers/openai.zig");
 const resolve_mod = @import("../core/config/resolve.zig");
 const image_mod = @import("../core/image.zig");
+const memory_mod = @import("../core/memory.zig");
+const skills_mod = @import("../core/skills.zig");
+const skills_lock = @import("../core/skills_lock.zig");
 const trace_mod = @import("../core/trace.zig");
 const wire_log = @import("../core/wire_log.zig");
 const turn_cache_mod = @import("../core/turn_cache.zig");
@@ -366,8 +369,8 @@ pub fn run(
     {
         const provider_display = cfg.getOptionalString("model.provider_label") orelse provider_name;
         const key_note = if (pcfg.api_key.len == 0) blk: {
-            const key_env = cfg.getOptionalString("model.api_key_env") orelse
-                (if (std.mem.eql(u8, provider_name, "anthropic")) "ANTHROPIC_API_KEY" else "OPENAI_API_KEY");
+            const key_env = cfg.getConfiguredString("model.api_key_env") orelse
+                resolve_mod.defaultKeyEnv(provider_name);
             break :blk std.fmt.allocPrint(arena, " — {s}run /provider key {s} <value>{s}", .{ palette.warn("", arena), key_env, "\x1b[0m" }) catch ", no api key";
         } else "";
         try out(io, "{s}ifnh session{s} {s} ({s}{s} · {s}{s}){s}\n", .{
@@ -628,7 +631,7 @@ fn persistProjectConfig(
 // -------------------------------------------------------------- first-run setup
 
 pub const ProviderPreset = struct {
-    /// Wire protocol: "openai" (any OpenAI-compatible endpoint) | "anthropic".
+    /// Wire protocol: "openai" (any OpenAI-compatible endpoint) | "anthropic" | "gemini".
     id: []const u8,
     /// Human-readable provider name (display only).
     label: []const u8,
@@ -643,6 +646,7 @@ pub const ProviderPreset = struct {
 pub const presets = [_]ProviderPreset{
     .{ .id = "openai", .label = "OpenRouter", .base_url = "https://openrouter.ai/api/v1", .key_env = "OPENROUTER_API_KEY", .default_model = "openrouter/auto", .needs_key = true },
     .{ .id = "anthropic", .label = "Anthropic", .base_url = "https://api.anthropic.com", .key_env = "ANTHROPIC_API_KEY", .default_model = "claude-sonnet-4-6", .needs_key = true },
+    .{ .id = "gemini", .label = "Google Gemini", .base_url = "https://generativelanguage.googleapis.com/v1beta", .key_env = "GEMINI_API_KEY", .default_model = "gemini-2.5-pro", .needs_key = true },
     .{ .id = "openai", .label = "OpenAI", .base_url = "https://api.openai.com/v1", .key_env = "OPENAI_API_KEY", .default_model = "gpt-5.1", .needs_key = true },
     .{ .id = "openai", .label = "xAI (Grok)", .base_url = "https://api.x.ai/v1", .key_env = "XAI_API_KEY", .default_model = "grok-4", .needs_key = true },
     .{ .id = "openai", .label = "Groq", .base_url = "https://api.groq.com/openai/v1", .key_env = "GROQ_API_KEY", .default_model = "llama-3.3-70b-versatile", .needs_key = true },
@@ -740,7 +744,7 @@ fn runFirstRunSetup(
 
     // Live model list; typed fallback when unavailable.
     var model_name: []const u8 = preset.default_model;
-    const models_res = models_mod.fetchModels(arena, io, base_url, key_value, std.mem.eql(u8, preset.id, "anthropic"));
+    const models_res = models_mod.fetchModels(arena, io, base_url, key_value, std.meta.stringToEnum(models_mod.Style, preset.id) orelse .openai);
     switch (models_res) {
         .models => |list| {
             try out(io, "{s}({d} models available — enter a number, or type a model id){s}\n", .{
@@ -929,7 +933,7 @@ pub const commands = [_][]const u8{
     "help",      "quit",      "model", "config",  "context",  "undo",
     "redo",      "diff",      "plan",  "agents",  "mcp",      "exec",
     "review",    "reconcile", "usage", "compact", "sessions", "provider",
-    "lifecycle", "skills",    "image",
+    "lifecycle", "skills",    "image", "memory",
 };
 
 fn handleCommand(
@@ -970,6 +974,10 @@ fn handleCommand(
             \\  /image <path>         attach a png/jpg/gif/webp to the next message
             \\  /image [clear]        show the queued count / empty the queue
             \\  /sessions             list sessions (use `ifnh resume <id>`)
+            \\  /skills [list]        installed skills with their pinned commit
+            \\  /skills install <git-url> [name] [--ref <ref>] [--force]
+            \\  /skills remove <name> delete an installed skill (asks first)
+            \\  /memory [purge]       memory scope, entry count and newest notes; purge deletes them
             \\
         , .{}) catch {};
     } else if (std.mem.eql(u8, cmd, "image")) {
@@ -1172,7 +1180,7 @@ fn handleCommand(
                 show_label,
                 pcfg_now.model,
                 pcfg_now.base_url,
-                cfg.getOptionalString("model.api_key_env") orelse "(default)",
+                cfg.getConfiguredString("model.api_key_env") orelse "(default)",
                 key_state,
                 tools_state,
                 if (cw != null) std.fmt.allocPrint(arena, ", compaction threshold {d} tokens", .{cw.?}) catch "" else "",
@@ -1325,16 +1333,9 @@ fn handleCommand(
             out(io, "[compacted: {d} -> {d} tokens]\n", .{ res.tokens_before, res.tokens_after }) catch {};
         }
     } else if (std.mem.eql(u8, cmd, "skills")) {
-        if (rt.skills) |catalog| {
-            if (catalog.skills.len == 0) {
-                if (config_mod.userSkillsDir(arena, rt.process_environ)) |user_skills| {
-                    out(io, "no skills installed (.ifnh/skills/, {s}/)\n", .{user_skills}) catch {};
-                } else out(io, "no skills installed (.ifnh/skills/)\n", .{}) catch {};
-            }
-            for (catalog.skills) |s| {
-                out(io, "  [{s}] {s}: {s}\n", .{ s.scope, s.name, s.description }) catch {};
-            }
-        } else out(io, "skills unavailable\n", .{}) catch {};
+        skillsCommand(io, arena, cwd, rt, events, rest);
+    } else if (std.mem.eql(u8, cmd, "memory")) {
+        memoryCommand(io, arena, cwd, rt, events, cfg, rest);
     } else if (std.mem.eql(u8, cmd, "mcp")) {
         if (rt.mcp_registry) |reg| {
             if (reg.all_configs.len == 0) {
@@ -1386,6 +1387,148 @@ fn handleCommand(
 /// Disk-backed slash command (D030, M0-T37): `.ifnh/commands/<name>.md`
 /// with optional frontmatter; `$ARGS` in the body is replaced by the
 /// command arguments. The body is submitted as the user's prompt.
+/// `/skills [list]`, `/skills install ...`, `/skills remove <name>` (E-05b).
+/// Install and remove rescan the catalog, so no `/reload` is needed.
+fn skillsCommand(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    cwd: std.Io.Dir,
+    rt: *session_runtime.SessionRuntime,
+    events: *const session_runtime.Events,
+    rest: []const u8,
+) void {
+    switch (skills_mod.parseCommand(rest)) {
+        .usage => |text| out(io, "{s}\n", .{text}) catch {},
+        .list => {
+            const lock = skills_lock.read(cwd, io, arena) catch |err| blk: {
+                if (err == error.InvalidLock) out(io, "{s}\n", .{skills_lock.invalid_message}) catch {};
+                break :blk skills_lock.Lock{};
+            };
+            const catalog = rt.skills orelse {
+                out(io, "skills unavailable\n", .{}) catch {};
+                return;
+            };
+            if (catalog.skills.len == 0) {
+                if (config_mod.userSkillsDir(arena, rt.process_environ)) |user_skills| {
+                    out(io, "no skills installed (.ifnh/skills/, {s}/)\n", .{user_skills}) catch {};
+                } else out(io, "no skills installed (.ifnh/skills/)\n", .{}) catch {};
+            }
+            for (catalog.skills) |s| {
+                const pinned = if (skills_mod.projectDirName(s.path)) |dir| lock.get(dir) else null;
+                const commit = skills_lock.shortCommit(if (pinned) |p| p.commit else null);
+                out(io, "  [{s}] {s} {s}: {s}\n", .{ s.scope, s.name, commit, s.description }) catch {};
+            }
+        },
+        .install => |args| {
+            out(io, "installing {s} ...\n", .{args.url}) catch {};
+            var msg: []const u8 = "";
+            const done = skills_mod.install(arena, io, cwd, rt.process_environ, args, &msg) catch |err| {
+                if (err == error.OutOfMemory) msg = "out of memory";
+                out(io, "{s}\n", .{msg}) catch {};
+                return;
+            };
+            rt.rescanSkills(arena, cwd);
+            if (done.has_skill_md) {
+                out(io, "installed {s} ({s})\n", .{ done.name, skills_lock.shortCommit(done.commit) }) catch {};
+            } else {
+                out(io, "warning: no SKILL.md found in {s}\n", .{done.name}) catch {};
+            }
+        },
+        .remove => |name| {
+            if (!skills_mod.isInstalled(cwd, io, arena, name)) {
+                out(io, "skill '{s}' is not installed\n", .{name}) catch {};
+                return;
+            }
+            const resp = events.on_approval(events.ctx, .{
+                .tool = "skills",
+                .title = "remove skill",
+                .detail = std.fmt.allocPrint(arena, "delete .ifnh/skills/{s} and its lockfile entry", .{name}) catch name,
+            });
+            if (resp == .denied) {
+                out(io, "cancelled\n", .{}) catch {};
+                return;
+            }
+            var msg: []const u8 = "";
+            skills_mod.remove(arena, io, cwd, name, &msg) catch |err| {
+                if (err == error.OutOfMemory) msg = "out of memory";
+                out(io, "{s}\n", .{msg}) catch {};
+                return;
+            };
+            rt.rescanSkills(arena, cwd);
+            out(io, "removed {s}\n", .{name}) catch {};
+        },
+    }
+}
+
+/// `/memory` and `/memory purge` (E-05a, DECISIONS Q229/Q230). Purge asks
+/// through the same approval path as tool calls.
+fn memoryCommand(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    cwd: std.Io.Dir,
+    rt: *session_runtime.SessionRuntime,
+    events: *const session_runtime.Events,
+    cfg: *config_mod.Store,
+    rest: []const u8,
+) void {
+    const settings = memory_mod.settingsFrom(cfg);
+    if (settings.kind == .none) {
+        out(io, "memory is off (memory.adapter)\n", .{}) catch {};
+        return;
+    }
+    const purge = std.mem.eql(u8, rest, "purge");
+    if (rest.len > 0 and !purge) {
+        out(io, "usage: /memory [purge]\n", .{}) catch {};
+        return;
+    }
+    const handle = memory_mod.open(arena, io, cwd, rt.process_environ, settings, rt.mcp_registry) orelse {
+        out(io, "memory unavailable (out of memory)\n", .{}) catch {};
+        return;
+    };
+    const scope = @tagName(settings.scope);
+    var diag = memory_mod.Diag{};
+
+    if (purge) {
+        const resp = events.on_approval(events.ctx, .{
+            .tool = "memory",
+            .title = "purge memory",
+            .detail = std.fmt.allocPrint(arena, "delete every {s} memory note", .{scope}) catch scope,
+        });
+        if (resp == .denied) {
+            out(io, "cancelled\n", .{}) catch {};
+            return;
+        }
+        const res = handle.adapter.forget(arena, io, &diag, settings.scope, null) catch |err| {
+            out(io, "error: {s}\n", .{if (diag.message.len > 0) diag.message else @errorName(err)}) catch {};
+            return;
+        };
+        if (res.text) |t| {
+            out(io, "{s}\n", .{t}) catch {};
+        } else {
+            out(io, "purged {d} {s} (scope {s})\n", .{ res.count, if (res.count == 1) "entry" else "entries", scope }) catch {};
+        }
+        return;
+    }
+
+    const res = handle.adapter.recall(arena, io, &diag, "", settings.scope, .{ .max_snippets = 100_000, .max_bytes = 64 * 1024 * 1024 }) catch |err| {
+        out(io, "error: {s}\n", .{if (diag.message.len > 0) diag.message else @errorName(err)}) catch {};
+        return;
+    };
+    if (res.text) |t| {
+        out(io, "memory: scope {s} (adapter {s})\n{s}\n", .{ scope, @tagName(settings.kind), t }) catch {};
+        return;
+    }
+    out(io, "memory: scope {s}, {d} {s}\n", .{ scope, res.snippets.len, if (res.snippets.len == 1) "entry" else "entries" }) catch {};
+    for (res.snippets[0..@min(res.snippets.len, 5)]) |s| {
+        const line = arena.dupe(u8, if (s.text.len > 100) s.text[0..100] else s.text) catch continue;
+        for (line) |*c| {
+            if (c.* == '\n' or c.* == '\r') c.* = ' ';
+        }
+        out(io, "  {s} ({s}): {s}\n", .{ s.id, s.ts, line }) catch {};
+    }
+    if (res.skipped > 0) out(io, "  ({d} malformed line(s) skipped)\n", .{res.skipped}) catch {};
+}
+
 fn loadDiskCommand(io: std.Io, arena: std.mem.Allocator, cwd: std.Io.Dir, cmd: []const u8, args: []const u8) ?[]const u8 {
     var name_buf: [128]u8 = undefined;
     if (cmd.len == 0 or cmd.len > 64) return null;

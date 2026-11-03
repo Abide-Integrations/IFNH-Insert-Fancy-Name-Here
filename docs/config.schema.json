@@ -17,7 +17,7 @@
       "properties": {
         "provider": {
           "type": "string",
-          "enum": ["openai", "anthropic", "openai-responses"]
+          "enum": ["openai", "anthropic", "openai-responses", "gemini"]
         },
         "model": {
           "type": "string",
@@ -30,6 +30,12 @@
         "api_key_env": {
           "type": "string",
           "description": "Environment variable that holds the API key."
+        },
+        "auth": {
+          "type": "string",
+          "enum": ["api_key", "oauth"],
+          "default": "api_key",
+          "description": "How the key in api_key_env is sent. Only gemini reads it: \"oauth\" sends it as Authorization: Bearer (a Google OAuth access token) instead of x-goog-api-key. A models.aliases.<name> entry may set it too. There is no login flow; supply the token through the env var or /provider key."
         },
         "temperature": {
           "type": ["number", "null"],
@@ -199,6 +205,32 @@
       "additionalProperties": true,
       "properties": {
         "redact": { "type": "boolean" }
+      }
+    },
+    "memory": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Optional advisory memory (DECISIONS Q223-232). Off by default; entries are only read or written by the model's explicit memory_* tool calls, never injected into the prompt.",
+      "properties": {
+        "adapter": {
+          "type": "string",
+          "enum": ["none", "file", "mcp"],
+          "description": "none: off. file: JSONL files under .ifnh/memory/ (project) or the user config dir (user). mcp: proxy to the mcp_servers entry named by server."
+        },
+        "scope": {
+          "type": "string",
+          "enum": ["project", "user"],
+          "description": "Where entries live."
+        },
+        "server": {
+          "type": "string",
+          "description": "mcp adapter only: name of an mcp_servers entry. Required when adapter is mcp."
+        },
+        "tools": {
+          "type": "object",
+          "description": "mcp adapter only: tool names on the server, keys recall, remember and forget. Defaults: memory_recall, memory_remember, memory_forget.",
+          "additionalProperties": { "type": "string" }
+        }
       }
     },
     "hooks": {

@@ -18,6 +18,8 @@ const trace_mod = @import("core/trace.zig");
 const wire_log = @import("core/wire_log.zig");
 const git_mod = @import("core/git.zig");
 const keys_mod = @import("core/config/keys.zig");
+const resolve_mod = @import("core/config/resolve.zig");
+const memory_mod = @import("core/memory.zig");
 const transcript = @import("core/session/transcript.zig");
 const debug_bundle = @import("core/debug_bundle.zig");
 
@@ -150,6 +152,7 @@ fn dispatch(
             });
         },
         .doctor => try runDoctor(io, arena, environ),
+        .memory => try runMemory(io, arena, environ, parsed.flags, parsed.args),
         .@"debug-bundle" => try runDebugBundle(io, arena, environ, parsed.flags, parsed.args),
         .session => try runSession(io, arena, environ, parsed.args),
         .replay => try runReplay(io, arena, parsed.flags, parsed.args),
@@ -608,6 +611,114 @@ fn runCleanup(io: std.Io, arena: std.mem.Allocator, environ: *const std.process.
     }
 }
 
+/// `ifnh memory <list|purge>` (E-05a, DECISIONS Q229/Q230). Both say
+/// `memory is off (memory.adapter)` and exit 0 while the adapter is "none".
+fn runMemory(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    environ: *const std.process.Environ.Map,
+    flags: cli_args.GlobalFlags,
+    args: []const []const u8,
+) !void {
+    const margs = cli_args.parseMemory(args) catch {
+        try printErr(io, arena, "usage: ifnh memory list [--scope project|user] [--json]\n       ifnh memory purge [--scope project|user] [--yes]\n", .{});
+        std.process.exit(2);
+    };
+    const cwd = std.Io.Dir.cwd();
+    var cfg = try config_mod.load(arena, io, environ, cwd);
+    defer cfg.deinit();
+    try applyStartupOverrides(io, arena, &cfg, flags);
+    if (cfg.errors.items.len > 0) {
+        for (cfg.errors.items) |e| try printErr(io, arena, "config error [{s}]: {s}\n", .{ e.path, e.message });
+        std.process.exit(1);
+    }
+    const settings = memory_mod.settingsFrom(&cfg);
+    if (settings.kind == .none) {
+        try printOut(io, arena, "memory is off (memory.adapter)\n", .{});
+        return;
+    }
+    const scope = margs.scope orelse settings.scope;
+    var registry = try @import("core/mcp.zig").Registry.init(io, arena, cfg.get("mcp_servers"), "parent");
+    defer registry.deinit();
+    const handle = memory_mod.open(arena, io, cwd, environ, settings, &registry) orelse return error.OutOfMemory;
+    var diag = memory_mod.Diag{};
+
+    switch (margs.action) {
+        .list => {
+            const res = handle.adapter.recall(arena, io, &diag, "", scope, .{ .max_snippets = 100_000, .max_bytes = 64 * 1024 * 1024 }) catch |err| {
+                try printErr(io, arena, "error: {s}\n", .{if (diag.message.len > 0) diag.message else @errorName(err)});
+                std.process.exit(1);
+            };
+            if (wantsJson(&flags, args) or margs.json) {
+                var aw: std.Io.Writer.Allocating = .init(arena);
+                const w = &aw.writer;
+                try w.print("{{\"scope\":\"{s}\",\"skipped\":{d}", .{ @tagName(scope), res.skipped });
+                if (res.text) |t| {
+                    try w.writeAll(",\"text\":");
+                    try std.json.Stringify.value(t, .{}, w);
+                } else {
+                    try w.writeAll(",\"entries\":[");
+                    for (res.snippets, 0..) |s, i| {
+                        if (i > 0) try w.writeByte(',');
+                        try w.writeAll("{\"id\":");
+                        try std.json.Stringify.value(s.id, .{}, w);
+                        try w.writeAll(",\"ts\":");
+                        try std.json.Stringify.value(s.ts, .{}, w);
+                        try w.writeAll(",\"text\":");
+                        try std.json.Stringify.value(s.text, .{}, w);
+                        try w.writeByte('}');
+                    }
+                    try w.writeByte(']');
+                }
+                try w.writeByte('}');
+                try printOut(io, arena, "{s}\n", .{aw.written()});
+                return;
+            }
+            if (res.text) |t| {
+                try printOut(io, arena, "{s}\n", .{t});
+                return;
+            }
+            if (res.snippets.len == 0) try printOut(io, arena, "no memory entries (scope {s})\n", .{@tagName(scope)});
+            for (res.snippets) |s| {
+                // One line per entry, oldest last: embedded newlines become spaces.
+                const line = try arena.dupe(u8, s.text);
+                for (line) |*c| {
+                    if (c.* == '\n' or c.* == '\r') c.* = ' ';
+                }
+                try printOut(io, arena, "{s}  {s}  {s}\n", .{ s.id, s.ts, line });
+            }
+            if (res.skipped > 0) try printErr(io, arena, "warning: {d} malformed line(s) skipped\n", .{res.skipped});
+        },
+        .purge => {
+            if (!margs.yes) {
+                const tty = std.Io.File.stdin().isTty(io) catch false;
+                if (!tty) {
+                    try printErr(io, arena, "refusing to purge {s} memory without confirmation (stdin is not a terminal); re-run: ifnh memory purge --scope {s} --yes\n", .{ @tagName(scope), @tagName(scope) });
+                    std.process.exit(2);
+                }
+                try printOut(io, arena, "delete ALL {s} memory entries? [y/N] ", .{@tagName(scope)});
+                var buf: [64]u8 = undefined;
+                var stdin_r = std.Io.File.stdin().reader(io, &buf);
+                const line = stdin_r.interface.takeDelimiterInclusive('\n') catch "";
+                const answer = std.mem.trim(u8, line, " \t\r\n");
+                if (!std.ascii.eqlIgnoreCase(answer, "y") and !std.ascii.eqlIgnoreCase(answer, "yes")) {
+                    try printOut(io, arena, "cancelled\n", .{});
+                    return;
+                }
+            }
+            const res = handle.adapter.forget(arena, io, &diag, scope, null) catch |err| {
+                try printErr(io, arena, "error: {s}\n", .{if (diag.message.len > 0) diag.message else @errorName(err)});
+                std.process.exit(1);
+            };
+            if (res.text) |t| {
+                try printOut(io, arena, "{s}\n", .{t});
+            } else {
+                try printOut(io, arena, "purged {d} {s} (scope {s})\n", .{ res.count, if (res.count == 1) "entry" else "entries", @tagName(scope) });
+            }
+        },
+    }
+}
+
 /// `ifnh doctor` — environment health check (M1-T14, DECISIONS S259).
 fn runDoctor(io: std.Io, arena: std.mem.Allocator, environ: *const std.process.Environ.Map) !void {
     var aw: std.Io.Writer.Allocating = .init(arena);
@@ -637,9 +748,8 @@ fn doctorReport(io: std.Io, arena: std.mem.Allocator, environ: *const std.proces
 
     // Model/provider.
     const provider_name = cfg.getString("model.provider", "openai");
-    const is_anthropic = std.mem.eql(u8, provider_name, "anthropic");
-    const key_env = cfg.getOptionalString("model.api_key_env") orelse
-        (if (is_anthropic) "ANTHROPIC_API_KEY" else "OPENAI_API_KEY");
+    const key_env = cfg.getConfiguredString("model.api_key_env") orelse
+        resolve_mod.defaultKeyEnv(provider_name);
     // Key lookup uses the same merged view as sessions: process env +
     // stored keys (~/.config/ifnh/env).
     var stored_keys = keys_mod.Keys.init(arena);
@@ -955,6 +1065,7 @@ const help_text =
     \\  resume      resume a previous session (M0)
     \\  ask         run one headless turn (prompt arg or stdin; --json NDJSON)
     \\  doctor      check environment health (M1)
+    \\  memory      'ifnh memory list [--scope project|user] [--json]' / 'purge [--scope ..] [--yes]'
     \\  debug-bundle  write a redacted JSON bundle for bug reports (D-09)
     \\  session     'ifnh session export <id> [--out <path>|-]' writes redacted NDJSON
     \\  replay      'ifnh replay <file> [--json]' prints an exported session offline
@@ -1008,6 +1119,7 @@ test {
     _ = @import("providers/sse.zig");
     _ = @import("providers/openai.zig");
     _ = @import("providers/anthropic.zig");
+    _ = @import("providers/gemini.zig");
     _ = @import("providers/openai_responses.zig");
     _ = @import("providers/limits.zig");
     _ = @import("providers/pricing.zig");
@@ -1026,6 +1138,8 @@ test {
     _ = @import("core/git.zig");
     _ = @import("core/mcp.zig");
     _ = @import("core/skills.zig");
+    _ = @import("core/skills_lock.zig");
+    _ = @import("core/memory.zig");
     _ = @import("core/hooks.zig");
     _ = @import("core/compaction.zig");
     _ = @import("core/lifecycle.zig");

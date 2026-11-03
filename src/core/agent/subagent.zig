@@ -14,6 +14,7 @@
 const std = @import("std");
 const core_types = @import("../types.zig");
 const provider_mod = @import("../../providers/provider.zig");
+const memory_mod = @import("../memory.zig");
 const agent_engine = @import("engine.zig");
 const tool_mod = @import("../../tools/tool.zig");
 const engine_mod = @import("../permissions/engine.zig");
@@ -41,6 +42,7 @@ pub const ChildModel = struct {
     model: []const u8,
     base_url: []const u8,
     api_key: []const u8,
+    auth: provider_mod.Auth = .api_key,
     provider_options: []const u8 = "",
     temperature: ?f64 = null,
     max_output_tokens: ?u32 = null,
@@ -94,6 +96,7 @@ pub const Host = struct {
     provider: provider_mod.Provider,
     base_url: []const u8,
     api_key: []const u8,
+    auth: provider_mod.Auth = .api_key,
     default_model: []const u8,
     /// Session-owned HTTP client shared by child turns (B-02).
     client: ?*std.http.Client = null,
@@ -143,6 +146,10 @@ pub const Host = struct {
     /// The parent's MCP registry (borrowed). A child never uses it directly:
     /// it gets its own `forAgent` view with no live clients (E-03).
     mcp: ?*const mcp_mod.Registry = null,
+    /// The parent's open memory adapter (`memory.Handle`); children share it
+    /// rather than opening their own. Research and review children only get
+    /// `memory_recall`; they are read-only.
+    memory: ?*memory_mod.Handle = null,
 };
 
 fn rolePreamble(arena: std.mem.Allocator, role: Role, label: []const u8) ![]const u8 {
@@ -319,6 +326,10 @@ fn runChild(
         .mcp_call_fn = if (child_mcp != null) mcp_mod.callHook else null,
         .mcp_describe_fn = if (child_mcp != null) mcp_mod.describeHook else null,
         .mcp_ctx = if (child_mcp) |*reg| reg else null,
+        .memory_recall_fn = if (host.memory != null) memory_mod.recallHook else null,
+        .memory_remember_fn = if (host.memory != null and role == .implement) memory_mod.rememberHook else null,
+        .memory_forget_fn = if (host.memory != null and role == .implement) memory_mod.forgetHook else null,
+        .memory_ctx = host.memory,
     };
 
     var history: std.ArrayListUnmanaged(core_types.ChatMessage) = .empty;
@@ -340,6 +351,7 @@ fn runChild(
         .model = host.default_model,
         .base_url = host.base_url,
         .api_key = host.api_key,
+        .auth = host.auth,
         .provider_options = host.provider_options,
         .temperature = host.temperature,
         .max_output_tokens = host.max_output_tokens,
@@ -358,6 +370,7 @@ fn runChild(
             .model = chosen.model,
             .base_url = chosen.base_url,
             .api_key = chosen.api_key,
+            .auth = chosen.auth,
             .client = host.client,
             .provider_options = chosen.provider_options,
             .temperature = chosen.temperature,

@@ -22,6 +22,11 @@ pub const Sink = struct {
     }
 };
 
+/// How `ModelRequest.api_key` is presented to the endpoint. Only the Gemini
+/// adapter reads it: `.oauth` sends the key as a Bearer token (a Google OAuth
+/// access token) instead of `x-goog-api-key`.
+pub const Auth = enum { api_key, oauth };
+
 /// One streaming model request. All slices are borrowed for the duration
 /// of the call. `api_key` is a credential lease: adapters must not copy it
 /// into retained memory (DECISIONS H110).
@@ -29,6 +34,7 @@ pub const ModelRequest = struct {
     model: []const u8,
     base_url: []const u8,
     api_key: []const u8,
+    auth: Auth = .api_key,
     system: []const u8,
     /// Byte length of the byte-stable prefix of `system` (B-03). Adapters
     /// that support prompt caching may split there and mark the prefix
