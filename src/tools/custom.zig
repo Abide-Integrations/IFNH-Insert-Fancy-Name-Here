@@ -38,9 +38,9 @@ pub const CustomTool = struct {
 /// `tool.zig` asserts at compile time that this list matches its registry, so
 /// the two cannot drift.
 pub const reserved_names = [_][]const u8{
-    "read",             "glob",     "grep",         "edit",     "write", "bash",
-    "skill",            "mcp_list", "mcp_describe", "mcp_call", "agent", "exec",
-    "read_tool_result", "git",
+    "read",             "glob",     "grep",          "edit",            "write",         "bash",
+    "skill",            "mcp_list", "mcp_describe",  "mcp_call",        "agent",         "exec",
+    "read_tool_result", "git",      "memory_recall", "memory_remember", "memory_forget",
 };
 
 pub fn isReserved(name: []const u8) bool {

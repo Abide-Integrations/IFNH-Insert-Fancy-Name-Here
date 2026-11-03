@@ -204,11 +204,15 @@ pub const RunParams = struct {
     session_id: []const u8 = "",
 };
 
-/// Builtin tool specs plus one spec per loaded custom tool (D-02).
+/// Builtin tool specs plus one spec per loaded custom tool (D-02). The
+/// `memory_*` tools are left out while no memory hook is wired.
 fn advertisedTools(arena: std.mem.Allocator, ctx: *const tool_mod.ToolContext) std.mem.Allocator.Error![]const core_types.ToolSpec {
-    if (ctx.custom.len == 0) return &tool_mod.specs;
+    const memory_on = ctx.memory_ctx != null;
+    if (ctx.custom.len == 0 and memory_on) return &tool_mod.specs;
     var out: std.ArrayListUnmanaged(core_types.ToolSpec) = .empty;
-    try out.appendSlice(arena, &tool_mod.specs);
+    for (tool_mod.specs) |spec| {
+        if (memory_on or !tool_mod.isMemoryTool(spec.name)) try out.append(arena, spec);
+    }
     for (ctx.custom) |ct| {
         try out.append(arena, .{
             .name = ct.name,
@@ -1604,4 +1608,27 @@ test "reasoning reaches on_reasoning and the thinking block rides the assistant 
     try std.testing.expectEqualStrings("SIG", first.reasoning_signature.?);
     try std.testing.expect(!first.reasoning_redacted);
     try std.testing.expect(history.items[3].reasoning == null);
+}
+
+test "memory tools are advertised only while a memory hook is wired" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var ctx: tool_mod.ToolContext = undefined;
+    ctx.custom = &.{};
+    ctx.memory_ctx = null;
+    const off = try advertisedTools(arena, &ctx);
+    for (off) |spec| try std.testing.expect(!tool_mod.isMemoryTool(spec.name));
+    try std.testing.expectEqual(tool_mod.specs.len - 3, off.len);
+
+    var marker: u8 = 0;
+    ctx.memory_ctx = &marker;
+    const on = try advertisedTools(arena, &ctx);
+    try std.testing.expectEqual(tool_mod.specs.len, on.len);
+    var memory_tools: usize = 0;
+    for (on) |spec| {
+        if (tool_mod.isMemoryTool(spec.name)) memory_tools += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), memory_tools);
 }

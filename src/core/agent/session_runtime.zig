@@ -22,6 +22,7 @@ const subagent_mod = @import("subagent.zig");
 const git_mod = @import("../git.zig");
 const mcp_mod = @import("../mcp.zig");
 const skills_mod = @import("../skills.zig");
+const memory_mod = @import("../memory.zig");
 const hooks_mod = @import("../hooks.zig");
 const compaction_mod = @import("../compaction.zig");
 const executions_mod = @import("../executions.zig");
@@ -480,6 +481,9 @@ pub const SessionRuntime = struct {
             } }) catch {};
         }
         child_models.aliases = alias_models.items;
+        // Advisory memory (E-05a): opened once per turn from the current
+        // config; null while `memory.adapter` is "none".
+        const memory_handle = memory_mod.open(arena, io, cwd, self.process_environ, memory_mod.settingsFrom(cfg), self.mcp_registry);
         var host = subagent_mod.Host{
             .io = io,
             .workspace = cwd,
@@ -524,6 +528,7 @@ pub const SessionRuntime = struct {
             },
             .session_hint = self.store.manifest.id,
             .mcp = self.mcp_registry,
+            .memory = memory_handle,
         };
         var tool_ctx = tool_mod.ToolContext{
             .io = io,
@@ -545,6 +550,10 @@ pub const SessionRuntime = struct {
             .mcp_call_fn = mcpCallHook,
             .mcp_describe_fn = mcpDescribeHook,
             .mcp_ctx = self.mcp_registry orelse mcp_registry_sentinel,
+            .memory_recall_fn = if (memory_handle != null) memory_mod.recallHook else null,
+            .memory_remember_fn = if (memory_handle != null) memory_mod.rememberHook else null,
+            .memory_forget_fn = if (memory_handle != null) memory_mod.forgetHook else null,
+            .memory_ctx = memory_handle,
             .skill_load_fn = skillLoadHook,
             .skill_ctx = self,
             .exec_start_fn = execStartHook,

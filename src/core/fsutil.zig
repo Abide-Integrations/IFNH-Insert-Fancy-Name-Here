@@ -46,6 +46,23 @@ pub fn atomicWriteFilePerm(
     try dir.rename(tmp_path, dir, sub_path, io);
 }
 
+/// `2026-11-03T12:00:00Z` for `secs` since the Unix epoch, written into `buf`.
+pub fn isoUtc(buf: *[20]u8, secs: u64) []const u8 {
+    const es = std.time.epoch.EpochSeconds{ .secs = secs };
+    const day = es.getEpochDay().calculateYearDay();
+    const md = day.calculateMonthDay();
+    const ds = es.getDaySeconds();
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+        day.year,             md.month.numeric(),      md.day_index + 1,
+        ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
+    }) catch unreachable;
+}
+
+/// Current wall-clock time in seconds since the Unix epoch.
+pub fn nowSecs(io: std.Io) u64 {
+    return @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_s));
+}
+
 pub fn fileExists(dir: std.Io.Dir, io: std.Io, sub_path: []const u8) bool {
     dir.access(io, sub_path, .{}) catch return false;
     return true;
@@ -113,4 +130,10 @@ test "ensureDirPath creates nested directories" {
     try ensureDirPath(tmp.dir, io, "a/b/c");
     try std.testing.expect(fileExists(tmp.dir, io, "a/b/c"));
     try ensureDirPath(tmp.dir, io, "a/b/c"); // idempotent
+}
+
+test "isoUtc formats epoch seconds" {
+    var buf: [20]u8 = undefined;
+    try std.testing.expectEqualStrings("1970-01-01T00:00:00Z", isoUtc(&buf, 0));
+    try std.testing.expectEqualStrings("2026-11-03T12:34:56Z", isoUtc(&buf, 1793709296));
 }

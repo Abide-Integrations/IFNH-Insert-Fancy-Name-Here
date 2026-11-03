@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const config_mod = @import("../core/config/config.zig");
+const memory_mod = @import("../core/memory.zig");
 
 pub const LogLevel = enum { err, info, debug, trace };
 
@@ -77,6 +78,8 @@ pub const Subcommand = enum {
     replay,
     /// `ifnh ask "<prompt>"`: headless one-shot turn (C-02).
     ask,
+    /// `ifnh memory <list|purge>` (E-05a).
+    memory,
     unknown,
 };
 
@@ -218,6 +221,8 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
         .replay
     else if (std.mem.eql(u8, cmd_name, "ask"))
         .ask
+    else if (std.mem.eql(u8, cmd_name, "memory"))
+        .memory
     else
         .unknown;
 
@@ -294,6 +299,40 @@ pub fn parseAsk(args: []const []const u8) ParseError!AskArgs {
         @as(u8, @intFromBool(out.deny_all)) +
         @as(u8, @intFromBool(out.policy != null));
     if (approval_flags > 1) return error.ConflictingFlags;
+    return out;
+}
+
+pub const MemoryAction = enum { list, purge };
+
+/// `ifnh memory` arguments. Pure data: `main` owns the I/O.
+pub const MemoryArgs = struct {
+    action: MemoryAction,
+    /// `--scope`; null means `memory.scope` from config.
+    scope: ?memory_mod.Scope = null,
+    json: bool = false,
+    yes: bool = false,
+};
+
+/// Parse `list [--scope project|user] [--json]` or
+/// `purge [--scope project|user] [--yes]`.
+pub fn parseMemory(args: []const []const u8) ParseError!MemoryArgs {
+    if (args.len == 0) return error.MissingFlagValue;
+    var out = MemoryArgs{ .action = std.meta.stringToEnum(MemoryAction, args[0]) orelse return error.UnknownFlag };
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--scope")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            out.scope = std.meta.stringToEnum(memory_mod.Scope, args[i]) orelse return error.InvalidFlagValue;
+        } else if (std.mem.eql(u8, arg, "--json") and out.action == .list) {
+            out.json = true;
+        } else if (std.mem.eql(u8, arg, "--yes") and out.action == .purge) {
+            out.yes = true;
+        } else {
+            return error.UnknownFlag;
+        }
+    }
     return out;
 }
 
@@ -487,4 +526,24 @@ test "cli trace flag takes a path before the subcommand" {
     try std.testing.expectError(error.MissingFlagValue, parse(&.{"--trace"}));
     try std.testing.expectEqual(Subcommand.replay, (try parse(&.{ "replay", "f" })).subcommand);
     try std.testing.expectEqual(Subcommand.@"debug-bundle", (try parse(&.{"debug-bundle"})).subcommand);
+}
+
+test "parse memory list and purge" {
+    const p = try parse(&.{ "memory", "list", "--scope", "user", "--json" });
+    try std.testing.expectEqual(Subcommand.memory, p.subcommand);
+    const list = try parseMemory(p.args);
+    try std.testing.expectEqual(MemoryAction.list, list.action);
+    try std.testing.expectEqual(@as(?memory_mod.Scope, .user), list.scope);
+    try std.testing.expect(list.json and !list.yes);
+
+    const purge = try parseMemory(&.{ "purge", "--yes" });
+    try std.testing.expectEqual(MemoryAction.purge, purge.action);
+    try std.testing.expect(purge.yes and purge.scope == null);
+
+    try std.testing.expectError(error.MissingFlagValue, parseMemory(&.{}));
+    try std.testing.expectError(error.UnknownFlag, parseMemory(&.{"wipe"}));
+    try std.testing.expectError(error.UnknownFlag, parseMemory(&.{ "list", "--yes" }));
+    try std.testing.expectError(error.UnknownFlag, parseMemory(&.{ "purge", "--json" }));
+    try std.testing.expectError(error.InvalidFlagValue, parseMemory(&.{ "list", "--scope", "team" }));
+    try std.testing.expectError(error.MissingFlagValue, parseMemory(&.{ "list", "--scope" }));
 }

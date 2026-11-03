@@ -14,6 +14,7 @@
 const std = @import("std");
 const core_types = @import("../types.zig");
 const provider_mod = @import("../../providers/provider.zig");
+const memory_mod = @import("../memory.zig");
 const agent_engine = @import("engine.zig");
 const tool_mod = @import("../../tools/tool.zig");
 const engine_mod = @import("../permissions/engine.zig");
@@ -145,6 +146,10 @@ pub const Host = struct {
     /// The parent's MCP registry (borrowed). A child never uses it directly:
     /// it gets its own `forAgent` view with no live clients (E-03).
     mcp: ?*const mcp_mod.Registry = null,
+    /// The parent's open memory adapter (`memory.Handle`); children share it
+    /// rather than opening their own. Research and review children only get
+    /// `memory_recall`; they are read-only.
+    memory: ?*memory_mod.Handle = null,
 };
 
 fn rolePreamble(arena: std.mem.Allocator, role: Role, label: []const u8) ![]const u8 {
@@ -321,6 +326,10 @@ fn runChild(
         .mcp_call_fn = if (child_mcp != null) mcp_mod.callHook else null,
         .mcp_describe_fn = if (child_mcp != null) mcp_mod.describeHook else null,
         .mcp_ctx = if (child_mcp) |*reg| reg else null,
+        .memory_recall_fn = if (host.memory != null) memory_mod.recallHook else null,
+        .memory_remember_fn = if (host.memory != null and role == .implement) memory_mod.rememberHook else null,
+        .memory_forget_fn = if (host.memory != null and role == .implement) memory_mod.forgetHook else null,
+        .memory_ctx = host.memory,
     };
 
     var history: std.ArrayListUnmanaged(core_types.ChatMessage) = .empty;

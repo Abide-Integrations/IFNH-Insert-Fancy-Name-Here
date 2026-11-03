@@ -26,6 +26,7 @@ const tool_mod = @import("../tools/tool.zig");
 const openai = @import("../providers/openai.zig");
 const resolve_mod = @import("../core/config/resolve.zig");
 const image_mod = @import("../core/image.zig");
+const memory_mod = @import("../core/memory.zig");
 const trace_mod = @import("../core/trace.zig");
 const wire_log = @import("../core/wire_log.zig");
 const turn_cache_mod = @import("../core/turn_cache.zig");
@@ -930,7 +931,7 @@ pub const commands = [_][]const u8{
     "help",      "quit",      "model", "config",  "context",  "undo",
     "redo",      "diff",      "plan",  "agents",  "mcp",      "exec",
     "review",    "reconcile", "usage", "compact", "sessions", "provider",
-    "lifecycle", "skills",    "image",
+    "lifecycle", "skills",    "image", "memory",
 };
 
 fn handleCommand(
@@ -971,6 +972,7 @@ fn handleCommand(
             \\  /image <path>         attach a png/jpg/gif/webp to the next message
             \\  /image [clear]        show the queued count / empty the queue
             \\  /sessions             list sessions (use `ifnh resume <id>`)
+            \\  /memory [purge]       memory scope, entry count and newest notes; purge deletes them
             \\
         , .{}) catch {};
     } else if (std.mem.eql(u8, cmd, "image")) {
@@ -1336,6 +1338,8 @@ fn handleCommand(
                 out(io, "  [{s}] {s}: {s}\n", .{ s.scope, s.name, s.description }) catch {};
             }
         } else out(io, "skills unavailable\n", .{}) catch {};
+    } else if (std.mem.eql(u8, cmd, "memory")) {
+        memoryCommand(io, arena, cwd, rt, events, cfg, rest);
     } else if (std.mem.eql(u8, cmd, "mcp")) {
         if (rt.mcp_registry) |reg| {
             if (reg.all_configs.len == 0) {
@@ -1387,6 +1391,75 @@ fn handleCommand(
 /// Disk-backed slash command (D030, M0-T37): `.ifnh/commands/<name>.md`
 /// with optional frontmatter; `$ARGS` in the body is replaced by the
 /// command arguments. The body is submitted as the user's prompt.
+/// `/memory` and `/memory purge` (E-05a, DECISIONS Q229/Q230). Purge asks
+/// through the same approval path as tool calls.
+fn memoryCommand(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    cwd: std.Io.Dir,
+    rt: *session_runtime.SessionRuntime,
+    events: *const session_runtime.Events,
+    cfg: *config_mod.Store,
+    rest: []const u8,
+) void {
+    const settings = memory_mod.settingsFrom(cfg);
+    if (settings.kind == .none) {
+        out(io, "memory is off (memory.adapter)\n", .{}) catch {};
+        return;
+    }
+    const purge = std.mem.eql(u8, rest, "purge");
+    if (rest.len > 0 and !purge) {
+        out(io, "usage: /memory [purge]\n", .{}) catch {};
+        return;
+    }
+    const handle = memory_mod.open(arena, io, cwd, rt.process_environ, settings, rt.mcp_registry) orelse {
+        out(io, "memory unavailable (out of memory)\n", .{}) catch {};
+        return;
+    };
+    const scope = @tagName(settings.scope);
+    var diag = memory_mod.Diag{};
+
+    if (purge) {
+        const resp = events.on_approval(events.ctx, .{
+            .tool = "memory",
+            .title = "purge memory",
+            .detail = std.fmt.allocPrint(arena, "delete every {s} memory note", .{scope}) catch scope,
+        });
+        if (resp == .denied) {
+            out(io, "cancelled\n", .{}) catch {};
+            return;
+        }
+        const res = handle.adapter.forget(arena, io, &diag, settings.scope, null) catch |err| {
+            out(io, "error: {s}\n", .{if (diag.message.len > 0) diag.message else @errorName(err)}) catch {};
+            return;
+        };
+        if (res.text) |t| {
+            out(io, "{s}\n", .{t}) catch {};
+        } else {
+            out(io, "purged {d} {s} (scope {s})\n", .{ res.count, if (res.count == 1) "entry" else "entries", scope }) catch {};
+        }
+        return;
+    }
+
+    const res = handle.adapter.recall(arena, io, &diag, "", settings.scope, .{ .max_snippets = 100_000, .max_bytes = 64 * 1024 * 1024 }) catch |err| {
+        out(io, "error: {s}\n", .{if (diag.message.len > 0) diag.message else @errorName(err)}) catch {};
+        return;
+    };
+    if (res.text) |t| {
+        out(io, "memory: scope {s} (adapter {s})\n{s}\n", .{ scope, @tagName(settings.kind), t }) catch {};
+        return;
+    }
+    out(io, "memory: scope {s}, {d} {s}\n", .{ scope, res.snippets.len, if (res.snippets.len == 1) "entry" else "entries" }) catch {};
+    for (res.snippets[0..@min(res.snippets.len, 5)]) |s| {
+        const line = arena.dupe(u8, if (s.text.len > 100) s.text[0..100] else s.text) catch continue;
+        for (line) |*c| {
+            if (c.* == '\n' or c.* == '\r') c.* = ' ';
+        }
+        out(io, "  {s} ({s}): {s}\n", .{ s.id, s.ts, line }) catch {};
+    }
+    if (res.skipped > 0) out(io, "  ({d} malformed line(s) skipped)\n", .{res.skipped}) catch {};
+}
+
 fn loadDiskCommand(io: std.Io, arena: std.mem.Allocator, cwd: std.Io.Dir, cmd: []const u8, args: []const u8) ?[]const u8 {
     var name_buf: [128]u8 = undefined;
     if (cmd.len == 0 or cmd.len > 64) return null;

@@ -173,6 +173,7 @@ is not a terminal or `TERM` is `dumb`: then nothing at all is written.
 | `/agents` | subagent reports |
 | `/skills` | installed skills |
 | `/mcp` | MCP servers/tools |
+| `/memory` | memory scope, entry count and the newest notes (`/memory purge` deletes them, after approval) |
 | `/exec` | background executions |
 | `/usage` | session token and dollar totals, with the budget and a per-model line when several models were used |
 | `/compact` | force context compaction |
@@ -498,6 +499,8 @@ recorded in the session log.
 - **`bash` with `background: true`** — long commands return an execution
   handle; poll with the `exec` tool or `/exec` (status/output/stop).
 - **`skill`** — load installed skills (see below).
+- **`memory_recall` / `memory_remember` / `memory_forget`** — only when
+  `memory.adapter` is not `none` (see Memory).
 - **`mcp_list` / `mcp_describe` / `mcp_call`** — MCP servers (see below).
 - **`read_tool_result`** — page through oversized outputs stored as
   artifacts.
@@ -612,7 +615,46 @@ The agent sees a budgeted catalog each turn and loads bodies with the
 `skill` tool. First-party examples ship in this repo under `skills/`
 (reconnaissance, create-skill) — copy them into a skills directory to use.
 
-## 10. Hooks
+## 10. Memory
+
+Optional, advisory notes that survive between sessions. **Off by default**
+(`memory.adapter: "none"`): nothing is stored, no tool is advertised.
+
+```jsonc
+{ "memory": { "adapter": "file",      // "none" | "file" | "mcp"
+              "scope": "project" } }  // "project" | "user"
+```
+
+- **What gets stored:** only what the model saves with an explicit
+  `memory_remember` call (a text of at most 4096 bytes, approved like any
+  other write; `permissions` MCP rules apply as `memory.remember` and
+  `memory.forget`). Entries are never added to the prompt automatically; the
+  model reads them by calling `memory_recall`, and treats them as hints, not
+  instructions (DECISIONS Q231). `memory_forget` deletes one note by id, or
+  the whole scope without an id.
+- **`file` adapter:** JSONL, one `{"id","ts","scope","text","source"}` object
+  per line, in `.ifnh/memory/project.jsonl` (project scope; commit it or add
+  it to `.ifnh/.gitignore`, as you prefer) or `<config dir>/memory/user.jsonl`
+  (user scope). Recall is a case-insensitive substring match, newest first,
+  at most 8 notes and 4 KiB per call; malformed lines are skipped and
+  reported.
+- **`mcp` adapter:** `{"adapter": "mcp", "server": "honcho"}` forwards to an
+  entry of `mcp_servers`, calling the server's `memory_recall`,
+  `memory_remember` and `memory_forget` tools with `{query, scope, limit}`,
+  `{text, scope}` and `{scope, id}`. Rename them with
+  `"tools": {"recall": "...", "remember": "...", "forget": "..."}`. A missing
+  server or tool is reported as an error; the server's text reply is passed
+  through. `adapter: "mcp"` without a `server` that exists in `mcp_servers`
+  is a startup error.
+- **Inspect and clear:** `ifnh memory list [--scope project|user] [--json]`
+  prints one line per note; `ifnh memory purge [--scope ...] [--yes]` deletes
+  them (without `--yes` it asks on a terminal and refuses when stdin is not
+  one). In the REPL, `/memory` and `/memory purge`. With memory off, all of
+  them print `memory is off (memory.adapter)`.
+- Subagents share the parent's adapter; `research` and `review` children get
+  `memory_recall` only.
+
+## 11. Hooks
 
 ```jsonc
 { "hooks": {
@@ -645,7 +687,7 @@ Rewrites chain through the remaining `before_tool` hooks; `after_*` hooks
 never block, whatever they print. A non-zero exit or a timeout still blocks
 `before_*` and is advisory everywhere else. Hooks never trigger hooks.
 
-## 11. Lifecycles
+## 12. Lifecycles
 
 ```jsonc
 // .ifnh/lifecycle/ship.json
@@ -663,7 +705,7 @@ Run with `/lifecycle run .ifnh/lifecycle/ship.json` (resume with
 `--from <stage-index>`). Failed reviews stop the pipeline (D008); only
 `/review override <reason>` — recorded as an audit artifact — bypasses.
 
-## 12. Observability
+## 13. Observability
 
 - `ifnh doctor` — environment health.
 - `/usage` — session token totals; per-turn records in the session dir.
@@ -699,7 +741,7 @@ Run with `/lifecycle run .ifnh/lifecycle/ship.json` (resume with
   records unchanged. Malformed input exits 2 with the line number on stderr
   and nothing on stdout.
 
-## 13. Distribution
+## 14. Distribution
 
 One-liner (after the repo is on GitHub and a tag is released):
 
@@ -739,7 +781,7 @@ the GitHub release with sha256sums. For a single machine:
 zig build -Doptimize=ReleaseSafe && scripts/install.sh
 ```
 
-## 14. Project layout inside `.ifnh/`
+## 15. Project layout inside `.ifnh/`
 
 ```
 .ifnh/
@@ -748,6 +790,7 @@ zig build -Doptimize=ReleaseSafe && scripts/install.sh
 ├── instructions/        # committed — extra project instructions
 ├── commands/            # committed — custom slash commands
 ├── skills/              # committed — project skills
+├── memory/              # advisory notes of the file memory adapter (opt-in)
 ├── lifecycle/           # committed — lifecycle definitions
 ├── tool-notes/          # committed — per-CLI guidance for agents
 ├── plans/               # plan artifacts
