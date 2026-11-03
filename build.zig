@@ -53,4 +53,44 @@ pub fn build(b: *std.Build) void {
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+
+    // libifnh (E-06b): the runtime as a static library with a C ABI. The
+    // module links libc for the exported symbols (`malloc`, `environ`); the
+    // executable does not.
+    const lib_module = b.createModule(.{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = optimize != .debug,
+        .link_libc = true,
+        .error_tracing = false,
+    });
+    lib_module.addAnonymousImport("config_schema", .{
+        .root_source_file = b.path("docs/config.schema.json"),
+    });
+    const lib = b.addLibrary(.{
+        .name = "ifnh",
+        .linkage = .static,
+        .root_module = lib_module,
+    });
+    lib.installHeader(b.path("include/ifnh.h"), "ifnh.h");
+    b.installArtifact(lib);
+    const lib_step = b.step("lib", "Build libifnh.a and install include/ifnh.h");
+    lib_step.dependOn(&b.addInstallArtifact(lib, .{}).step);
+
+    // `check` also type-checks the library (never installed, no codegen).
+    const check_lib = b.addLibrary(.{
+        .name = "ifnh",
+        .linkage = .static,
+        .root_module = lib_module,
+    });
+    check_step.dependOn(&check_lib.step);
+
+    // The library pulls in most of the tree, whose tests the main test
+    // binary already runs; by default only lib.zig's own tests run here.
+    const lib_tests = b.addTest(.{
+        .root_module = lib_module,
+        .filters = if (test_filters.len > 0) test_filters else &.{"lib.test."},
+    });
+    test_step.dependOn(&b.addRunArtifact(lib_tests).step);
 }

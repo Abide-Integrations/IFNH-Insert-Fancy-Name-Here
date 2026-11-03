@@ -80,6 +80,8 @@ pub const Subcommand = enum {
     ask,
     /// `ifnh memory <list|purge>` (E-05a).
     memory,
+    /// `ifnh serve [--framing ndjson|content-length]`: JSON-RPC 2.0 over stdio (E-06).
+    serve,
     /// Hidden: the Landlock re-exec helper (E-04). Not in `ifnh help`; it
     /// refuses to run unless the parent set `IFNH_SANDBOX_EXEC=1`.
     @"__sandbox-exec",
@@ -127,6 +129,32 @@ pub const AskArgs = struct {
         return self.image_paths[0..self.image_count];
     }
 };
+
+/// How `ifnh serve` delimits JSON-RPC messages on stdio.
+pub const Framing = enum { ndjson, content_length };
+
+/// `ifnh serve` flags.
+pub const ServeArgs = struct {
+    framing: Framing = .ndjson,
+};
+
+/// Parse `ifnh serve` arguments: only `--framing ndjson|content-length`.
+pub fn parseServe(args: []const []const u8) ParseError!ServeArgs {
+    var out = ServeArgs{};
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (!std.mem.eql(u8, args[i], "--framing")) return error.UnknownFlag;
+        i += 1;
+        if (i >= args.len) return error.MissingFlagValue;
+        out.framing = if (std.mem.eql(u8, args[i], "ndjson"))
+            .ndjson
+        else if (std.mem.eql(u8, args[i], "content-length"))
+            .content_length
+        else
+            return error.InvalidFlagValue;
+    }
+    return out;
+}
 
 /// Most images one `ask` may attach.
 pub const max_images: usize = 8;
@@ -226,6 +254,8 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
         .ask
     else if (std.mem.eql(u8, cmd_name, "memory"))
         .memory
+    else if (std.mem.eql(u8, cmd_name, "serve"))
+        .serve
     else if (std.mem.eql(u8, cmd_name, "__sandbox-exec"))
         .@"__sandbox-exec"
     else
@@ -349,6 +379,15 @@ pub fn resolveAskPrompt(global: ?[]const u8, ask: AskArgs) ?[]const u8 {
     const g = global orelse return null;
     if (std.mem.eql(u8, g, "-")) return null;
     return g;
+}
+
+test "serve flags: default ndjson, --framing selects content-length, bad values are errors" {
+    try std.testing.expectEqual(Subcommand.serve, (try parse(&.{"serve"})).subcommand);
+    try std.testing.expectEqual(Framing.ndjson, (try parseServe(&.{})).framing);
+    try std.testing.expectEqual(Framing.content_length, (try parseServe(&.{ "--framing", "content-length" })).framing);
+    try std.testing.expectError(error.InvalidFlagValue, parseServe(&.{ "--framing", "xml" }));
+    try std.testing.expectError(error.MissingFlagValue, parseServe(&.{"--framing"}));
+    try std.testing.expectError(error.UnknownFlag, parseServe(&.{"--port"}));
 }
 
 test "parse bare invocation" {

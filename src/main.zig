@@ -11,6 +11,7 @@ const cli_args = @import("cli/args.zig");
 const fsutil = @import("core/fsutil.zig");
 const repl = @import("cli/repl.zig");
 const ask_mod = @import("cli/ask.zig");
+const serve_mod = @import("cli/serve.zig");
 const session_mod = @import("core/session/store.zig");
 const config_mod = @import("core/config/config.zig");
 const config_schema = @import("core/config/schema.zig");
@@ -153,6 +154,13 @@ fn dispatch(
             });
         },
         .doctor => try runDoctor(io, arena, environ),
+        .serve => {
+            const serve_args = cli_args.parseServe(parsed.args) catch |err| {
+                try printErr(io, arena, "error: bad arguments: {s}\nusage: ifnh serve [--framing ndjson|content-length]\n", .{@errorName(err)});
+                std.process.exit(2);
+            };
+            std.process.exit(serve_mod.run(io, environ, parsed.flags, serve_args, openWire(io, arena, environ, parsed.flags)));
+        },
         .@"__sandbox-exec" => {
             var buf: [256]u8 = undefined;
             var err_writer = std.Io.File.stderr().writer(io, &buf);
@@ -1080,6 +1088,7 @@ const help_text =
     \\  resume      resume a previous session (M0)
     \\  ask         run one headless turn (prompt arg or stdin; --json NDJSON)
     \\  doctor      check environment health (M1)
+    \\  serve       JSON-RPC 2.0 over stdio (ACP): 'ifnh serve [--framing ndjson|content-length]' (E-06)
     \\  memory      'ifnh memory list [--scope project|user] [--json]' / 'purge [--scope ..] [--yes]'
     \\  debug-bundle  write a redacted JSON bundle for bug reports (D-09)
     \\  session     'ifnh session export <id> [--out <path>|-]' writes redacted NDJSON
@@ -1118,6 +1127,7 @@ test {
     _ = @import("core/image.zig");
     _ = @import("core/fsutil.zig");
     _ = @import("cli/args.zig");
+    _ = @import("cli/serve.zig");
     _ = @import("core/config/config.zig");
     _ = @import("core/config/schema.zig");
     _ = @import("core/session/store.zig");

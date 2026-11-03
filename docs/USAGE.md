@@ -882,3 +882,103 @@ The backend is resolved once when a session starts; child agents inherit it.
 A command's working directory is still the directory `ifnh` was started in.
 Landlock needs the `ifnh` executable itself, so it is not offered when
 `libifnh` is embedded in another program.
+
+## 17. Server mode (ACP)
+
+`ifnh serve` speaks JSON-RPC 2.0 on stdin/stdout so an editor or another
+program can drive the agent. The method set is the core of the
+[Agent Client Protocol](https://agentclientprotocol.com) plus one extension.
+Each session is the same runtime `ifnh ask` uses (same config, permissions,
+sandbox, tools); there is no second agent loop. Stdout carries protocol
+messages only: no ANSI, no banners. Diagnostics go to stderr. The server
+exits 0 when stdin closes.
+
+```bash
+ifnh serve                            # newline-delimited JSON (ACP default)
+ifnh serve --framing content-length   # LSP style: Content-Length: N\r\n\r\n<json>
+ifnh --profile quick --model m serve  # global flags apply to every session
+```
+
+Framing: in the default mode a message is one line (CRLF and blank lines are
+tolerated, a message may arrive split across reads). A message over 1 MiB is
+answered with `-32600` (`id: null`) and skipped; the stream continues. With
+`content-length`, both directions use the header form.
+
+| Method | Params | Result |
+|---|---|---|
+| `initialize` | `{protocolVersion: 1, clientCapabilities?}` | `{protocolVersion: 1, agentCapabilities: {loadSession: true, promptCapabilities: {image: true}}, agentInfo: {name: "ifnh", version}, authMethods: []}` |
+| `session/new` | `{cwd?, mcpServers?}` | `{sessionId}` |
+| `session/load` | `{sessionId, cwd?}` | `{sessionId}` (resumes a persisted session; history is rebuilt, not replayed as updates) |
+| `session/prompt` | `{sessionId, prompt: [content blocks]}` | `{stopReason}`: `end_turn`, `cancelled`, `max_turn_requests`, `refusal` (budget spent) |
+| `session/cancel` | notification `{sessionId}` | none; the running prompt ends with `cancelled` |
+| `session/close` | `{sessionId}` | `{}` |
+
+- `cwd` is the project directory of the session (default: the server's
+  working directory); config and `.ifnh/` state are read from it. A bad
+  directory is `-32602`. The server moves the process into it while a prompt
+  runs, so shell commands run there. Prompts run one at a time.
+- Content blocks: `text` (several are joined with `"\n"` in order),
+  `image` (`mimeType` png/jpeg/gif/webp, base64 `data`) and `resource_link`
+  (passed to the model as `[link] <uri>`). `mcpServers` from the client are
+  ignored (an `ifnh/notice` says so); configure `mcp_servers` instead.
+- Errors: `-32700` parse error, `-32600` invalid request, `-32601` unknown
+  method, `-32602` invalid params (including an unknown session), `-32603`
+  a handler failure with a one-line message (for example `no model
+  configured`).
+
+Server to client:
+
+- `session/update` notifications: `agent_message_chunk` for assistant text,
+  `tool_call` (`status: "in_progress"`, `rawInput`) when a tool starts and
+  `tool_call_update` (`completed` or `failed`, text `content`) when it ends.
+  No `agent_thought_chunk` is sent: the runtime does not surface reasoning.
+- `ifnh/notice` notifications (extension): `{sessionId, level, text}` with
+  `level` one of `info`, `warn`, `error`, `notice`. Status and notice lines
+  of the runtime (compaction, denials, the sandbox notice) arrive here.
+- `session/request_permission` requests, whenever a tool needs approval:
+  `{sessionId, toolCall, options}` (the approval comes before the tool starts, so
+  `toolCall.toolCallId` is the placeholder `approval`) with the options `allow_once`,
+  `allow_always` (this session) and `reject_once`. Answer with
+  `{outcome: {outcome: "selected", optionId}}`. Anything else (another
+  option, `cancelled`, an error, no answer within 30 s, a `session/cancel`,
+  or closed stdin) is a rejection. Other messages that arrive while waiting
+  are kept and handled afterwards. A cancel takes effect at the next point
+  the turn checks it (between streamed events), so while the provider has not
+  yet sent its first byte the prompt ends when that wait does.
+
+## 18. Embedding libifnh
+
+`zig build` (or `zig build lib`) also produces `zig-out/lib/libifnh.a` and
+`zig-out/include/ifnh.h`: the runtime as a static library with a small C ABI
+(`include/ifnh.h` documents it). The library reads no config files; the
+host passes the whole configuration as JSON over the builtin defaults, and
+API keys come from the process environment.
+
+```c
+#include "ifnh.h"
+
+static void on_event(void *user, int kind, const char *text, int status) {
+    if (kind == IFNH_EVENT_TEXT) fputs(text, stdout);
+}
+
+char *err = NULL;
+ifnh_runtime *rt = ifnh_runtime_new("/path/to/project",
+    "{\"model\":{\"provider\":\"openai\",\"model\":\"gpt-5\"}}", &err);
+if (!rt) { fprintf(stderr, "%s\n", err); ifnh_string_free(err); return 1; }
+int code = ifnh_runtime_prompt(rt, "summarize this repo", on_event, NULL, &err);
+ifnh_runtime_free(rt);
+```
+
+`ifnh_runtime_prompt` returns 0 (completed), 1 (failed or never ran, for
+example no model), 2 (cancelled), 3 (a tool was refused) or 4 (budget spent),
+with the same precedence as `ifnh ask`. Strings passed to the callback are
+copies valid for the call. There is no approval channel: tools that would ask
+are refused, so allow them in the config you pass (`permissions`). A runtime
+is single-threaded and not reentrant; shell commands run in the process
+working directory, so `chdir` to the project first. The Landlock sandbox
+backend is not available when embedded (it re-executes `ifnh`); bwrap and
+Seatbelt are. From Zig, `src/lib.zig` exposes the same thing as `Runtime`.
+
+```bash
+./tests/smoke-lib.sh    # builds, compiles a C program with `zig cc`, runs it
+```
