@@ -9,6 +9,7 @@ const std = @import("std");
 const trace_mod = @import("../trace.zig");
 const wire_log = @import("../wire_log.zig");
 const resolve_mod = @import("resolve.zig");
+const mcp_mod = @import("../mcp.zig");
 
 pub const Layer = enum {
     builtin,
@@ -441,6 +442,65 @@ pub const Store = struct {
         // Aliases, fallback chains, routing and profiles reference each
         // other by name; check the references (D44/D45/D49).
         try resolve_mod.validateConfig(self);
+        try self.validateMcpServers();
+    }
+
+    /// `mcp_servers.<name>`: exactly one of `command` (stdio) or `url` (HTTP),
+    /// well-typed `headers`/`agents`. An unknown agent identity only warns, so
+    /// a role list written for a newer build still loads.
+    fn validateMcpServers(self: *Store) !void {
+        const servers = self.get("mcp_servers") orelse return;
+        if (servers != .object) return self.addError("mcp_servers", "must be an object", .{});
+        const arena = self.alloc();
+        var it = servers.object.iterator();
+        while (it.next()) |entry| {
+            const name = entry.key_ptr.*;
+            const path = try std.fmt.allocPrint(arena, "mcp_servers.{s}", .{name});
+            if (entry.value_ptr.* != .object) {
+                try self.addError(path, "must be an object", .{});
+                continue;
+            }
+            const o = entry.value_ptr.object;
+            const has_command = o.get("command") != null;
+            const has_url = o.get("url") != null;
+            if (has_command and has_url) {
+                try self.addError(path, "set either \"command\" (stdio) or \"url\" (HTTP), not both", .{});
+            } else if (!has_command and !has_url) {
+                try self.addError(path, "needs \"command\" (stdio server) or \"url\" (HTTP server)", .{});
+            }
+            if (o.get("command")) |c| {
+                if (c != .string or c.string.len == 0) try self.addError(path, "\"command\" must be a non-empty string", .{});
+            }
+            if (o.get("url")) |u| {
+                if (u != .string or u.string.len == 0) try self.addError(path, "\"url\" must be a non-empty string", .{});
+            }
+            if (o.get("headers")) |h| {
+                var ok = h == .object;
+                if (ok) {
+                    var hit = h.object.iterator();
+                    while (hit.next()) |kv| {
+                        if (kv.value_ptr.* != .string) ok = false;
+                    }
+                }
+                if (!ok) try self.addError(path, "\"headers\" must be an object of strings", .{});
+            }
+            if (o.get("agents")) |a| {
+                if (a != .array) {
+                    try self.addError(path, "\"agents\" must be an array of strings", .{});
+                    continue;
+                }
+                for (a.array.items, 0..) |item, i| {
+                    if (item != .string) {
+                        try self.addError(path, "\"agents\" must be an array of strings", .{});
+                        break;
+                    }
+                    const known = for (mcp_mod.agent_identities) |id| {
+                        if (std.mem.eql(u8, id, item.string)) break true;
+                    } else false;
+                    if (!known) try self.warn("{s}.agents[{d}]: unknown agent '{s}' (parent, research, implement, review)", .{ path, i, item.string });
+                }
+            }
+        }
     }
 
     /// Merge `profiles.<name>` into the live tree at the CLI layer and
@@ -842,6 +902,52 @@ test "model.provider accepts the three adapters and names them on error" {
     try bad.validate();
     try std.testing.expectEqual(@as(usize, 1), bad.errors.items.len);
     try std.testing.expectEqualStrings("must be \"openai\", \"anthropic\" or \"openai-responses\", got \"gemini\"", bad.errors.items[0].message);
+}
+
+fn mcpStore(json: []const u8) !Store {
+    var store = try Store.init(std.testing.allocator);
+    errdefer store.deinit();
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, store.alloc(), json, .{});
+    try store.mergeValue(v, .{ .layer = .project, .origin = "test" });
+    try store.validate();
+    return store;
+}
+
+test "mcp_servers: command xor url, naming the server" {
+    var both = try mcpStore("{\"mcp_servers\":{\"remote\":{\"command\":\"x\",\"url\":\"http://h/mcp\"}}}");
+    defer both.deinit();
+    try std.testing.expectEqual(@as(usize, 1), both.errors.items.len);
+    try std.testing.expectEqualStrings("mcp_servers.remote", both.errors.items[0].path);
+    try std.testing.expect(std.mem.indexOf(u8, both.errors.items[0].message, "not both") != null);
+
+    var neither = try mcpStore("{\"mcp_servers\":{\"empty\":{\"args\":[]}}}");
+    defer neither.deinit();
+    try std.testing.expectEqual(@as(usize, 1), neither.errors.items.len);
+    try std.testing.expectEqualStrings("mcp_servers.empty", neither.errors.items[0].path);
+
+    var ok = try mcpStore(
+        \\{"mcp_servers":{"a":{"command":"x"},"b":{"url":"http://h/mcp","headers":{"Authorization":"Bearer t"},"agents":["parent","research"]}}}
+    );
+    defer ok.deinit();
+    try std.testing.expectEqual(@as(usize, 0), ok.errors.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ok.warnings.items.len);
+
+    var bad_types = try mcpStore(
+        \\{"mcp_servers":{"b":{"url":"http://h","headers":{"A":1},"agents":"parent"}}}
+    );
+    defer bad_types.deinit();
+    try std.testing.expectEqual(@as(usize, 2), bad_types.errors.items.len);
+}
+
+test "mcp_servers: an unknown agent identity warns but does not fail" {
+    var store = try mcpStore("{\"mcp_servers\":{\"s\":{\"command\":\"x\",\"agents\":[\"research\",\"planner\"]}}}");
+    defer store.deinit();
+    try std.testing.expectEqual(@as(usize, 0), store.errors.items.len);
+    try std.testing.expectEqual(@as(usize, 1), store.warnings.items.len);
+    try std.testing.expectEqualStrings(
+        "mcp_servers.s.agents[1]: unknown agent 'planner' (parent, research, implement, review)",
+        store.warnings.items[0],
+    );
 }
 
 test "tools.external must be a boolean" {

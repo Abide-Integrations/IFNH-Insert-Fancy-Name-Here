@@ -520,7 +520,45 @@ mid-session policy change fails approvals closed.
 }
 ```
 
-Servers spawn lazily on first use and are killed at session end. Tool
+A server is either a local process (`command`, as above) or a remote
+Streamable HTTP endpoint (`url`); setting both, or neither, is a config error
+naming `mcp_servers.<name>`:
+
+```jsonc
+{
+  "mcp_servers": {
+    "tracker": {
+      "url": "https://mcp.example.com/mcp",
+      "headers": { "Authorization": "Bearer <token>" }   // optional
+    }
+  }
+}
+```
+
+Each request is a `POST` with `Accept: application/json, text/event-stream`;
+the reply may be plain JSON or an event stream (read until the response to
+that request). The `Mcp-Session-Id` from `initialize` is sent on every later
+request, with `MCP-Protocol-Version: 2024-11-05`, and a `DELETE` with it ends
+the session at shutdown (best effort). `headers` values are plain config:
+keep tokens out of a committed `.ifnh/config.json`.
+
+`agents` limits a server to some agent identities: `parent` is the
+top-level agent, and a subagent is its role (`research`, `implement`,
+`review`). Absent or empty means every agent. A server that is not enabled
+for an agent is never started for it and behaves as if it did not exist
+(`mcp_list` says `no MCP servers for agent '<name>'` when none is left; a
+call gets `error: mcp server '<name>' is not enabled for agent '<agent>'`).
+An unknown identity only produces a config warning, so a role list stays
+forward-compatible.
+
+```jsonc
+{ "mcp_servers": { "docs": { "command": "docs-mcp", "agents": ["parent", "research"] } } }
+```
+
+Subagents inherit MCP through the same allowlist; each child starts its own
+connections, which end when the child finishes.
+
+Stdio servers spawn lazily on first use and are killed at session end. Tool
 calls pass the permission engine (`mcp.<server>.<tool>`, default ask).
 Inspect with `/mcp`; the agent uses `mcp_list`/`mcp_describe`/`mcp_call`.
 `mcp_describe(server, tool)` returns that tool's description and its input

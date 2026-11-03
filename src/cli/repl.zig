@@ -1337,11 +1337,11 @@ fn handleCommand(
         } else out(io, "skills unavailable\n", .{}) catch {};
     } else if (std.mem.eql(u8, cmd, "mcp")) {
         if (rt.mcp_registry) |reg| {
-            if (reg.configs.len == 0) {
+            if (reg.all_configs.len == 0) {
                 out(io, "no MCP servers configured (mcp_servers in config)\n", .{}) catch {};
             }
             for (reg.configs) |c| {
-                out(io, "  {s}: {s}\n", .{ c.name, c.command }) catch {};
+                out(io, "  {s}: {s}\n", .{ c.name, if (c.url.len > 0) c.url else c.command }) catch {};
             }
             out(io, "{s}", .{rt.mcpListText(arena)}) catch {};
         } else out(io, "MCP not available\n", .{}) catch {};

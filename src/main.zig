@@ -671,9 +671,9 @@ fn doctorReport(io: std.Io, arena: std.mem.Allocator, environ: *const std.proces
 
     // MCP.
     const mcp_mod = @import("core/mcp.zig");
-    var reg = try mcp_mod.Registry.init(io, arena, cfg.get("mcp_servers"));
+    var reg = try mcp_mod.Registry.init(io, arena, cfg.get("mcp_servers"), "parent");
     defer reg.deinit();
-    try w.print("  mcp: {d} servers configured\n", .{reg.configs.len});
+    try w.print("  mcp: {d} servers configured\n", .{reg.all_configs.len});
 
     // Hooks (D-07).
     const hooks_mod = @import("core/hooks.zig");

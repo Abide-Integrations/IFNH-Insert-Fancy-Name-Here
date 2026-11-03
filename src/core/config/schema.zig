@@ -139,3 +139,25 @@ test "config schema allows only the modes validation allows" {
     try std.testing.expect(saw_ask and saw_auto);
     try std.testing.expectEqual(@as(usize, 2), allowed.items.len);
 }
+
+test "config schema covers the providers and the MCP server keys the loader reads" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), json_schema, .{});
+
+    const providers = nodeAt(schema, "model.provider").?.object.get("enum").?.array;
+    for ([_][]const u8{ "openai", "anthropic", "openai-responses" }) |name| {
+        var found = false;
+        for (providers.items) |item| {
+            if (std.mem.eql(u8, item.string, name)) found = true;
+        }
+        try std.testing.expect(found);
+    }
+    try std.testing.expectEqual(@as(usize, 3), providers.items.len);
+
+    const server = nodeAt(schema, "mcp_servers").?.object.get("additionalProperties").?;
+    const props = server.object.get("properties").?.object;
+    for ([_][]const u8{ "command", "args", "env", "required", "url", "headers", "agents" }) |key| {
+        try std.testing.expect(props.get(key) != null);
+    }
+}

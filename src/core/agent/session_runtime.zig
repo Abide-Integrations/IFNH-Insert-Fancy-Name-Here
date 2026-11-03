@@ -225,7 +225,7 @@ pub const SessionRuntime = struct {
         // ---- MCP registry (lazy servers, J137/138) ----
         self.mcp_registry = blk: {
             const reg = arena.create(mcp_mod.Registry) catch break :blk null;
-            reg.* = mcp_mod.Registry.init(io, arena, cfg.get("mcp_servers")) catch break :blk null;
+            reg.* = mcp_mod.Registry.init(io, arena, cfg.get("mcp_servers"), "parent") catch break :blk null;
             break :blk reg;
         };
 
@@ -522,6 +522,7 @@ pub const SessionRuntime = struct {
                 break :blk root;
             },
             .session_hint = self.store.manifest.id,
+            .mcp = self.mcp_registry,
         };
         var tool_ctx = tool_mod.ToolContext{
             .io = io,
@@ -848,33 +849,21 @@ fn redactionsFor(arena: std.mem.Allocator, enabled: bool, api_key: []const u8) [
 
 const mcp_registry_sentinel: *mcp_mod.Registry = @ptrFromInt(@alignOf(usize)); // never dereferenced
 
+// The hooks themselves live in `mcp.zig` (children use them too); these
+// only turn "no registry" into the same answers as before.
 fn mcpListHook(ctx: *anyopaque, arena: std.mem.Allocator) []const u8 {
-    const reg: *mcp_mod.Registry = @ptrCast(@alignCast(ctx));
-    if (reg == mcp_registry_sentinel or reg.configs.len == 0) return "no MCP servers configured";
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    for (reg.allTools(arena)) |st| {
-        buf.print(arena, "{s}.{s}: {s}\n", .{ st.server, st.tool.name, st.tool.description }) catch {};
-    }
-    if (buf.items.len == 0) return "no MCP tools available";
-    return buf.items;
+    if (ctx == @as(*anyopaque, mcp_registry_sentinel)) return "no MCP servers configured";
+    return mcp_mod.listHook(ctx, arena);
 }
 
 fn mcpDescribeHook(ctx: *anyopaque, arena: std.mem.Allocator, server: []const u8, tool: []const u8) []const u8 {
-    const reg: *mcp_mod.Registry = @ptrCast(@alignCast(ctx));
-    if (reg == mcp_registry_sentinel or reg.configs.len == 0) return "error: no MCP servers configured";
-    return reg.describeText(arena, server, tool);
+    if (ctx == @as(*anyopaque, mcp_registry_sentinel)) return "error: no MCP servers configured";
+    return mcp_mod.describeHook(ctx, arena, server, tool);
 }
 
 fn mcpCallHook(ctx: *anyopaque, arena: std.mem.Allocator, server: []const u8, tool: []const u8, arguments_json: []const u8) []const u8 {
-    const reg: *mcp_mod.Registry = @ptrCast(@alignCast(ctx));
-    if (reg == mcp_registry_sentinel) return "error: MCP not configured";
-    const res = reg.call(arena, server, tool, arguments_json) catch |err| {
-        return std.fmt.allocPrint(arena, "error: mcp call failed: {s}", .{@errorName(err)}) catch "error: mcp call failed";
-    };
-    if (res.is_error) {
-        return std.fmt.allocPrint(arena, "mcp error: {s}", .{res.text}) catch res.text;
-    }
-    return res.text;
+    if (ctx == @as(*anyopaque, mcp_registry_sentinel)) return "error: MCP not configured";
+    return mcp_mod.callHook(ctx, arena, server, tool, arguments_json);
 }
 
 fn execStartHook(ctx: *anyopaque, arena: std.mem.Allocator, command: []const u8) []const u8 {
