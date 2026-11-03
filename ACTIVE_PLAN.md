@@ -10,7 +10,7 @@
 
 **Who runs what.** The agent writes code and colocated tests and never runs `zig` (the agent's Mac has no toolchain). The owner runs every build/test on their **Linux test host** (clone at `/opt/ifnh`; keep runs cheap) and reports the result. A task only becomes `[x]` on the owner's confirmation.
 
-**Test-host requirements (learned 2026-09-18).** The project needs **Zig 0.16.0 exactly** (`build.zig.zon` `minimum_zig_version`; the code uses `std.Io`, `std.testing.io`, `std.mem.trimEnd`, which do not exist in 0.14). The host's distro package is Zig 0.14 (`/usr/lib/zig0.14`), which fails with 60 unrelated compile errors. Before reporting results: `zig version` must print `0.16.0`, and `git pull` must have fetched the commit under test (`git log -1`).
+**Test-host requirements (learned 2026-09-18).** The project needs **Zig 0.17.x** (`build.zig.zon` `minimum_zig_version` is 0.17.0; since E-07 the tree no longer compiles on 0.16, and it never did on 0.14: it uses `std.Io`, `std.testing.io`, `std.mem.trimEnd`). The host's distro package is Zig 0.14 (`/usr/lib/zig0.14`), which fails with 60 unrelated compile errors. Before reporting results: `zig version` must print `0.17.1` (or another 0.17.x), and `git pull` must have fetched the commit under test (`git log -1`).
 
 **Status legend**
 
@@ -43,9 +43,11 @@ Heavy checks (ReleaseSafe, size/startup budgets, kill-9, bench) run in CI: `gh r
 
 ## Current focus
 
-1. **Owner: W-06** (install Zig 0.16.0 on the test host, `git pull`), then verify W-01, W-02, A-01 (commands in their Verify cells).
-2. **A-02** — Anthropic tool wire format: `[?]` awaiting owner verification (owner-run tests in the Verify cell).
-3. **W-04 / W-05** — golden-wire tests and config-key coverage.
+*(rewritten 2026-11-03; the earlier list named W-06/A-02 from September.)*
+
+1. **Owner: verify Phase E.** Every E row is `[?]`: E-01 and E-03 (PR #41), E-02 and E-05 (PR #42), and E-04, E-06, E-07, E-08, E-09 (the draft PR from the Phase E card). Commands and counts are in each Verify cell. E-09 is only proven by a real run: dispatch the `macos` workflow and `gh run watch` it.
+2. **Owner: re-verify the September `[!]` rows (W-06, W-01, W-02, A-01).** They were blocked by a Zig 0.14 host and a stale clone; the toolchain is now **Zig 0.17.1** (E-07) and the gates run green, so those marks are stale. Install 0.17.1 (`zig version` must print `0.17.x`), pull, and re-run the Verify cells.
+3. **Still open:** C-07 `[ ]`; Phase F (distribution) is untouched; the E rows list their residuals (for example Landlock cannot deny UDP, ACP session replay on `session/load`, `engine` test `read-only batch preserves call order...` is timing-flaky and fails on a clean 0.17 checkout about one run in six).
 
 ---
 
@@ -53,7 +55,7 @@ Heavy checks (ReleaseSafe, size/startup budgets, kill-9, bench) run in CI: `gh r
 
 | ID | Task | Status | Verify | Notes |
 |---|---|---|---|---|
-| W-06 | **Test host has Zig 0.16.0** and a current clone (owner action) | `[ ]` | `zig version` prints `0.16.0`; `git -C /opt/ifnh log -1 --oneline` shows `e88af60` or later | Blocks verification of everything below. Distro package is 0.14; use the official tarball from ziglang.org/download (put it first on PATH), or a version manager |
+| W-06 | **Test host has Zig 0.17.x** (was 0.16.0 until E-07) and a current clone (owner action) | `[ ]` | `zig version` prints `0.17.1`; `git -C /opt/ifnh log -1 --oneline` shows `e88af60` or later | Blocks verification of everything below. Distro package is 0.14; use the official tarball from ziglang.org/download (put it first on PATH), or a version manager |
 | W-01 | `zig build check` step: compile with no codegen | `[!]` blocked by W-06 (first run invalid: Zig 0.14, stale clone) | `zig build check` (expect: exits 0, no `zig-out/bin/ifnh` produced/updated); `zig build --help` lists `check` | `build.zig`: second `addExecutable` on the same module, never installed, so no bin is requested. If 0.16 rejects the API, paste the error |
 | W-02 | `-Dtest-filter=<substr>` build option wired to test step `filters` | `[!]` blocked by W-06 (first run invalid: stale clone had no such option) | `zig build test -Dtest-filter=runTurn` (expect: only the engine `runTurn` tests run); `zig build test` still runs everything | `build.zig`: `b.option([]const []const u8, "test-filter", ...)` -> `.filters`. Repeatable flag. Tagging thread/subprocess tests `slow:` is still to do |
 | W-03 | AGENTS.md verification rule (owner runs toolchain) + `[?]` legend + tracker pointer | `[?]` | read AGENTS.md | landed 2026-09-18 with this file |

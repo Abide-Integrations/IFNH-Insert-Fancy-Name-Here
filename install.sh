@@ -1,6 +1,6 @@
 #!/bin/sh
 # IFNH installer — curl-pipe friendly:
-#   curl -fsSL https://raw.githubusercontent.com/<org>/<repo>/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/Abide-Integrations/IFNH-Insert-Fancy-Name-Here/main/install.sh | sh
 # Env overrides:
 #   IFNH_REPO=<org>/<repo>   GitHub repo (see CHANGE ME below)
 #   IFNH_PREFIX=<dir>        install dir (default ~/.local/bin)
