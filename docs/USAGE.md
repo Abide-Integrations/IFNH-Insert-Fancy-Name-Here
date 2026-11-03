@@ -843,3 +843,42 @@ zig build -Doptimize=ReleaseSafe && scripts/install.sh
 ├── cache/               # artifacts, background-execution logs (gitignored)
 └── .gitignore           # written by IFNH
 ```
+
+## 16. Sandbox
+
+An OS sandbox for the commands the **model** issues: the `bash` tool
+(including `background: true`), data-defined custom tools and anything a
+child agent runs. It never wraps the REPL's `!cmd` (you typed it) or the
+`git` tool. It is best effort and off by default; the permission engine
+still decides what may run, the sandbox limits what a permitted command can
+touch.
+
+```json
+{ "sandbox": { "mode": "auto", "network": false, "write_extra": ["../shared-cache"] } }
+```
+
+- `sandbox.mode`: `"off"` (default; behaviour is byte-identical to no
+  sandbox), `"auto"` (use the first available backend; if there is none, run
+  unsandboxed and print `sandbox backend unavailable; running unsandboxed`
+  once per session), `"required"` (no backend means the tool call fails with
+  `sandbox unavailable: <reason>`; nothing runs unsandboxed).
+- `sandbox.network`: default `false`. Allow network access inside the
+  sandbox.
+- `sandbox.write_extra`: paths (absolute, or relative to the workspace)
+  that may be written in addition to the workspace, the temp dir (`$TMPDIR`,
+  else `/tmp`) and `/dev/null`. They must exist for bwrap and Landlock.
+
+Everything is readable; writes outside those places fail with a permission
+error. Backends, in order of preference:
+
+| Platform | Backend | Notes |
+|---|---|---|
+| Linux | `bwrap` (bubblewrap) | Read-only bind of `/`, fresh `/dev`, `/proc`, `/tmp`, PID/IPC/UTS namespaces, `--unshare-net` unless `network`. It is used only if it actually starts (it is test-run once per session). The user namespace is not unshared: that breaks hosts where bwrap is setuid or the namespace is already owned. |
+| Linux | Landlock | Kernel 5.13+. The command runs under `ifnh __sandbox-exec`, a hidden helper that restricts itself (write access only below the allowed paths) and then `exec`s the shell; it refuses to start unless the parent set `IFNH_SANDBOX_EXEC=1`, and any failure exits 126 with `sandbox: <errno>` instead of running open. Denying the network needs ABI 4 (kernel 6.7+), and only covers TCP bind/connect: on an older kernel the filesystem is still scoped but `network: false` cannot be enforced; UDP and unix sockets are not covered. |
+| macOS | Seatbelt | `/usr/bin/sandbox-exec` with a generated profile (`deny default`, reads allowed, writes to the paths above plus `/private/tmp` and `/private/var/tmp`). Paths containing a newline or `)` are refused. |
+
+`ifnh doctor` prints the result: `sandbox: landlock (mode=auto, network=off)`.
+The backend is resolved once when a session starts; child agents inherit it.
+A command's working directory is still the directory `ifnh` was started in.
+Landlock needs the `ifnh` executable itself, so it is not offered when
+`libifnh` is embedded in another program.

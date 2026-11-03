@@ -37,6 +37,7 @@ const turn_cache_mod = @import("../turn_cache.zig");
 const budget_mod = @import("../budget.zig");
 const local_grants = @import("../permissions/local_grants.zig");
 const pricing = @import("../../providers/pricing.zig");
+const sandbox_mod = @import("../sandbox.zig");
 
 /// Severity of an informational status line. The caller picks the styling.
 pub const Level = enum { plain, warn, err };
@@ -74,6 +75,10 @@ pub const InitOptions = struct {
     profile: ?[]const u8 = null,
     /// Wire log owned by the CLI run (`--trace`, D-09).
     wire: ?*wire_log.WireLog = null,
+    /// Executable re-run as the Landlock helper. Null resolves the running
+    /// program; "" means the host is not `ifnh` (embedding), so Landlock is
+    /// unavailable.
+    sandbox_exe: ?[]const u8 = null,
 };
 
 /// Result of one turn. `ran` is false when the turn never reached the
@@ -138,6 +143,9 @@ pub const SessionRuntime = struct {
     profile: ?[]const u8 = null,
     /// Wire log borrowed from the CLI run (D-09).
     wire: ?*wire_log.WireLog = null,
+    /// OS sandbox for model-issued commands, resolved once here and shared
+    /// read-only with every child agent (E-04).
+    sandbox: sandbox_mod.Session = .{},
 
     /// Build a runtime: load provider keys, create or open the session
     /// store, and discover skills, background executions and MCP servers.
@@ -172,7 +180,7 @@ pub const SessionRuntime = struct {
         else
             try session_mod.Session.create(cwd, io, arena, opts.sessions_dir, opts.cwd_label);
         errdefer store.close();
-        const j = try journal_mod.Journal.open(io, arena, store.dir, cwd);
+        var j = try journal_mod.Journal.open(io, arena, store.dir, cwd);
         errdefer j.close();
 
         var self = SessionRuntime{
@@ -198,6 +206,14 @@ pub const SessionRuntime = struct {
                 "warning: ignoring {s} ({s}); fix or delete it. Project grants are not loaded and the file will not be overwritten.\n",
                 .{ local_grants.path, why },
             ) catch null,
+        }
+
+        const sandbox_settings = cfg.sandboxSettings();
+        if (sandbox_settings.mode != .off) {
+            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const workspace = try arena.dupe(u8, path_buf[0..try cwd.realPathFile(io, ".", &path_buf)]);
+            const exe = opts.sandbox_exe orelse (std.process.executablePathAlloc(io, arena) catch "");
+            self.sandbox = try sandbox_mod.Session.resolve(arena, io, process_environ, sandbox_settings, workspace, exe);
         }
 
         self.custom_tools = tool_mod.CustomToolSet.load(arena, io, cwd, cfg.getBool("tools.external", true));
@@ -437,6 +453,8 @@ pub const SessionRuntime = struct {
             statusFmt(events, .plain, "note: no api key — run /provider key {s} <value> (or export it) before sending a message\n", .{key_env});
         }
 
+        if (self.sandbox.takeNotice()) |text| events.on_notice(events.ctx, text);
+
         var total_span = trace_mod.Span.begin(self.trace, "turn.total");
         defer total_span.end("");
         var cancel = std.atomic.Value(bool).init(false);
@@ -514,6 +532,8 @@ pub const SessionRuntime = struct {
             .use_external_tools = cfg.getBool("tools.external", true),
             .custom = self.custom_tools.tools,
             .timeout_tool_s = cfg.getU32("agents.timeout_tool_s", 120),
+            .sandbox_fn = if (self.sandbox.active()) sandbox_mod.Session.wrapFn else null,
+            .sandbox_ctx = &self.sandbox,
             .journal = &self.journal,
             .approval_ctx = &gate,
             .approval_fn = Gate.approve,
@@ -566,6 +586,8 @@ pub const SessionRuntime = struct {
             .exec_start_fn = execStartHook,
             .exec_query_fn = execQueryHook,
             .exec_ctx = self,
+            .sandbox_fn = if (self.sandbox.active()) sandbox_mod.Session.wrapFn else null,
+            .sandbox_ctx = &self.sandbox,
         };
         tool_ctx.approval_ctx = &gate;
         tool_ctx.approval_fn = Gate.approve;
@@ -886,11 +908,11 @@ fn mcpCallHook(ctx: *anyopaque, arena: std.mem.Allocator, server: []const u8, to
 fn execStartHook(ctx: *anyopaque, arena: std.mem.Allocator, command: []const u8) []const u8 {
     const self: *SessionRuntime = @ptrCast(@alignCast(ctx));
     const reg = self.executions orelse return "error: background executions unavailable";
-    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
-    argv.append(arena, "/bin/sh") catch return "error: oom";
-    argv.append(arena, "-c") catch return "error: oom";
-    argv.append(arena, command) catch return "error: oom";
-    const id = reg.start(argv.items) catch |err| {
+    const argv = switch (self.sandbox.argvFor(arena, command)) {
+        .argv => |v| v,
+        .unsupported => |reason| return std.fmt.allocPrint(arena, "error: sandbox unavailable: {s}", .{reason}) catch "error: sandbox unavailable",
+    };
+    const id = reg.startAs(argv, command) catch |err| {
         return std.fmt.allocPrint(arena, "error: start failed: {s}", .{@errorName(err)}) catch "error: start failed";
     };
     return std.fmt.allocPrint(arena, "started background execution {d}; poll with exec action=status id={d}, output with action=output", .{ id, id }) catch "started";

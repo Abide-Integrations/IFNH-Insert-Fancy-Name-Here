@@ -22,6 +22,7 @@ const resolve_mod = @import("core/config/resolve.zig");
 const memory_mod = @import("core/memory.zig");
 const transcript = @import("core/session/transcript.zig");
 const debug_bundle = @import("core/debug_bundle.zig");
+const sandbox_mod = @import("core/sandbox.zig");
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -152,6 +153,11 @@ fn dispatch(
             });
         },
         .doctor => try runDoctor(io, arena, environ),
+        .@"__sandbox-exec" => {
+            var buf: [256]u8 = undefined;
+            var err_writer = std.Io.File.stderr().writer(io, &buf);
+            std.process.exit(sandbox_mod.runExec(io, arena, environ, parsed.args, &err_writer.interface));
+        },
         .memory => try runMemory(io, arena, environ, parsed.flags, parsed.args),
         .@"debug-bundle" => try runDebugBundle(io, arena, environ, parsed.flags, parsed.args),
         .session => try runSession(io, arena, environ, parsed.args),
@@ -785,6 +791,15 @@ fn doctorReport(io: std.Io, arena: std.mem.Allocator, environ: *const std.proces
     defer reg.deinit();
     try w.print("  mcp: {d} servers configured\n", .{reg.all_configs.len});
 
+    // Sandbox (E-04).
+    const sandbox_settings = cfg.sandboxSettings();
+    const sandbox_backend = sandbox_mod.detect(io, environ);
+    try w.print("  {s}\n", .{try sandbox_mod.doctorLine(arena, sandbox_settings, sandbox_backend)});
+    if (sandbox_settings.mode == .required and sandbox_backend == .none) {
+        problems += 1;
+        try w.print("  sandbox: required but unavailable ({s})\n", .{sandbox_mod.unavailableReason()});
+    }
+
     // Hooks (D-07).
     const hooks_mod = @import("core/hooks.zig");
     const hook_defs = hooks_mod.Engine.fromConfig(arena, cfg.get("hooks")) catch &.{};
@@ -1107,6 +1122,7 @@ test {
     _ = @import("core/config/schema.zig");
     _ = @import("core/session/store.zig");
     _ = @import("core/journal.zig");
+    _ = @import("core/sandbox.zig");
     _ = @import("core/permissions/glob.zig");
     _ = @import("core/permissions/command_class.zig");
     _ = @import("core/permissions/engine.zig");

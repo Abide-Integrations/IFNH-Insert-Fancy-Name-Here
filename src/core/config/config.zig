@@ -10,6 +10,7 @@ const trace_mod = @import("../trace.zig");
 const wire_log = @import("../wire_log.zig");
 const resolve_mod = @import("resolve.zig");
 const mcp_mod = @import("../mcp.zig");
+const sandbox_mod = @import("../sandbox.zig");
 
 pub const Layer = enum {
     builtin,
@@ -111,6 +112,11 @@ pub const default_config_json =
     \\  "memory": {
     \\    "adapter": "none",
     \\    "scope": "project"
+    \\  },
+    \\  "sandbox": {
+    \\    "mode": "off",
+    \\    "network": false,
+    \\    "write_extra": []
     \\  }
     \\}
 ;
@@ -120,7 +126,7 @@ pub const default_config_json =
 pub const known_sections = [_][]const u8{
     "schema_version", "model", "models", "routing", "profiles",
     "permissions",    "git",   "agents", "tools",   "context",
-    "sessions",       "ui",    "debug",  "memory",
+    "sessions",       "ui",    "debug",  "memory",  "sandbox",
 };
 
 /// Subtrees keyed by user-chosen names (alias names, model ids, profile
@@ -169,7 +175,8 @@ pub const wired_defaults = [_][]const u8{
     "debug.redact",                "routing.parent",
     "routing.research",            "routing.implement",
     "routing.review",              "memory.adapter",
-    "memory.scope",
+    "memory.scope",                "sandbox.mode",
+    "sandbox.network",             "sandbox.write_extra",
 };
 
 /// `IFNH_*` variables that switch runtime features and are not config keys.
@@ -464,6 +471,38 @@ pub const Store = struct {
         try resolve_mod.validateConfig(self);
         try self.validateMcpServers();
         try self.validateMemory();
+        try self.validateSandbox();
+    }
+
+    /// `sandbox.*` (E-04): a security section, so every bad value is an error.
+    fn validateSandbox(self: *Store) !void {
+        const mode = self.getString("sandbox.mode", "off");
+        if (sandbox_mod.Mode.parse(mode) == null) {
+            try self.addError("sandbox.mode", "must be \"off\", \"auto\" or \"required\", got \"{s}\"", .{mode});
+        }
+        if (self.get("sandbox.mode")) |v| {
+            if (v != .string) try self.addError("sandbox.mode", "must be \"off\", \"auto\" or \"required\"", .{});
+        }
+        if (self.get("sandbox.network")) |v| {
+            if (v != .bool) try self.addError("sandbox.network", "must be true or false", .{});
+        }
+        if (self.get("sandbox.write_extra")) |v| {
+            var ok = v == .array;
+            if (ok) for (v.array.items) |item| {
+                if (item != .string or item.string.len == 0 or std.mem.indexOfScalar(u8, item.string, 0) != null) ok = false;
+            };
+            if (!ok) try self.addError("sandbox.write_extra", "must be an array of non-empty path strings", .{});
+        }
+    }
+
+    /// The `sandbox.*` values. An unparsable mode reads as `required` so a
+    /// config that slipped past validation refuses rather than runs open.
+    pub fn sandboxSettings(self: *Store) sandbox_mod.Settings {
+        return .{
+            .mode = sandbox_mod.Mode.parse(self.getString("sandbox.mode", "off")) orelse .required,
+            .network = self.getBool("sandbox.network", false),
+            .write_extra = self.getStringList("sandbox.write_extra"),
+        };
     }
 
     /// `memory.*`: adapter and scope are closed sets; the MCP adapter needs a
@@ -1508,4 +1547,48 @@ test "coverage: every key in default_config_json is read somewhere in src" {
         std.debug.print("{s}\n", .{dead.items});
         return error.DeadConfigKey;
     }
+}
+
+test "sandbox config: defaults, valid values and fail-closed errors" {
+    var store = try Store.init(std.testing.allocator);
+    defer store.deinit();
+    try store.validate();
+    const d = store.sandboxSettings();
+    try std.testing.expectEqual(sandbox_mod.Mode.off, d.mode);
+    try std.testing.expect(!d.network);
+    try std.testing.expectEqual(@as(usize, 0), d.write_extra.len);
+
+    try store.applyOverride("sandbox", "{\"mode\":\"required\",\"network\":true,\"write_extra\":[\"build\",\"/srv/x\"]}", .{ .layer = .project, .origin = "test" });
+    store.errors.clearRetainingCapacity();
+    try store.validate();
+    try std.testing.expectEqual(@as(usize, 0), store.errors.items.len);
+    const s = store.sandboxSettings();
+    try std.testing.expectEqual(sandbox_mod.Mode.required, s.mode);
+    try std.testing.expect(s.network);
+    try std.testing.expectEqual(@as(usize, 2), s.write_extra.len);
+    try std.testing.expectEqualStrings("build", s.write_extra[0]);
+}
+
+test "sandbox config: unknown mode, non-bool network and bad paths name their key" {
+    const cases = [_]struct { json: []const u8, key: []const u8 }{
+        .{ .json = "{\"mode\":\"strict\"}", .key = "sandbox.mode" },
+        .{ .json = "{\"mode\":true}", .key = "sandbox.mode" },
+        .{ .json = "{\"network\":\"no\"}", .key = "sandbox.network" },
+        .{ .json = "{\"write_extra\":\"/tmp\"}", .key = "sandbox.write_extra" },
+        .{ .json = "{\"write_extra\":[1]}", .key = "sandbox.write_extra" },
+        .{ .json = "{\"write_extra\":[\"\"]}", .key = "sandbox.write_extra" },
+    };
+    for (cases) |c| {
+        var store = try Store.init(std.testing.allocator);
+        defer store.deinit();
+        try store.applyOverride("sandbox", c.json, .{ .layer = .project, .origin = "test" });
+        try store.validate();
+        try std.testing.expectEqual(@as(usize, 1), store.errors.items.len);
+        try std.testing.expectEqualStrings(c.key, store.errors.items[0].path);
+    }
+    // A mode that slipped past validation never reads as "off".
+    var store = try Store.init(std.testing.allocator);
+    defer store.deinit();
+    try store.applyOverride("sandbox.mode", "\"strict\"", .{ .layer = .project, .origin = "test" });
+    try std.testing.expectEqual(sandbox_mod.Mode.required, store.sandboxSettings().mode);
 }

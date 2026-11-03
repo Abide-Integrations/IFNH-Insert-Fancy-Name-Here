@@ -16,6 +16,7 @@ const globm = @import("../core/permissions/glob.zig");
 const search = @import("search.zig");
 const diff_mod = @import("../core/diff.zig");
 const custom_mod = @import("custom.zig");
+const sandbox_mod = @import("../core/sandbox.zig");
 
 /// Data-defined tool from `<workspace>/.ifnh/tools/*.json` (D-02, ADR 0004).
 pub const CustomTool = custom_mod.CustomTool;
@@ -77,6 +78,10 @@ pub const ToolContext = struct {
     exec_start_fn: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, command: []const u8) []const u8 = null,
     exec_query_fn: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, action: []const u8, id: []const u8) []const u8 = null,
     exec_ctx: ?*anyopaque = null,
+    /// OS-sandbox hook for model-issued shell commands (E-04; wired by the
+    /// host, null disables). Never consulted for `git` or the REPL's `!cmd`.
+    sandbox_fn: ?sandbox_mod.WrapFn = null,
+    sandbox_ctx: ?*anyopaque = null,
     /// Skill loader hook (wired by the host; null disables the tool).
     skill_load_fn: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, name: []const u8) ?[]const u8 = null,
     skill_ctx: ?*anyopaque = null,
@@ -1548,9 +1553,19 @@ fn toolBash(command: []const u8, background: bool, timeout_s: u32, ctx: *ToolCon
     var local = ctx.*;
     if (timeout_s > 0) local.timeout_s = @min(timeout_s, if (ctx.timeout_s == 0) 120 else ctx.timeout_s);
 
-    const argv = [_][]const u8{ "/bin/sh", "-c", command };
     // Note: shell side effects are not journaled (M185); surfaced in audit log instead.
-    return runCaptured(&local, &argv, "");
+    return runModelShell(&local, command);
+}
+
+/// Run a command the model issued under `/bin/sh -c`, through the sandbox
+/// hook when the host wired one. Without a hook this is `runShell` exactly.
+fn runModelShell(ctx: *ToolContext, command: []const u8) ToolResult {
+    const wrap = ctx.sandbox_fn orelse return runShell(ctx, command);
+    const wrap_ctx = ctx.sandbox_ctx orelse return errResult(ctx.arena, "sandbox unavailable: hook has no state", .{});
+    switch (wrap(wrap_ctx, ctx.arena, command)) {
+        .argv => |argv| return runCaptured(ctx, argv, ""),
+        .unsupported => |reason| return errResult(ctx.arena, "sandbox unavailable: {s}", .{reason}),
+    }
 }
 
 /// Run `command` under `/bin/sh -c` with the bash tool's capture, cancel and
@@ -1587,7 +1602,7 @@ fn customExec(ctx: *ToolContext, a: *const Args) ToolResult {
     // 120 s default, same meaning as everywhere else for `timeout_s`).
     var local = ctx.*;
     local.timeout_s = @min(ct.timeout_s, if (ctx.timeout_s == 0) 120 else ctx.timeout_s);
-    return runShell(&local, rendered);
+    return runModelShell(&local, rendered);
 }
 
 /// "git commit -m x" -> "git commit"; "ls" -> "ls".
@@ -2655,4 +2670,202 @@ test "permission rules for MCP tools govern memory writes (memory.*)" {
 
     try std.testing.expectEqual(Status.ok, execute("memory_remember", "{\"text\":\"allowed by rule\"}", &ctx).status);
     try std.testing.expectEqual(Status.denied, execute("memory_forget", "{}", &ctx).status);
+}
+
+// ---------------------------------------------------------------- sandbox (E-04)
+
+/// A resolved sandbox for `ws` using the best backend of this host, or null
+/// (with a printed SKIP) when none can run here. Landlock re-executes the
+/// built `zig-out/bin/ifnh`, so it needs `zig build` to have run first.
+fn sandboxForTest(arena: std.mem.Allocator, io: std.Io, ws: std.Io.Dir, network: bool) !?sandbox_mod.Session {
+    var env = try std.testing.environ.createMap(arena);
+    var ws_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const ws_path = try arena.dupe(u8, ws_buf[0..try ws.realPathFile(io, ".", &ws_buf)]);
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe: []const u8 = blk: {
+        const n = std.Io.Dir.cwd().realPathFile(io, "zig-out/bin/ifnh", &exe_buf) catch break :blk "";
+        break :blk try arena.dupe(u8, exe_buf[0..n]);
+    };
+    const s = try sandbox_mod.Session.resolve(arena, io, &env, .{ .mode = .required, .network = network }, ws_path, exe);
+    if (s.backend == .none) {
+        std.debug.print("SKIP sandbox integration: no backend on this host\n", .{});
+        return null;
+    }
+    if (s.backend == .landlock and exe.len == 0) {
+        std.debug.print("SKIP sandbox integration: Landlock needs zig-out/bin/ifnh (run `zig build` first)\n", .{});
+        return null;
+    }
+    return s;
+}
+
+fn jsonCommand(arena: std.mem.Allocator, command: []const u8) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    try aw.writer.writeAll("{\"command\":");
+    try std.json.Stringify.value(command, .{}, &aw.writer);
+    try aw.writer.writeByte('}');
+    return aw.written();
+}
+
+test "sandbox required: bash writes inside the workspace, nothing outside it" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+    var other = try makeTmp();
+    defer other.cleanup();
+    var e = engine_mod.Engine.init(std.testing.allocator, .auto);
+    defer e.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var session = (try sandboxForTest(arena, io, tmp.dir, false)) orelse return error.SkipZigTest;
+    var ctx = testCtx(arena, io, tmp.dir, &e);
+    ctx.sandbox_fn = sandbox_mod.Session.wrapFn;
+    ctx.sandbox_ctx = &session;
+
+    var other_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const other_path = other_buf[0..try other.dir.realPath(io, &other_buf)];
+    // The directory above the workspace, for the `cd ..` escape.
+    const parent_probe = try std.fmt.allocPrint(arena, "{s}/escape-ifnh-test", .{std.fs.path.dirname(session.policy.workspace).?});
+    defer std.Io.Dir.cwd().deleteFile(io, parent_probe) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, "/etc/ifnh-sandbox-test") catch {};
+
+    // Allowed: a write in the workspace.
+    // The test process does not run in `tmp`, so commands use absolute paths.
+    const ws_path = session.policy.workspace;
+    const inside_cmd = try std.fmt.allocPrint(arena, "echo sandboxed > {s}/inside.txt && cat {s}/inside.txt", .{ ws_path, ws_path });
+    const inside = execute("bash", try jsonCommand(arena, inside_cmd), &ctx);
+    try std.testing.expectEqual(Status.ok, inside.status);
+    try std.testing.expect(std.mem.indexOf(u8, inside.output, "sandboxed") != null);
+    try tmp.dir.access(io, "inside.txt", .{});
+
+    // Allowed: reading outside the workspace, and /dev/null redirection.
+    const read = execute("bash", try jsonCommand(arena, "head -c 1 /etc/passwd >/dev/null 2>/dev/null && echo read-ok"), &ctx);
+    try std.testing.expectEqual(Status.ok, read.status);
+    try std.testing.expect(std.mem.indexOf(u8, read.output, "read-ok") != null);
+
+    // Denied: a write outside the workspace.
+    const outside_cmd = try std.fmt.allocPrint(arena, "touch {s}/outside.txt", .{other_path});
+    const outside = execute("bash", try jsonCommand(arena, outside_cmd), &ctx);
+    try std.testing.expectEqual(Status.failed, outside.status);
+    try std.testing.expectError(error.FileNotFound, other.dir.access(io, "outside.txt", .{}));
+
+    // Denied: a write under /etc.
+    const etc = execute("bash", try jsonCommand(arena, "echo x > /etc/ifnh-sandbox-test"), &ctx);
+    try std.testing.expectEqual(Status.failed, etc.status);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, "/etc/ifnh-sandbox-test", .{}));
+
+    // Denied: leaving the workspace with `cd ..`.
+    const esc_cmd = try std.fmt.allocPrint(arena, "cd {s}; set -e; cd ..; touch escape-ifnh-test", .{ws_path});
+    const esc = execute("bash", try jsonCommand(arena, esc_cmd), &ctx);
+    try std.testing.expectEqual(Status.failed, esc.status);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, parent_probe, .{}));
+}
+
+test "sandbox required: network is denied unless sandbox.network is on" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+    var e = engine_mod.Engine.init(std.testing.allocator, .auto);
+    defer e.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    if (!programAvailableForTest(io, "bash")) {
+        std.debug.print("SKIP sandbox network test: bash not found\n", .{});
+        return error.SkipZigTest;
+    }
+
+    // A listener that never accepts: a connect completes in the kernel backlog.
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var srv = try addr.listen(io, .{ .reuse_address = true });
+    defer srv.deinit(io);
+    const connect = try std.fmt.allocPrint(arena, "bash -c 'exec 3<>/dev/tcp/127.0.0.1/{d} && echo connected'", .{srv.socket.address.getPort()});
+
+    var denied_session = (try sandboxForTest(arena, io, tmp.dir, false)) orelse return error.SkipZigTest;
+    var ctx = testCtx(arena, io, tmp.dir, &e);
+    ctx.sandbox_fn = sandbox_mod.Session.wrapFn;
+    ctx.sandbox_ctx = &denied_session;
+    const denied = execute("bash", try jsonCommand(arena, connect), &ctx);
+    try std.testing.expectEqual(Status.failed, denied.status);
+    try std.testing.expect(std.mem.indexOf(u8, denied.output, "connected") == null);
+
+    var open_session = (try sandboxForTest(arena, io, tmp.dir, true)) orelse return error.SkipZigTest;
+    ctx.sandbox_ctx = &open_session;
+    const allowed = execute("bash", try jsonCommand(arena, connect), &ctx);
+    try std.testing.expectEqual(Status.ok, allowed.status);
+    try std.testing.expect(std.mem.indexOf(u8, allowed.output, "connected") != null);
+}
+
+fn programAvailableForTest(io: std.Io, program: []const u8) bool {
+    return search.programAvailable(io, program);
+}
+
+test "sandbox required without a usable backend fails the call instead of running open" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+    var e = engine_mod.Engine.init(std.testing.allocator, .auto);
+    defer e.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var session = sandbox_mod.Session{ .mode = .required, .backend = .none };
+    var ctx = testCtx(arena, io, tmp.dir, &e);
+    ctx.sandbox_fn = sandbox_mod.Session.wrapFn;
+    ctx.sandbox_ctx = &session;
+
+    const r = execute("bash", "{\"command\":\"touch must-not-exist.txt\"}", &ctx);
+    try std.testing.expectEqual(Status.failed, r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "sandbox unavailable: ") != null);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "must-not-exist.txt", .{}));
+
+    // The human's `!cmd` path and the git tool never consult the sandbox.
+    const shell = runShell(&ctx, "echo human-ok");
+    try std.testing.expect(std.mem.indexOf(u8, shell.output, "human-ok") != null);
+}
+
+test "sandbox auto without a backend runs the command unsandboxed" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+    var e = engine_mod.Engine.init(std.testing.allocator, .auto);
+    defer e.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var session = sandbox_mod.Session{ .mode = .auto, .backend = .none };
+    var ctx = testCtx(arena, io, tmp.dir, &e);
+    ctx.sandbox_fn = sandbox_mod.Session.wrapFn;
+    ctx.sandbox_ctx = &session;
+    const r = execute("bash", "{\"command\":\"echo plain\"}", &ctx);
+    try std.testing.expectEqual(Status.ok, r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "plain") != null);
+}
+
+test "sandbox hook also guards data-defined custom tools" {
+    const io = std.testing.io;
+    var tmp = try makeTmp();
+    defer tmp.cleanup();
+    var e = engine_mod.Engine.init(std.testing.allocator, .auto);
+    defer e.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var session = sandbox_mod.Session{ .mode = .required, .backend = .none };
+    var ctx = testCtx(arena, io, tmp.dir, &e);
+    ctx.sandbox_fn = sandbox_mod.Session.wrapFn;
+    ctx.sandbox_ctx = &session;
+    const defs = [_]CustomTool{.{
+        .name = "say",
+        .description = "say it",
+        .command_template = "echo custom-ran",
+        .parameters_json = "{\"type\":\"object\",\"properties\":{}}",
+        .permission = .exec,
+        .timeout_s = 5,
+    }};
+    ctx.custom = &defs;
+    const r = execute("say", "{}", &ctx);
+    try std.testing.expectEqual(Status.failed, r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "sandbox unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "custom-ran") == null);
 }
