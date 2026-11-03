@@ -79,7 +79,10 @@ pub const Journal = struct {
     io: std.Io,
     /// Journal-lifetime allocator (arena contract, like session/store.zig).
     alloc: std.mem.Allocator,
+    /// Where `journal.jsonl` lives (the session directory).
     dir: std.Io.Dir,
+    /// Root that journaled paths are relative to (the workspace).
+    root: std.Io.Dir,
     file: ?std.Io.File = null,
     next_gid: u64 = 1,
     /// gid -> state, rebuilt on open.
@@ -90,10 +93,11 @@ pub const Journal = struct {
     /// Serializes journal mutations; subagent threads share one journal.
     mutex: std.Io.Mutex = .init,
 
-    /// Open (or create) the journal in `dir`. Rebuilds group state and rolls
+    /// Open (or create) the journal log in `dir`; journaled file paths resolve
+    /// under `root`, which is the workspace, never the log directory. Rebuilds group state and rolls
     /// back any group that has an intent but no commit (crash recovery).
-    pub fn open(io: std.Io, alloc: std.mem.Allocator, dir: std.Io.Dir) !Journal {
-        var self = Journal{ .io = io, .alloc = alloc, .dir = dir };
+    pub fn open(io: std.Io, alloc: std.mem.Allocator, dir: std.Io.Dir, root: std.Io.Dir) !Journal {
+        var self = Journal{ .io = io, .alloc = alloc, .dir = dir, .root = root };
 
         const text = fsutil.readSmallFile(dir, io, alloc, "journal.jsonl", max_journal_bytes) catch |err| switch (err) {
             error.FileNotFound => {
@@ -243,7 +247,7 @@ pub const Journal = struct {
             if (before_v != .string) return error.BadOp;
             try self.writeFile(path, before_v.string);
         } else if (std.mem.eql(u8, kind_v.string, "create")) {
-            self.dir.deleteFile(self.io, path) catch {};
+            self.root.deleteFile(self.io, path) catch {};
         } else if (std.mem.eql(u8, kind_v.string, "delete")) {
             const before_v = op_v.object.get("before") orelse return error.BadOp;
             if (before_v != .string) return error.BadOp;
@@ -253,9 +257,9 @@ pub const Journal = struct {
 
     fn writeFile(self: *Journal, path: []const u8, data: []const u8) !void {
         if (std.mem.lastIndexOfScalar(u8, path, '/')) |slash| {
-            try self.dir.createDirPath(self.io, path[0..slash]);
+            try self.root.createDirPath(self.io, path[0..slash]);
         }
-        try fsutil.atomicWriteFile(self.dir, self.io, self.alloc, path, data);
+        try fsutil.atomicWriteFile(self.root, self.io, self.alloc, path, data);
     }
 
     /// Apply a group of operations atomically-with-recovery:
@@ -342,21 +346,21 @@ pub const Journal = struct {
         for (ops) |op| {
             switch (op) {
                 .write => |w| {
-                    const cur = self.dir.readFileAlloc(self.io, w.path, arena, .limited(max_before_image_bytes + 1)) catch
+                    const cur = self.root.readFileAlloc(self.io, w.path, arena, .limited(max_before_image_bytes + 1)) catch
                         return error.PathNotFound;
                     if (!std.mem.eql(u8, cur, w.before)) return error.StaleBefore;
                     try self.writeFile(w.path, w.after);
                 },
                 .create => |c| {
-                    const cur = self.dir.readFileAlloc(self.io, c.path, arena, .limited(1)) catch null;
+                    const cur = self.root.readFileAlloc(self.io, c.path, arena, .limited(1)) catch null;
                     if (cur != null) return error.PathExists;
                     try self.writeFile(c.path, c.after);
                 },
                 .delete => |d| {
-                    const cur = self.dir.readFileAlloc(self.io, d.path, arena, .limited(max_before_image_bytes + 1)) catch
+                    const cur = self.root.readFileAlloc(self.io, d.path, arena, .limited(max_before_image_bytes + 1)) catch
                         return error.PathNotFound;
                     if (!std.mem.eql(u8, cur, d.before)) return error.StaleBefore;
-                    try self.dir.deleteFile(self.io, d.path);
+                    try self.root.deleteFile(self.io, d.path);
                 },
             }
         }
@@ -459,7 +463,7 @@ pub const Journal = struct {
             } else if (std.mem.eql(u8, kind_v.string, "create")) {
                 try self.writeFile(path_v.string, op_v.object.get("after").?.string);
             } else if (std.mem.eql(u8, kind_v.string, "delete")) {
-                try self.dir.deleteFile(self.io, path_v.string);
+                try self.root.deleteFile(self.io, path_v.string);
             }
         }
     }
@@ -537,6 +541,34 @@ fn tmpJournal() !struct { tmp: std.testing.TmpDir, dir: std.Io.Dir } {
     return .{ .tmp = tmp, .dir = tmp.dir };
 }
 
+test "journal resolves paths under the root, not the log directory" {
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var ws = std.testing.tmpDir(.{});
+    defer ws.cleanup();
+    var logs = std.testing.tmpDir(.{});
+    defer logs.cleanup();
+
+    try ws.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "hello" });
+    var j = try Journal.open(io, arena, logs.dir, ws.dir);
+    defer j.close();
+
+    try j.apply("edit", &.{.{ .write = .{ .path = "a.txt", .before = "hello", .after = "HELLO" } }});
+    const in_ws = try ws.dir.readFileAlloc(io, "a.txt", arena, .limited(1024));
+    try std.testing.expectEqualStrings("HELLO", in_ws);
+    try std.testing.expectError(error.FileNotFound, logs.dir.statFile(io, "a.txt", .{}));
+    // The log itself stays in the log directory.
+    _ = try logs.dir.statFile(io, "journal.jsonl", .{});
+    try std.testing.expectError(error.FileNotFound, ws.dir.statFile(io, "journal.jsonl", .{}));
+
+    // A create lands in the workspace too.
+    try j.apply("write", &.{.{ .create = .{ .path = "sub/new.txt", .after = "x" } }});
+    _ = try ws.dir.statFile(io, "sub/new.txt", .{});
+    try std.testing.expectError(error.FileNotFound, logs.dir.statFile(io, "sub/new.txt", .{}));
+}
+
 test "journal write, undo, redo" {
     const io = std.testing.io;
     var ts = try tmpJournal();
@@ -547,7 +579,7 @@ test "journal write, undo, redo" {
 
     try ts.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "hello" });
 
-    var j = try Journal.open(io, arena, ts.dir);
+    var j = try Journal.open(io, arena, ts.dir, ts.dir);
     defer j.close();
 
     try j.apply("edit", &.{.{ .write = .{
@@ -581,7 +613,7 @@ test "journal create and delete ops" {
 
     try ts.dir.writeFile(io, .{ .sub_path = "gone.txt", .data = "old data" });
 
-    var j = try Journal.open(io, arena, ts.dir);
+    var j = try Journal.open(io, arena, ts.dir, ts.dir);
     defer j.close();
 
     try j.apply("scaffold", &.{
@@ -606,7 +638,7 @@ test "journal stale before refused" {
     const arena = arena_state.allocator();
 
     try ts.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "actual" });
-    var j = try Journal.open(io, arena, ts.dir);
+    var j = try Journal.open(io, arena, ts.dir, ts.dir);
     defer j.close();
 
     try std.testing.expectError(error.StaleBefore, j.apply("edit", &.{.{ .write = .{
@@ -634,7 +666,7 @@ test "journal crash recovery rolls back uncommitted group" {
     try ts.dir.writeFile(io, .{ .sub_path = "journal.jsonl", .data = intent });
     try ts.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "after" });
 
-    var j = try Journal.open(io, arena, ts.dir); // recovery happens here
+    var j = try Journal.open(io, arena, ts.dir, ts.dir); // recovery happens here
     defer j.close();
     const cur = try ts.dir.readFileAlloc(io, "a.txt", arena, .limited(1024));
     try std.testing.expectEqualStrings("before", cur); // rolled back
@@ -648,7 +680,7 @@ test "journal refuses unsafe paths and oversized images" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var j = try Journal.open(io, arena, ts.dir);
+    var j = try Journal.open(io, arena, ts.dir, ts.dir);
     defer j.close();
 
     try std.testing.expectError(error.PathUnsafe, j.apply("x", &.{.{ .create = .{ .path = "../evil.txt", .after = "pwn" } }}));
@@ -666,7 +698,7 @@ test "versionsForPath collects distinct competing versions" {
     const arena = arena_state.allocator();
 
     try ts.dir.writeFile(io, .{ .sub_path = "x.txt", .data = "base" });
-    var j = try Journal.open(io, arena, ts.dir);
+    var j = try Journal.open(io, arena, ts.dir, ts.dir);
     defer j.close();
 
     try j.apply("a", &.{.{ .write = .{ .path = "x.txt", .before = "base", .after = "version-one" } }});

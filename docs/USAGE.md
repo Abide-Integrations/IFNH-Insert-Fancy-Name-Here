@@ -397,7 +397,7 @@ Model aliases name a provider/model pair once and reuse it:
   `implement` and `review` for the child agents that role can spawn.
   `"default"` means the plain `model` block. A role with no entry uses the
   parent's provider, model, endpoint and key together (never a mix).
-- An explicit `model` argument in an `agent` tool call beats `routing`.
+- An explicit `model` argument in an `agent` tool call names an alias (or `default`) and beats `routing`; an unknown alias fails the call.
 - `fallbacks` is a chain, off by default. It is tried only after the failures
   that are worth retrying (HTTP 429/5xx, network, timeout) are exhausted, never
   after an error that a retry cannot fix and never after text has already been
@@ -422,7 +422,7 @@ Model aliases name a provider/model pair once and reuse it:
 - **`bash` with `background: true`** — long commands return an execution
   handle; poll with the `exec` tool or `/exec` (status/output/stop).
 - **`skill`** — load installed skills (see below).
-- **`mcp_list` / `mcp_call`** — MCP servers (see below).
+- **`mcp_list` / `mcp_describe` / `mcp_call`** — MCP servers (see below).
 - **`read_tool_result`** — page through oversized outputs stored as
   artifacts.
 
@@ -473,7 +473,18 @@ mid-session policy change fails approvals closed.
 
 Servers spawn lazily on first use and are killed at session end. Tool
 calls pass the permission engine (`mcp.<server>.<tool>`, default ask).
-Inspect with `/mcp`; the agent uses `mcp_list`/`mcp_call`.
+Inspect with `/mcp`; the agent uses `mcp_list`/`mcp_describe`/`mcp_call`.
+`mcp_describe(server, tool)` returns that tool's description and its input
+JSON schema (from the server's `tools/list`), so the model need not guess
+arguments.
+
+Manual check against a stdio server: configure the `docs` server above, run
+`ifnh`, and ask "use mcp_describe on docs read_file and tell me its required
+arguments". The `[tool] mcp_describe` line must be followed by
+`docs.read_file: <description>` and an `input schema: {...}` line whose
+`required` list the model then repeats. An unknown tool gives
+`error: unknown tool docs.<name>`; an unknown server gives
+`error: server '<name>' unavailable`.
 
 ## 9. Skills
 

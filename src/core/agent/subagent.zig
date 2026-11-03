@@ -51,6 +51,18 @@ pub const ChildModels = struct {
     research: ?ChildModel = null,
     implement: ?ChildModel = null,
     review: ?ChildModel = null,
+    /// Every configured alias (plus "default"); an explicit `model` on an
+    /// `agent` call is looked up here, never used as a literal model id.
+    aliases: []const NamedModel = &.{},
+
+    pub const NamedModel = struct { name: []const u8, model: ChildModel };
+
+    pub fn alias(self: *const ChildModels, name: []const u8) ?ChildModel {
+        for (self.aliases) |a| {
+            if (std.mem.eql(u8, a.name, name)) return a.model;
+        }
+        return null;
+    }
 
     pub const roles = [_][]const u8{ "research", "implement", "review" };
 
@@ -173,7 +185,7 @@ pub fn spawnHook(
     // Parse arguments.
     var task: []const u8 = "";
     var role: Role = .implement;
-    var model: ?[]const u8 = null;
+    var model: ?[]const u8 = null; // alias name
     var isolation_worktree = false;
     {
         const v = std.json.parseFromSliceLeaky(std.json.Value, arena, arguments_json, .{}) catch
@@ -196,6 +208,12 @@ pub fn spawnHook(
         }
     }
 
+    var chosen_alias: ?ChildModel = null;
+    if (model) |name| {
+        chosen_alias = if (host.routing) |r| r.alias(name) else null;
+        if (chosen_alias == null) return fail(arena, "agent: unknown alias '{s}' (the model argument names an entry of models.aliases, or \"default\")", .{name});
+    }
+
     if (host.cancel.load(.acquire)) return fail(arena, "agent: cancelled", .{});
     if (parent_depth + 1 > host.max_depth) {
         return fail(arena, "agent: max delegation depth {d} exceeded", .{host.max_depth});
@@ -204,7 +222,7 @@ pub fn spawnHook(
     defer _ = host.active.fetchSub(1, .acq_rel);
 
     const label = std.fmt.allocPrint(arena, "{s}-{d}", .{ @tagName(role), host.report_seq.load(.monotonic) + 1 }) catch "child";
-    const result = runChild(host, arena, task, role, model, parent_depth, label, isolation_worktree);
+    const result = runChild(host, arena, task, role, chosen_alias, parent_depth, label, isolation_worktree);
     return result;
 }
 
@@ -237,7 +255,7 @@ fn runChild(
     parent_arena: std.mem.Allocator,
     task: []const u8,
     role: Role,
-    model: ?[]const u8,
+    explicit: ?ChildModel,
     parent_depth: usize,
     label: []const u8,
     isolation_worktree: bool,
@@ -301,21 +319,22 @@ fn runChild(
         host.base_system,
     }) catch return fail(parent_arena, "agent: out of memory", .{});
 
-    // An explicit `model` on the tool call wins; otherwise `routing.<role>`
-    // picks the whole bundle (D45). No routing entry keeps the parent's.
+    // An explicit `model` alias on the tool call wins (resolved by
+    // `spawnHook`); otherwise `routing.<role>` picks the whole bundle (D45).
+    // No routing entry keeps the parent's.
     var chosen = ChildModel{
         .provider = host.provider,
-        .model = model orelse host.default_model,
+        .model = host.default_model,
         .base_url = host.base_url,
         .api_key = host.api_key,
         .provider_options = host.provider_options,
         .temperature = host.temperature,
         .max_output_tokens = host.max_output_tokens,
     };
-    if (model == null) {
-        if (host.routing) |routing| {
-            if (routing.get(@tagName(role))) |routed| chosen = routed;
-        }
+    if (explicit) |e| {
+        chosen = e;
+    } else if (host.routing) |routing| {
+        if (routing.get(@tagName(role))) |routed| chosen = routed;
     }
 
     const outcome = agent_engine.runTurn(.{
@@ -775,10 +794,25 @@ test "routed child role switches provider, model and options together" {
     try std.testing.expectEqualStrings("parent-key", parent_rec.api_key);
     try std.testing.expectEqualStrings("{\"reasoning_effort\":\"low\"}", parent_rec.options);
 
-    // An explicit `model` argument wins over the role table: the child stays
-    // on the parent's provider and endpoint, only the model name changes.
-    _ = spawnHook(&host, arena, 0, "{\"task\":\"look\",\"role\":\"research\",\"model\":\"explicit-model\"}");
-    try std.testing.expectEqualStrings("explicit-model", parent_rec.model);
-    try std.testing.expectEqualStrings("http://parent.example", parent_rec.base_url);
-    try std.testing.expectEqualStrings("parent-key", parent_rec.api_key);
+    // An explicit `model` is an alias: it wins over the role table and brings
+    // its whole bundle (provider, endpoint, key, options).
+    var alias_rec = Recorder{};
+    models.aliases = &.{.{ .name = "fast", .model = .{
+        .provider = alias_rec.provider(),
+        .model = "fast-model",
+        .base_url = "http://fast.example",
+        .api_key = "fast-key",
+    } }};
+    const known = spawnHook(&host, arena, 0, "{\"task\":\"look\",\"role\":\"research\",\"model\":\"fast\"}");
+    try std.testing.expectEqual(tool_mod.AgentSpawnResult.SpawnStatus.completed, known.status);
+    try std.testing.expectEqualStrings("fast-model", alias_rec.model);
+    try std.testing.expectEqualStrings("http://fast.example", alias_rec.base_url);
+    try std.testing.expectEqualStrings("fast-key", alias_rec.api_key);
+    try std.testing.expectEqual(@as(usize, 1), research_rec.calls);
+
+    // An unknown alias is an error; the string is not passed through as a model id.
+    const unknown = spawnHook(&host, arena, 0, "{\"task\":\"look\",\"role\":\"research\",\"model\":\"explicit-model\"}");
+    try std.testing.expectEqual(tool_mod.AgentSpawnResult.SpawnStatus.failed, unknown.status);
+    try std.testing.expect(std.mem.indexOf(u8, unknown.summary, "unknown alias 'explicit-model'") != null);
+    try std.testing.expectEqual(@as(usize, 1), parent_rec.calls);
 }

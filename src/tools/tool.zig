@@ -193,7 +193,7 @@ pub const registry = [_]Tool{
     \\{"type":"object","properties":{"server":{"type":"string"},"tool":{"type":"string"},"arguments":{"type":"object"}},"required":["server","tool"]}
     , .executor_kind = .exec, .call_fn = execMcpCall },
     .{ .name = "agent", .description = "Delegate a self-contained task to a child agent. Roles: research (read-only), implement (may edit), review (read-only findings). The child works independently and returns a summary; its full report is stored under .ifnh/reports/.", .parameters_json =
-    \\{"type":"object","properties":{"task":{"type":"string"},"role":{"type":"string","enum":["research","implement","review"]},"model":{"type":"string"}},"required":["task","role"]}
+    \\{"type":"object","properties":{"task":{"type":"string"},"role":{"type":"string","enum":["research","implement","review"]},"model":{"type":"string","description":"Optional model alias from models.aliases (or default)"}},"required":["task","role"]}
     , .executor_kind = .exec, .call_fn = execAgent },
     .{ .name = "exec", .description = "Manage background executions: status/output/stop/list by execution id.", .parameters_json =
     \\{"type":"object","properties":{"action":{"type":"string","enum":["status","output","stop","list"]},"id":{"type":"integer"}},"required":["action"]}
@@ -1719,6 +1719,12 @@ test "write denied on protected path without approval escape" {
 
     const r = execute("write", "{\"path\":\".ifnh/config.json\",\"content\":\"{}\"}", &ctx);
     try std.testing.expectEqual(Status.denied, r.status);
+
+    // Custom tool definitions are arbitrary shell: write and edit are refused too.
+    const w = execute("write", "{\"path\":\".ifnh/tools/evil.json\",\"content\":\"{}\"}", &ctx);
+    try std.testing.expectEqual(Status.denied, w.status);
+    const ed = execute("edit", "{\"path\":\".ifnh/tools/evil.json\",\"old_string\":\"a\",\"new_string\":\"b\"}", &ctx);
+    try std.testing.expectEqual(Status.denied, ed.status);
 }
 
 test "bash tool runs read-only commands without approval" {
@@ -2351,7 +2357,7 @@ test "edit multi-edit applies three edits in one approval, one write and one jou
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var j = try journal_mod.Journal.open(io, arena, tmp.dir);
+    var j = try journal_mod.Journal.open(io, arena, tmp.dir, tmp.dir);
     defer j.close();
     var seen = EditSeen{};
     var ctx = testCtx(arena, io, tmp.dir, &e);

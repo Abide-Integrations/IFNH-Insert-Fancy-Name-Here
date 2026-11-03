@@ -46,6 +46,8 @@ const protected_paths = [_][]const u8{
     ".ifnh/instructions/",
     ".ifnh/commands/",
     ".ifnh/skills/",
+    // Custom tool definitions are arbitrary shell templates.
+    ".ifnh/tools/",
     // The grants store: an agent must not be able to grant itself anything.
     ".ifnh/permissions.local.json",
     "AGENTS.md",
@@ -262,6 +264,7 @@ test "path writes ask by default, deny for protected policy paths" {
     try t.expectEqual(Decision.deny, e.decidePath(.write, ".ifnh/config.json"));
     try t.expectEqual(Decision.deny, e.decidePath(.write, ".ifnh/config.d/extra.json"));
     try t.expectEqual(Decision.deny, e.decidePath(.write, ".ifnh/lifecycle/default.json"));
+    try t.expectEqual(Decision.deny, e.decidePath(.write, ".ifnh/tools/hello.json"));
     try t.expectEqual(Decision.deny, e.decidePath(.write, "AGENTS.md"));
     try t.expectEqual(Decision.deny, e.decidePath(.write, "./AGENTS.md"));
     // Sessions are not protected.

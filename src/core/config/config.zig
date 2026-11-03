@@ -86,7 +86,6 @@ pub const default_config_json =
     \\    "max_retries": 3,
     \\    "max_tool_rounds": 25,
     \\    "timeout_tool_s": 120,
-    \\    "timeout_turn_s": 600,
     \\    "budget_usd": null
     \\  },
     \\  "tools": {
@@ -97,21 +96,15 @@ pub const default_config_json =
     \\    "compact_at_fraction": 0.8,
     \\    "max_file_read_bytes": 262144
     \\  },
-    \\  "planning": {
-    \\    "auto_call_threshold": 12
-    \\  },
     \\  "sessions": {
     \\    "dir": "project",
     \\    "keep": 30
     \\  },
     \\  "ui": {
     \\    "colors": true,
-    \\    "footer": true,
-    \\    "symbols": "unicode",
-    \\    "verbosity": "normal"
+    \\    "footer": true
     \\  },
     \\  "debug": {
-    \\    "level": "info",
     \\    "redact": true
     \\  }
     \\}
@@ -120,9 +113,9 @@ pub const default_config_json =
 /// Top-level sections recognized by the schema. Unknown keys produce
 /// warnings (DECISIONS B19); unknown values in security sections are errors.
 pub const known_sections = [_][]const u8{
-    "schema_version", "model",    "models", "routing", "profiles",
-    "permissions",    "git",      "agents", "tools",   "context",
-    "planning",       "sessions", "ui",     "debug",
+    "schema_version", "model", "models", "routing", "profiles",
+    "permissions",    "git",   "agents", "tools",   "context",
+    "sessions",       "ui",    "debug",
 };
 
 /// Subtrees keyed by user-chosen names (alias names, model ids, profile
@@ -170,16 +163,6 @@ pub const wired_defaults = [_][]const u8{
     "routing.review",
 };
 
-/// Defaults leaves deliberately not read yet: each would need a feature that
-/// does not exist. Documented allowlist (A-T07), not a silent gap.
-pub const unwired_defaults = [_][]const u8{
-    "agents.timeout_turn_s", // no turn deadline yet (F-A06 follow-up)
-    "planning.auto_call_threshold", // planning auto-invocation not implemented
-    "ui.symbols", // no ascii/unicode symbol set yet
-    "ui.verbosity", // no verbosity levels yet
-    "debug.level", // std log level is comptime (`std_options`); no runtime logger
-};
-
 /// `IFNH_*` variables that switch runtime features and are not config keys.
 fn isRuntimeSwitch(key: []const u8) bool {
     return std.mem.eql(u8, key, trace_mod.env_var) or std.mem.eql(u8, key, wire_log.env_var);
@@ -192,6 +175,8 @@ pub const Store = struct {
     /// Dotted key path -> winning source.
     sources: std.StringHashMapUnmanaged(Source) = .empty,
     warnings: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// Messages already handed out by `newWarnings`.
+    reported: std.ArrayListUnmanaged([]const u8) = .empty,
     errors: std.ArrayListUnmanaged(ValidationError) = .empty,
 
     pub fn alloc(self: *Store) std.mem.Allocator {
@@ -365,6 +350,20 @@ pub const Store = struct {
             if (std.mem.eql(u8, existing, msg)) return;
         }
         try self.warnings.append(self.alloc(), msg);
+    }
+
+    /// Warnings not returned by an earlier call. Applying a profile or flags
+    /// re-validates (and regenerates every warning), so callers print through
+    /// this rather than iterating `warnings`, or each would show up twice.
+    pub fn newWarnings(self: *Store) ![]const []const u8 {
+        const start = self.reported.items.len;
+        outer: for (self.warnings.items) |w| {
+            for (self.reported.items) |r| {
+                if (std.mem.eql(u8, r, w)) continue :outer;
+            }
+            try self.reported.append(self.alloc(), w);
+        }
+        return self.reported.items[start..];
     }
 
     pub fn addError(self: *Store, path: []const u8, comptime fmt: []const u8, args: anytype) !void {
@@ -962,7 +961,7 @@ test "validate warns on unknown keys at any depth with full path" {
     }
 }
 
-test "every defaults key is wired or documented as unwired" {
+test "every defaults key is listed in wired_defaults" {
     var store = try Store.init(std.testing.allocator);
     defer store.deinit();
 
@@ -973,15 +972,14 @@ test "every defaults key is wired or documented as unwired" {
 
     for (leaves.items) |leaf| {
         const known = std.mem.eql(u8, leaf, "schema_version") or
-            inList(&wired_defaults, leaf) or inList(&unwired_defaults, leaf);
+            inList(&wired_defaults, leaf);
         if (!known) {
-            std.debug.print("defaults key '{s}' is neither wired nor in unwired_defaults\n", .{leaf});
+            std.debug.print("defaults key '{s}' is not in wired_defaults\n", .{leaf});
             return error.TestUnexpectedResult;
         }
     }
     // Entries that are not defaults leaves are stale.
     for (&wired_defaults) |key| try std.testing.expect(inList(leaves.items, key));
-    for (&unwired_defaults) |key| try std.testing.expect(inList(leaves.items, key));
 }
 
 fn inList(list: []const []const u8, key: []const u8) bool {
@@ -1175,6 +1173,25 @@ test "config warn reports each distinct message once" {
     try std.testing.expectEqual(@as(usize, 2), store.warnings.items.len);
 }
 
+test "config warnings are reported once across profile and flag re-validation" {
+    var store = try Store.init(std.testing.allocator);
+    defer store.deinit();
+    try store.warn("unknown config key '{s}' ignored", .{"a.b"});
+    try std.testing.expectEqual(@as(usize, 1), (try store.newWarnings()).len);
+
+    // Re-validation clears and regenerates the same warning.
+    store.warnings.clearRetainingCapacity();
+    try store.warn("unknown config key '{s}' ignored", .{"a.b"});
+    try std.testing.expectEqual(@as(usize, 0), (try store.newWarnings()).len);
+
+    // A genuinely new warning still shows, once.
+    try store.warn("unknown config key '{s}' ignored", .{"c.d"});
+    const fresh = try store.newWarnings();
+    try std.testing.expectEqual(@as(usize, 1), fresh.len);
+    try std.testing.expect(std.mem.indexOf(u8, fresh[0], "c.d") != null);
+    try std.testing.expectEqual(@as(usize, 0), (try store.newWarnings()).len);
+}
+
 test "config validateFileText rejects bad values and warns on unknown keys" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -1195,4 +1212,72 @@ test "config validateFileText rejects bad values and warns on unknown keys" {
     const ok = try validateFileText(arena, "{ \"model\": { \"model\": \"m\" } }");
     try std.testing.expectEqual(@as(usize, 0), ok.errors.len);
     try std.testing.expectEqual(@as(usize, 0), ok.warnings.len);
+}
+
+/// Concatenated non-test source of every `.zig` file under `src/` (each file is
+/// cut at its first top-level `test`, so a key mentioned only by a test does
+/// not count as read). Tests run with the project root as cwd.
+fn readSourceText(arena: std.mem.Allocator, io: std.Io) ![]const u8 {
+    var dir = try std.Io.Dir.cwd().openDir(io, "src", .{ .iterate = true });
+    defer dir.close(io);
+    var walker = try dir.walk(arena);
+    defer walker.deinit();
+    var all: std.ArrayListUnmanaged(u8) = .empty;
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".zig")) continue;
+        const text = try dir.readFileAlloc(io, entry.path, arena, .limited(8 * 1024 * 1024));
+        var body = text[0 .. std.mem.indexOf(u8, text, "\ntest \"") orelse text.len];
+        if (std.mem.eql(u8, entry.path, "core/config/config.zig")) {
+            // The wired/unwired bookkeeping lists name every key; they are not readers.
+            const from = std.mem.indexOf(u8, body, "pub const wired_defaults") orelse 0;
+            const to = std.mem.indexOf(u8, body, "/// `IFNH_*` variables") orelse from;
+            try all.appendSlice(arena, body[0..from]);
+            body = body[to..];
+        }
+        try all.appendSlice(arena, body);
+    }
+    return all.items;
+}
+
+/// Append the dotted path of every leaf of `v` (a non-object, or an empty
+/// object such as `"aliases": {}`) to `out`.
+fn collectLeafPaths(arena: std.mem.Allocator, v: std.json.Value, prefix: []const u8, out: *std.ArrayListUnmanaged([]const u8)) !void {
+    if (v == .object and v.object.count() > 0) {
+        var it = v.object.iterator();
+        while (it.next()) |e| {
+            const path = if (prefix.len == 0) e.key_ptr.* else try std.fmt.allocPrint(arena, "{s}.{s}", .{ prefix, e.key_ptr.* });
+            try collectLeafPaths(arena, e.value_ptr.*, path, out);
+        }
+        return;
+    }
+    try out.append(arena, prefix);
+}
+
+test "coverage: every key in default_config_json is read somewhere in src" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const source = try readSourceText(arena, std.testing.io);
+
+    const defaults = try std.json.parseFromSliceLeaky(std.json.Value, arena, default_config_json, .{});
+    var paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    try collectLeafPaths(arena, defaults, "", &paths);
+    try std.testing.expect(paths.items.len > 30);
+
+    var dead: std.ArrayListUnmanaged(u8) = .empty;
+    for (paths.items) |path| {
+        // A key is read when its dotted path appears as a string literal, or
+        // when a sibling-generic reader builds it (`"routing.{s}"`).
+        const literal = try std.fmt.allocPrint(arena, "\"{s}\"", .{path});
+        if (std.mem.indexOf(u8, source, literal) != null) continue;
+        if (std.mem.lastIndexOfScalar(u8, path, '.')) |dot| {
+            const generic = try std.fmt.allocPrint(arena, "\"{s}.{{s}}\"", .{path[0..dot]});
+            if (std.mem.indexOf(u8, source, generic) != null) continue;
+        }
+        try dead.print(arena, "\n  dead config key: {s} (in default_config_json, never read in src/)", .{path});
+    }
+    if (dead.items.len > 0) {
+        std.debug.print("{s}\n", .{dead.items});
+        return error.DeadConfigKey;
+    }
 }

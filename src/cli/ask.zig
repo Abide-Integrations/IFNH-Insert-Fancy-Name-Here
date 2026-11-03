@@ -324,7 +324,7 @@ pub fn run(
     defer cfg.deinit();
     for (cfg.errors.items) |e| stderrPrint(io, "config error [{s}]: {s}\n", .{ e.path, e.message });
     if (cfg.errors.items.len > 0) return exitCode(.failed);
-    for (cfg.warnings.items) |w| stderrPrint(io, "config warning: {s}\n", .{w});
+    for (cfg.newWarnings() catch &.{}) |w| stderrPrint(io, "config warning: {s}\n", .{w});
 
     // `--profile` is a hard startup error when the name is unknown (D-03).
     if (global.profile) |name| {
@@ -338,7 +338,7 @@ pub fn run(
         };
         for (cfg.errors.items) |e| stderrPrint(io, "config error [{s}]: {s}\n", .{ e.path, e.message });
         if (cfg.errors.items.len > 0) return exitCode(.failed);
-        for (cfg.warnings.items) |w| stderrPrint(io, "config warning: {s}\n", .{w});
+        for (cfg.newWarnings() catch &.{}) |w| stderrPrint(io, "config warning: {s}\n", .{w});
     }
     // Per-key flags are config like any other and outrank the profile (D-06).
     if (global.override_count > 0) {
@@ -348,7 +348,7 @@ pub fn run(
         };
         for (cfg.errors.items) |e| stderrPrint(io, "config error [{s}]: {s}\n", .{ e.path, e.message });
         if (cfg.errors.items.len > 0) return exitCode(.failed);
-        for (cfg.warnings.items) |w| stderrPrint(io, "config warning: {s}\n", .{w});
+        for (cfg.newWarnings() catch &.{}) |w| stderrPrint(io, "config warning: {s}\n", .{w});
     }
 
     var rt = session_runtime.SessionRuntime.init(io, arena, environ, &cfg, cwd, .{

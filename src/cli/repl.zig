@@ -281,7 +281,7 @@ pub fn run(
         try out(io, "config error [{s}]: {s}\n", .{ err.path, err.message });
     }
     if (cfg.errors.items.len > 0) return error.InvalidConfig;
-    for (cfg.warnings.items) |w| try out(io, "config warning: {s}\n", .{w});
+    for (try cfg.newWarnings()) |w| try out(io, "config warning: {s}\n", .{w});
 
     // `--profile` is a hard startup error when the name is unknown (D-03):
     // a typo must not silently run with a different configuration.
@@ -295,14 +295,14 @@ pub fn run(
         };
         for (cfg.errors.items) |e| try out(io, "config error [{s}]: {s}\n", .{ e.path, e.message });
         if (cfg.errors.items.len > 0) return error.InvalidConfig;
-        for (cfg.warnings.items) |w| try out(io, "config warning: {s}\n", .{w});
+        for (try cfg.newWarnings()) |w| try out(io, "config warning: {s}\n", .{w});
     }
     // Per-key flags are config like any other and outrank the profile (D-06).
     if (opts.overrides.len > 0) {
         try cfg.applyCliOverrides(opts.overrides);
         for (cfg.errors.items) |e| try out(io, "config error [{s}]: {s}\n", .{ e.path, e.message });
         if (cfg.errors.items.len > 0) return error.InvalidConfig;
-        for (cfg.warnings.items) |w| try out(io, "config warning: {s}\n", .{w});
+        for (try cfg.newWarnings()) |w| try out(io, "config warning: {s}\n", .{w});
     }
 
     // ---- session state (zero-config: lazily create .ifnh) ----
