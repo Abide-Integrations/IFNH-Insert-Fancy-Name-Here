@@ -615,6 +615,48 @@ The agent sees a budgeted catalog each turn and loads bodies with the
 `skill` tool. First-party examples ship in this repo under `skills/`
 (reconnaissance, create-skill) — copy them into a skills directory to use.
 
+### Installing skills from git
+
+```
+/skills                                         # [scope] name commit: description
+/skills install <git-url> [name] [--ref <ref>] [--force]
+/skills remove <name>                           # asks first
+```
+
+`install` accepts `https://…`, `ssh://…` and `git@host:path` sources only
+(`file://`, `git://`, plain paths and anything starting with `-` are
+refused). It runs `git clone --depth 1 [--branch <ref>]` into
+`.ifnh/skills/.tmp-<name>`, then moves the result to `.ifnh/skills/<name>`;
+the name defaults to the repository name and must match `[A-Za-z0-9._-]+`.
+An existing `<name>` is refused unless you pass `--force`, which swaps the
+whole directory (it is never half-replaced). The clone's `.git` directory is
+dropped; the commit is pinned in `.ifnh/skills.lock.json`:
+
+```json
+{
+  "version": 1,
+  "skills": {
+    "pdf-review": {
+      "source": "https://github.com/o/pdf-review.git",
+      "ref": "",
+      "commit": "0123456789abcdef0123456789abcdef01234567",
+      "installed_at": "2026-11-03T12:00:00Z"
+    }
+  }
+}
+```
+
+The file is written deterministically (names sorted) so it diffs cleanly;
+commit it to share exact versions. If it is not valid JSON, `install` and
+`remove` stop with `skills lockfile is not valid JSON: .ifnh/skills.lock.json`
+and leave it alone; `/skills` lists without commits. `--ref` takes a branch
+or tag (not a bare commit id). An installed repository must keep its
+`SKILL.md` at the top level for the catalog to pick it up; when none is found
+within two directory levels, `install` still keeps the files but prints
+`warning: no SKILL.md found in <name>`. The catalog is rescanned right
+away. Skills never gain permissions from being installed (K153), but their
+text goes to the model, so install only sources you trust.
+
 ## 10. Memory
 
 Optional, advisory notes that survive between sessions. **Off by default**
@@ -789,7 +831,8 @@ zig build -Doptimize=ReleaseSafe && scripts/install.sh
 ├── config.d/            # committed — split config
 ├── instructions/        # committed — extra project instructions
 ├── commands/            # committed — custom slash commands
-├── skills/              # committed — project skills
+├── skills/              # committed — project skills (`/skills install` clones here)
+├── skills.lock.json     # committed — pinned source/commit of installed skills
 ├── memory/              # advisory notes of the file memory adapter (opt-in)
 ├── lifecycle/           # committed — lifecycle definitions
 ├── tool-notes/          # committed — per-CLI guidance for agents

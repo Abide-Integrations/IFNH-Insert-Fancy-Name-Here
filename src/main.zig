@@ -1138,6 +1138,7 @@ test {
     _ = @import("core/git.zig");
     _ = @import("core/mcp.zig");
     _ = @import("core/skills.zig");
+    _ = @import("core/skills_lock.zig");
     _ = @import("core/memory.zig");
     _ = @import("core/hooks.zig");
     _ = @import("core/compaction.zig");

@@ -27,6 +27,8 @@ const openai = @import("../providers/openai.zig");
 const resolve_mod = @import("../core/config/resolve.zig");
 const image_mod = @import("../core/image.zig");
 const memory_mod = @import("../core/memory.zig");
+const skills_mod = @import("../core/skills.zig");
+const skills_lock = @import("../core/skills_lock.zig");
 const trace_mod = @import("../core/trace.zig");
 const wire_log = @import("../core/wire_log.zig");
 const turn_cache_mod = @import("../core/turn_cache.zig");
@@ -972,6 +974,9 @@ fn handleCommand(
             \\  /image <path>         attach a png/jpg/gif/webp to the next message
             \\  /image [clear]        show the queued count / empty the queue
             \\  /sessions             list sessions (use `ifnh resume <id>`)
+            \\  /skills [list]        installed skills with their pinned commit
+            \\  /skills install <git-url> [name] [--ref <ref>] [--force]
+            \\  /skills remove <name> delete an installed skill (asks first)
             \\  /memory [purge]       memory scope, entry count and newest notes; purge deletes them
             \\
         , .{}) catch {};
@@ -1328,16 +1333,7 @@ fn handleCommand(
             out(io, "[compacted: {d} -> {d} tokens]\n", .{ res.tokens_before, res.tokens_after }) catch {};
         }
     } else if (std.mem.eql(u8, cmd, "skills")) {
-        if (rt.skills) |catalog| {
-            if (catalog.skills.len == 0) {
-                if (config_mod.userSkillsDir(arena, rt.process_environ)) |user_skills| {
-                    out(io, "no skills installed (.ifnh/skills/, {s}/)\n", .{user_skills}) catch {};
-                } else out(io, "no skills installed (.ifnh/skills/)\n", .{}) catch {};
-            }
-            for (catalog.skills) |s| {
-                out(io, "  [{s}] {s}: {s}\n", .{ s.scope, s.name, s.description }) catch {};
-            }
-        } else out(io, "skills unavailable\n", .{}) catch {};
+        skillsCommand(io, arena, cwd, rt, events, rest);
     } else if (std.mem.eql(u8, cmd, "memory")) {
         memoryCommand(io, arena, cwd, rt, events, cfg, rest);
     } else if (std.mem.eql(u8, cmd, "mcp")) {
@@ -1391,6 +1387,79 @@ fn handleCommand(
 /// Disk-backed slash command (D030, M0-T37): `.ifnh/commands/<name>.md`
 /// with optional frontmatter; `$ARGS` in the body is replaced by the
 /// command arguments. The body is submitted as the user's prompt.
+/// `/skills [list]`, `/skills install ...`, `/skills remove <name>` (E-05b).
+/// Install and remove rescan the catalog, so no `/reload` is needed.
+fn skillsCommand(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    cwd: std.Io.Dir,
+    rt: *session_runtime.SessionRuntime,
+    events: *const session_runtime.Events,
+    rest: []const u8,
+) void {
+    switch (skills_mod.parseCommand(rest)) {
+        .usage => |text| out(io, "{s}\n", .{text}) catch {},
+        .list => {
+            const lock = skills_lock.read(cwd, io, arena) catch |err| blk: {
+                if (err == error.InvalidLock) out(io, "{s}\n", .{skills_lock.invalid_message}) catch {};
+                break :blk skills_lock.Lock{};
+            };
+            const catalog = rt.skills orelse {
+                out(io, "skills unavailable\n", .{}) catch {};
+                return;
+            };
+            if (catalog.skills.len == 0) {
+                if (config_mod.userSkillsDir(arena, rt.process_environ)) |user_skills| {
+                    out(io, "no skills installed (.ifnh/skills/, {s}/)\n", .{user_skills}) catch {};
+                } else out(io, "no skills installed (.ifnh/skills/)\n", .{}) catch {};
+            }
+            for (catalog.skills) |s| {
+                const pinned = if (skills_mod.projectDirName(s.path)) |dir| lock.get(dir) else null;
+                const commit = skills_lock.shortCommit(if (pinned) |p| p.commit else null);
+                out(io, "  [{s}] {s} {s}: {s}\n", .{ s.scope, s.name, commit, s.description }) catch {};
+            }
+        },
+        .install => |args| {
+            out(io, "installing {s} ...\n", .{args.url}) catch {};
+            var msg: []const u8 = "";
+            const done = skills_mod.install(arena, io, cwd, rt.process_environ, args, &msg) catch |err| {
+                if (err == error.OutOfMemory) msg = "out of memory";
+                out(io, "{s}\n", .{msg}) catch {};
+                return;
+            };
+            rt.rescanSkills(arena, cwd);
+            if (done.has_skill_md) {
+                out(io, "installed {s} ({s})\n", .{ done.name, skills_lock.shortCommit(done.commit) }) catch {};
+            } else {
+                out(io, "warning: no SKILL.md found in {s}\n", .{done.name}) catch {};
+            }
+        },
+        .remove => |name| {
+            if (!skills_mod.isInstalled(cwd, io, arena, name)) {
+                out(io, "skill '{s}' is not installed\n", .{name}) catch {};
+                return;
+            }
+            const resp = events.on_approval(events.ctx, .{
+                .tool = "skills",
+                .title = "remove skill",
+                .detail = std.fmt.allocPrint(arena, "delete .ifnh/skills/{s} and its lockfile entry", .{name}) catch name,
+            });
+            if (resp == .denied) {
+                out(io, "cancelled\n", .{}) catch {};
+                return;
+            }
+            var msg: []const u8 = "";
+            skills_mod.remove(arena, io, cwd, name, &msg) catch |err| {
+                if (err == error.OutOfMemory) msg = "out of memory";
+                out(io, "{s}\n", .{msg}) catch {};
+                return;
+            };
+            rt.rescanSkills(arena, cwd);
+            out(io, "removed {s}\n", .{name}) catch {};
+        },
+    }
+}
+
 /// `/memory` and `/memory purge` (E-05a, DECISIONS Q229/Q230). Purge asks
 /// through the same approval path as tool calls.
 fn memoryCommand(
