@@ -176,6 +176,7 @@ is not a terminal or `TERM` is `dumb`: then nothing at all is written.
 | `/exec` | background executions |
 | `/usage` | session token and dollar totals, with the budget and a per-model line when several models were used |
 | `/compact` | force context compaction |
+| `/image <path>` | attach an image to the next message (`/image` = queued count, `/image clear`) |
 | `/lifecycle run <file.json> [--from <n>]` | run a lifecycle |
 | `/review override <reason>` | developer-only override of a blocked review (audited) |
 | `/reconcile <path>` | reconciliation agent for conflicting edits |
@@ -204,6 +205,10 @@ trimmed. An empty or whitespace-only prompt is a usage error (exit 2).
 Plain mode writes only assistant text to stdout; diagnostics go to stderr.
 `--json` (global or after `ask`) writes NDJSON to stdout and nothing else, with
 no styling or ANSI escapes.
+
+`--image <path>` attaches an image to the prompt (see "Images" in section 5;
+repeatable, up to 8). An unsupported type, a file over 5 MiB or an unreadable
+path is reported on stderr before anything runs, with exit 2.
 
 ### Approvals
 
@@ -314,7 +319,8 @@ The full annotated default lives in `src/core/config/config.zig`
 {
   "schema_version": 1,
   "model": {
-    "provider": "openai",          // "openai" = any OpenAI-compatible API
+    "provider": "openai",          // "openai" = any OpenAI-compatible API (Chat Completions)
+                                   // "openai-responses" = OpenAI Responses API; "anthropic" = Messages
     "model": "qwen3-coder",
     "base_url": "http://localhost:11434/v1",   // Ollama, llama.cpp, vLLM...
     "api_key_env": "OLLAMA_KEY"    // optional for local servers
@@ -409,6 +415,49 @@ Model aliases name a provider/model pair once and reuse it:
   alias > `models.provider_options.<model id>` > `model.provider_options`,
   merged key by key.
 
+### OpenAI Responses API
+
+`"provider": "openai-responses"` talks to `{base_url}/responses` (default
+`https://api.openai.com/v1`, key from `OPENAI_API_KEY`) instead of Chat
+Completions. Requests are streamed with `store: false`; it accepts the same
+`provider_options` keys as `openai`, and reasoning summaries stream as
+reasoning events.
+
+```jsonc
+{ "model": { "provider": "openai-responses", "model": "gpt-5.1",
+             "provider_options": { "reasoning": { "effort": "medium", "summary": "auto" } } } }
+```
+
+### Anthropic extended thinking
+
+Set `thinking` in `provider_options` of an `anthropic` model:
+
+```jsonc
+{ "model": { "provider": "anthropic", "model": "claude-sonnet-4-6",
+             "provider_options": { "thinking": { "type": "enabled", "budget_tokens": 4096 } } } }
+```
+
+With thinking on, `temperature` is not sent (the API requires the default),
+and `max_tokens` is raised to at least `budget_tokens + 1024`. The signed
+thinking block is sent back with the assistant turn it belongs to, as the API
+requires during a tool loop; it is kept in memory for the running session, not
+written to the session log, so a resumed session starts without it.
+
+### Images
+
+Attach PNG, JPEG, GIF or WebP files (at most 5 MiB each, 8 per message) to a
+message. Images are sent inline as base64; there is no URL form. The image is
+re-sent with every later request in the session, so it counts against the
+context window and cost each turn.
+
+```bash
+ifnh ask --image shot.png --image diagram.webp "what differs between these?"
+```
+
+In the REPL, `/image <path>` queues a file for the next message, `/image` shows
+how many are queued and `/image clear` empties the queue. Images are not
+recorded in the session log.
+
 ## 6. What the agent can do (tool kernel)
 
 `read` `glob` `grep` `edit` `write` `bash` `git` — plus:
@@ -471,7 +520,45 @@ mid-session policy change fails approvals closed.
 }
 ```
 
-Servers spawn lazily on first use and are killed at session end. Tool
+A server is either a local process (`command`, as above) or a remote
+Streamable HTTP endpoint (`url`); setting both, or neither, is a config error
+naming `mcp_servers.<name>`:
+
+```jsonc
+{
+  "mcp_servers": {
+    "tracker": {
+      "url": "https://mcp.example.com/mcp",
+      "headers": { "Authorization": "Bearer <token>" }   // optional
+    }
+  }
+}
+```
+
+Each request is a `POST` with `Accept: application/json, text/event-stream`;
+the reply may be plain JSON or an event stream (read until the response to
+that request). The `Mcp-Session-Id` from `initialize` is sent on every later
+request, with `MCP-Protocol-Version: 2024-11-05`, and a `DELETE` with it ends
+the session at shutdown (best effort). `headers` values are plain config:
+keep tokens out of a committed `.ifnh/config.json`.
+
+`agents` limits a server to some agent identities: `parent` is the
+top-level agent, and a subagent is its role (`research`, `implement`,
+`review`). Absent or empty means every agent. A server that is not enabled
+for an agent is never started for it and behaves as if it did not exist
+(`mcp_list` says `no MCP servers for agent '<name>'` when none is left; a
+call gets `error: mcp server '<name>' is not enabled for agent '<agent>'`).
+An unknown identity only produces a config warning, so a role list stays
+forward-compatible.
+
+```jsonc
+{ "mcp_servers": { "docs": { "command": "docs-mcp", "agents": ["parent", "research"] } } }
+```
+
+Subagents inherit MCP through the same allowlist; each child starts its own
+connections, which end when the child finishes.
+
+Stdio servers spawn lazily on first use and are killed at session end. Tool
 calls pass the permission engine (`mcp.<server>.<tool>`, default ask).
 Inspect with `/mcp`; the agent uses `mcp_list`/`mcp_describe`/`mcp_call`.
 `mcp_describe(server, tool)` returns that tool's description and its input

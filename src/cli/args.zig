@@ -113,7 +113,17 @@ pub const AskArgs = struct {
     deny_all: bool = false,
     /// Explicit `--policy`; null means the default (`ask`).
     policy: ?ApprovalPolicy = null,
+    /// `--image <path>` (repeatable, up to `max_images`), in command-line order.
+    image_paths: [max_images][]const u8 = undefined,
+    image_count: usize = 0,
+
+    pub fn images(self: *const AskArgs) []const []const u8 {
+        return self.image_paths[0..self.image_count];
+    }
 };
+
+/// Most images one `ask` may attach.
+pub const max_images: usize = 8;
 
 fn parseGlobal(argv: []const []const u8, i: *usize, result: *Parsed) ParseError!void {
     const arg = argv[i.*];
@@ -215,7 +225,7 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
     return result;
 }
 
-const AskFlag = enum { json, yes, deny_all, policy, prompt };
+const AskFlag = enum { json, yes, deny_all, policy, prompt, image };
 
 const ask_flag_table = [_]struct { name: []const u8, flag: AskFlag }{
     .{ .name = "--json", .flag = .json },
@@ -223,6 +233,7 @@ const ask_flag_table = [_]struct { name: []const u8, flag: AskFlag }{
     .{ .name = "--deny-all", .flag = .deny_all },
     .{ .name = "--policy", .flag = .policy },
     .{ .name = "-p", .flag = .prompt },
+    .{ .name = "--image", .flag = .image },
 };
 
 /// Parse the flags and prompt of `ifnh ask`. Exactly one prompt may be given:
@@ -254,6 +265,13 @@ pub fn parseAsk(args: []const []const u8) ParseError!AskArgs {
                     if (i >= args.len) return error.MissingFlagValue;
                     if (out.prompt != null) return error.TooManyArguments;
                     out.prompt = args[i];
+                },
+                .image => {
+                    i += 1;
+                    if (i >= args.len) return error.MissingFlagValue;
+                    if (out.image_count >= max_images) return error.TooManyArguments;
+                    out.image_paths[out.image_count] = args[i];
+                    out.image_count += 1;
                 },
             }
             continue;
@@ -364,6 +382,20 @@ test "ask --json after the subcommand" {
     // The global flag still works in either position.
     try std.testing.expect((try parse(&.{ "--json", "ask", "hi" })).flags.json);
     try std.testing.expect((try parseAsk(&.{"--json"})).json);
+}
+
+test "ask --image parses, repeats in order and is capped" {
+    const a = try parseAsk(&.{ "--image", "a.png", "describe", "--image", "b.jpg" });
+    try std.testing.expectEqual(@as(usize, 2), a.images().len);
+    try std.testing.expectEqualStrings("a.png", a.images()[0]);
+    try std.testing.expectEqualStrings("b.jpg", a.images()[1]);
+    try std.testing.expectEqualStrings("describe", a.prompt.?);
+    try std.testing.expectEqual(@as(usize, 0), (try parseAsk(&.{"hi"})).images().len);
+    try std.testing.expectError(error.MissingFlagValue, parseAsk(&.{"--image"}));
+
+    const nine = [_][]const u8{ "--image", "1.png", "--image", "2.png", "--image", "3.png", "--image", "4.png", "--image", "5.png", "--image", "6.png", "--image", "7.png", "--image", "8.png" };
+    try std.testing.expectEqual(@as(usize, 8), (try parseAsk(&nine)).images().len);
+    try std.testing.expectError(error.TooManyArguments, parseAsk(&(nine ++ [_][]const u8{ "--image", "9.png" })));
 }
 
 test "each ask flag parses" {

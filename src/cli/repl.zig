@@ -24,7 +24,8 @@ const secret_mod = @import("../ui/secret.zig");
 const models_mod = @import("../providers/models.zig");
 const tool_mod = @import("../tools/tool.zig");
 const openai = @import("../providers/openai.zig");
-const anthropic = @import("../providers/anthropic.zig");
+const resolve_mod = @import("../core/config/resolve.zig");
+const image_mod = @import("../core/image.zig");
 const trace_mod = @import("../core/trace.zig");
 const wire_log = @import("../core/wire_log.zig");
 const turn_cache_mod = @import("../core/turn_cache.zig");
@@ -396,6 +397,8 @@ pub fn run(
     }
 
     // ---- input loop ----
+    // Images queued by `/image`, sent with the next user message.
+    var image_queue = image_mod.Queue{};
     var stdin_buf: [4096]u8 = undefined;
     var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buf);
 
@@ -440,12 +443,12 @@ pub fn run(
             const cmd_end = std.mem.indexOfScalar(u8, line, ' ') orelse line.len;
             const cmd = line[1..cmd_end];
             const rest = if (cmd_end < line.len) std.mem.trim(u8, line[cmd_end + 1 ..], " \t") else "";
-            const action = handleCommand(io, arena, cwd, &rt, &ui, &events, &cfg, cmd, rest, profiled_instr);
+            const action = handleCommand(io, arena, cwd, &rt, &ui, &events, &cfg, &image_queue, cmd, rest, profiled_instr);
             switch (action) {
                 .quit => break,
                 .submit => |prompt| {
                     ui.beginTurn(&rt, &cfg);
-                    const res = try rt.submitTurn(arena, &cfg, rt.providerConfig(&cfg), profiled_instr.text, profiled_instr.stable_len, prompt, cwd, &events);
+                    const res = try rt.submitTurn(arena, &cfg, rt.providerConfig(&cfg), profiled_instr.text, profiled_instr.stable_len, prompt, image_queue.take(), cwd, &events);
                     try renderTurn(io, arena, &ui, res);
                     ui.endTurn(&rt, &cfg, res);
                 },
@@ -498,7 +501,7 @@ pub fn run(
         };
 
         ui.beginTurn(&rt, &cfg);
-        const res = try rt.submitTurn(arena, &cfg, rt.providerConfig(&cfg), skill_prompt.text, skill_prompt.stable_len, line, cwd, &events);
+        const res = try rt.submitTurn(arena, &cfg, rt.providerConfig(&cfg), skill_prompt.text, skill_prompt.stable_len, line, image_queue.take(), cwd, &events);
         try renderTurn(io, arena, &ui, res);
         ui.endTurn(&rt, &cfg, res);
     }
@@ -784,7 +787,7 @@ fn runFirstRunSetup(
     var context_window: ?u64 = null;
     {
         try out(io, "testing tool support ({s})... ", .{model_name});
-        const probe = @import("../providers/probe.zig").probeToolSupport(arena, io, if (std.mem.eql(u8, preset.id, "anthropic")) anthropic.instance else openai.instance, base_url, key_value, model_name);
+        const probe = @import("../providers/probe.zig").probeToolSupport(arena, io, resolve_mod.providerFor(preset.id) orelse openai.instance, base_url, key_value, model_name);
         switch (probe) {
             .supported => {
                 try out(io, "{s}ok — tool calling works{s}\n", .{ palette.success("", arena), "\x1b[0m" });
@@ -926,7 +929,7 @@ pub const commands = [_][]const u8{
     "help",      "quit",      "model", "config",  "context",  "undo",
     "redo",      "diff",      "plan",  "agents",  "mcp",      "exec",
     "review",    "reconcile", "usage", "compact", "sessions", "provider",
-    "lifecycle", "skills",
+    "lifecycle", "skills",    "image",
 };
 
 fn handleCommand(
@@ -937,6 +940,7 @@ fn handleCommand(
     ui: *const Ui,
     events: *const session_runtime.Events,
     cfg: *config_mod.Store,
+    images: *image_mod.Queue,
     cmd: []const u8,
     rest: []const u8,
     instr: instructions_mod.Assembled,
@@ -963,9 +967,32 @@ fn handleCommand(
             \\  /reconcile <path>     spawn reconciliation agent for a path
             \\  /usage                session token usage
             \\  /compact              compact the conversation context
+            \\  /image <path>         attach a png/jpg/gif/webp to the next message
+            \\  /image [clear]        show the queued count / empty the queue
             \\  /sessions             list sessions (use `ifnh resume <id>`)
             \\
         , .{}) catch {};
+    } else if (std.mem.eql(u8, cmd, "image")) {
+        if (rest.len == 0) {
+            out(io, "{d} image(s) queued for the next message\n", .{images.items.items.len}) catch {};
+        } else if (std.mem.eql(u8, rest, "clear")) {
+            images.clear();
+            out(io, "image queue cleared\n", .{}) catch {};
+        } else if (image_mod.load(arena, io, cwd, rest)) |loaded| {
+            switch (loaded) {
+                .ok => |part| {
+                    const added = images.add(arena, part) catch false;
+                    if (added) {
+                        out(io, "queued {s} ({d} queued)\n", .{ rest, images.items.items.len }) catch {};
+                    } else {
+                        out(io, "error: at most {d} images per message\n", .{image_mod.max_per_turn}) catch {};
+                    }
+                },
+                .err => |message| out(io, "error: {s}\n", .{message}) catch {},
+            }
+        } else |err| {
+            out(io, "error: cannot read image '{s}': {s}\n", .{ rest, @errorName(err) }) catch {};
+        }
     } else if (std.mem.eql(u8, cmd, "model")) {
         if (rest.len > 0) {
             if (!validModelId(rest)) {
@@ -1310,11 +1337,11 @@ fn handleCommand(
         } else out(io, "skills unavailable\n", .{}) catch {};
     } else if (std.mem.eql(u8, cmd, "mcp")) {
         if (rt.mcp_registry) |reg| {
-            if (reg.configs.len == 0) {
+            if (reg.all_configs.len == 0) {
                 out(io, "no MCP servers configured (mcp_servers in config)\n", .{}) catch {};
             }
             for (reg.configs) |c| {
-                out(io, "  {s}: {s}\n", .{ c.name, c.command }) catch {};
+                out(io, "  {s}: {s}\n", .{ c.name, if (c.url.len > 0) c.url else c.command }) catch {};
             }
             out(io, "{s}", .{rt.mcpListText(arena)}) catch {};
         } else out(io, "MCP not available\n", .{}) catch {};

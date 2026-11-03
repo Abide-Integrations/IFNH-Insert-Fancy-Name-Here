@@ -5,6 +5,15 @@ const std = @import("std");
 
 pub const ChatRole = enum { system, user, assistant, tool };
 
+/// An image attached to a user message. Base64 only: there is deliberately
+/// no URL form, so a request never makes the provider fetch a remote file.
+pub const ImagePart = struct {
+    /// e.g. "image/png".
+    media_type: []const u8,
+    /// Standard base64 of the file bytes, unpadded lines (never line-split).
+    data_base64: []const u8,
+};
+
 pub const ChatMessage = struct {
     role: ChatRole,
     content: []const u8,
@@ -14,6 +23,15 @@ pub const ChatMessage = struct {
     tool_calls_json: ?[]const u8 = null,
     /// Tool result failed/denied (Anthropic `tool_result.is_error`).
     is_error: bool = false,
+    /// Anthropic extended thinking carried by an assistant turn. A thinking
+    /// block is only sent back when `reasoning_signature` is set; with
+    /// `reasoning_redacted` the signature field holds the opaque `data` of a
+    /// `redacted_thinking` block and is echoed verbatim.
+    reasoning: ?[]const u8 = null,
+    reasoning_signature: ?[]const u8 = null,
+    reasoning_redacted: bool = false,
+    /// Images on a user message (ignored on every other role).
+    images: []const ImagePart = &.{},
 };
 
 /// A tool advertised to the model. `parameters_json` is a JSON Schema object;
@@ -68,10 +86,20 @@ pub fn isRetryable(kind: ProviderFailureKind) bool {
     };
 }
 
+/// A completed thinking block, emitted once per assistant message so the
+/// engine can echo it back on the next request (see `ChatMessage.reasoning`).
+pub const ReasoningBlock = struct {
+    text: []const u8 = "",
+    /// Signature, or the opaque `data` when `redacted`.
+    signature: []const u8,
+    redacted: bool = false,
+};
+
 /// Streaming provider events (DECISIONS D39).
 pub const StreamEvent = union(enum) {
     content_delta: []const u8,
     reasoning_delta: []const u8,
+    reasoning_block: ReasoningBlock,
     tool_call: ToolCall,
     usage: Usage,
     done,

@@ -20,6 +20,7 @@ const engine_mod = @import("../permissions/engine.zig");
 const journal_mod = @import("../journal.zig");
 const fsutil = @import("../fsutil.zig");
 const git_mod = @import("../git.zig");
+const mcp_mod = @import("../mcp.zig");
 
 pub const max_summary_bytes: usize = 4 * 1024;
 
@@ -139,6 +140,9 @@ pub const Host = struct {
     worktree_root: ?[]const u8 = null,
     /// Session hint used in worktree/branch names.
     session_hint: []const u8 = "s",
+    /// The parent's MCP registry (borrowed). A child never uses it directly:
+    /// it gets its own `forAgent` view with no live clients (E-03).
+    mcp: ?*const mcp_mod.Registry = null,
 };
 
 fn rolePreamble(arena: std.mem.Allocator, role: Role, label: []const u8) ![]const u8 {
@@ -290,6 +294,11 @@ fn runChild(
         .research, .review => &.{},
     };
 
+    // MCP for the child: the servers its role is allowlisted for, started on
+    // demand and shut down when the child finishes.
+    var child_mcp: ?mcp_mod.Registry = if (host.mcp) |parent_reg| parent_reg.forAgent(child_arena, @tagName(role)) else null;
+    defer if (child_mcp) |*reg| reg.deinit();
+
     var child_tool_ctx = tool_mod.ToolContext{
         .io = host.io,
         .arena = child_arena,
@@ -306,6 +315,10 @@ fn runChild(
         .agent_spawn_ctx = host,
         .agent_depth = parent_depth + 1,
         .agent_label = label,
+        .mcp_list_fn = if (child_mcp != null) mcp_mod.listHook else null,
+        .mcp_call_fn = if (child_mcp != null) mcp_mod.callHook else null,
+        .mcp_describe_fn = if (child_mcp != null) mcp_mod.describeHook else null,
+        .mcp_ctx = if (child_mcp) |*reg| reg else null,
     };
 
     var history: std.ArrayListUnmanaged(core_types.ChatMessage) = .empty;
@@ -815,4 +828,70 @@ test "routed child role switches provider, model and options together" {
     try std.testing.expectEqual(tool_mod.AgentSpawnResult.SpawnStatus.failed, unknown.status);
     try std.testing.expect(std.mem.indexOf(u8, unknown.summary, "unknown alias 'explicit-model'") != null);
     try std.testing.expectEqual(@as(usize, 1), parent_rec.calls);
+}
+
+test "a research child gets only its allowed MCP servers; the parent keeps its own set" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Two stdio servers that touch a marker file when they are spawned.
+    var dir_buf: [4096]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+    const parent_script = try mcp_mod.writeFakeServerWith(tmp.dir, io, arena, "parent-mcp.sh", try std.fmt.allocPrint(arena, "touch '{s}/spawned-parent'", .{dir}));
+    const research_script = try mcp_mod.writeFakeServerWith(tmp.dir, io, arena, "research-mcp.sh", try std.fmt.allocPrint(arena, "touch '{s}/spawned-research'", .{dir}));
+    const cfg_json = try std.fmt.allocPrint(
+        arena,
+        "{{\"p\":{{\"command\":\"{s}\",\"agents\":[\"parent\"]}},\"r\":{{\"command\":\"{s}\",\"agents\":[\"research\"]}}}}",
+        .{ parent_script, research_script },
+    );
+    const cfg_val = try std.json.parseFromSliceLeaky(std.json.Value, arena, cfg_json, .{});
+    var registry = try mcp_mod.Registry.init(io, arena, cfg_val, "parent");
+    defer registry.deinit();
+    try std.testing.expectEqual(@as(usize, 1), registry.configs.len);
+    try std.testing.expectEqualStrings("p", registry.configs[0].name);
+
+    // The child lists its MCP tools, then answers.
+    var child_fake = testing.Fake{ .script = &.{
+        &.{.{ .tool_call = .{ .id = "c1", .name = "mcp_list", .arguments_json = "{}" } }},
+        &.{.{ .text = "listed" }},
+    } };
+    var cancel = std.atomic.Value(bool).init(false);
+    var host = Host{
+        .io = io,
+        .workspace = tmp.dir,
+        .base_system = "",
+        .provider = child_fake.provider(),
+        .base_url = "",
+        .api_key = "",
+        .default_model = "fake",
+        .mode = .auto,
+        .read_globs = &.{"**"},
+        .write_globs = &.{},
+        .command_allow = &.{},
+        .command_deny = &.{},
+        .env_allow = &.{},
+        .journal = null,
+        .approval_ctx = undefined,
+        .approval_fn = undefined,
+        .max_depth = 1,
+        .max_concurrent = 1,
+        .max_rounds = 10,
+        .redactions = &.{},
+        .cancel = &cancel,
+        .mcp = &registry,
+    };
+
+    const result = spawnHook(&host, arena, 0, "{\"task\":\"list mcp\",\"role\":\"research\"}");
+    try std.testing.expectEqual(tool_mod.AgentSpawnResult.SpawnStatus.completed, result.status);
+
+    // The child started the research server and never the parent-only one.
+    try tmp.dir.access(io, "spawned-research", .{});
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "spawned-parent", .{}));
+    // The child did not borrow (or leave behind) any of the parent's clients.
+    try std.testing.expectEqual(@as(usize, 0), registry.clients.items.len);
+    try std.testing.expectEqual(@as(usize, 1), registry.configs.len);
 }

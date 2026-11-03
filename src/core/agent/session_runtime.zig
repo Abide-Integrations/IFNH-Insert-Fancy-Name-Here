@@ -29,7 +29,6 @@ const interrupt_mod = @import("../interrupt.zig");
 const tool_mod = @import("../../tools/tool.zig");
 const core_types = @import("../types.zig");
 const openai = @import("../../providers/openai.zig");
-const anthropic = @import("../../providers/anthropic.zig");
 const trace_mod = @import("../trace.zig");
 const wire_log = @import("../wire_log.zig");
 const fsutil = @import("../fsutil.zig");
@@ -226,7 +225,7 @@ pub const SessionRuntime = struct {
         // ---- MCP registry (lazy servers, J137/138) ----
         self.mcp_registry = blk: {
             const reg = arena.create(mcp_mod.Registry) catch break :blk null;
-            reg.* = mcp_mod.Registry.init(io, arena, cfg.get("mcp_servers")) catch break :blk null;
+            reg.* = mcp_mod.Registry.init(io, arena, cfg.get("mcp_servers"), "parent") catch break :blk null;
             break :blk reg;
         };
 
@@ -260,7 +259,7 @@ pub const SessionRuntime = struct {
         const api_key_env = cfg.getOptionalString("model.api_key_env") orelse
             (if (is_anthropic) "ANTHROPIC_API_KEY" else "OPENAI_API_KEY");
         return .{
-            .provider = if (is_anthropic) anthropic.instance else openai.instance,
+            .provider = resolve_mod.providerFor(provider_name) orelse openai.instance,
             .model = cfg.getString("model.model", ""),
             .base_url = base_url,
             .api_key = self.keyFor(api_key_env),
@@ -404,6 +403,9 @@ pub const SessionRuntime = struct {
         /// Byte length of the byte-stable prefix of `system` (B-03).
         system_stable_len: usize,
         user_text: []const u8,
+        /// Images attached to this turn's user message. They live in memory
+        /// only: the session record keeps the text.
+        images: []const core_types.ImagePart,
         cwd: std.Io.Dir,
         events: *const Events,
     ) !TurnOutcome {
@@ -418,7 +420,7 @@ pub const SessionRuntime = struct {
             }
         }
         if (pcfg.model.len == 0) {
-            statusFmt(events, .plain, "no model configured — run /provider set <openai|anthropic> <model> [base_url] [key_env]\n", .{});
+            statusFmt(events, .plain, "no model configured — run /provider set <openai|anthropic|openai-responses> <model> [base_url] [key_env]\n", .{});
             return .{};
         }
         if (pcfg.api_key.len == 0) {
@@ -520,6 +522,7 @@ pub const SessionRuntime = struct {
                 break :blk root;
             },
             .session_hint = self.store.manifest.id,
+            .mcp = self.mcp_registry,
         };
         var tool_ctx = tool_mod.ToolContext{
             .io = io,
@@ -593,7 +596,7 @@ pub const SessionRuntime = struct {
         // rollback snapshot is never invalidated by history rewriting.
         const history_start = self.history.items.len;
         _ = try self.store.append(.{ .user = .{ .text = user_text } });
-        try self.history.append(arena, .{ .role = .user, .content = user_text });
+        try self.history.append(arena, .{ .role = .user, .content = user_text, .images = images });
 
         const outcome = agent_engine.runTurn(.{
             .io = io,
@@ -846,33 +849,21 @@ fn redactionsFor(arena: std.mem.Allocator, enabled: bool, api_key: []const u8) [
 
 const mcp_registry_sentinel: *mcp_mod.Registry = @ptrFromInt(@alignOf(usize)); // never dereferenced
 
+// The hooks themselves live in `mcp.zig` (children use them too); these
+// only turn "no registry" into the same answers as before.
 fn mcpListHook(ctx: *anyopaque, arena: std.mem.Allocator) []const u8 {
-    const reg: *mcp_mod.Registry = @ptrCast(@alignCast(ctx));
-    if (reg == mcp_registry_sentinel or reg.configs.len == 0) return "no MCP servers configured";
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    for (reg.allTools(arena)) |st| {
-        buf.print(arena, "{s}.{s}: {s}\n", .{ st.server, st.tool.name, st.tool.description }) catch {};
-    }
-    if (buf.items.len == 0) return "no MCP tools available";
-    return buf.items;
+    if (ctx == @as(*anyopaque, mcp_registry_sentinel)) return "no MCP servers configured";
+    return mcp_mod.listHook(ctx, arena);
 }
 
 fn mcpDescribeHook(ctx: *anyopaque, arena: std.mem.Allocator, server: []const u8, tool: []const u8) []const u8 {
-    const reg: *mcp_mod.Registry = @ptrCast(@alignCast(ctx));
-    if (reg == mcp_registry_sentinel or reg.configs.len == 0) return "error: no MCP servers configured";
-    return reg.describeText(arena, server, tool);
+    if (ctx == @as(*anyopaque, mcp_registry_sentinel)) return "error: no MCP servers configured";
+    return mcp_mod.describeHook(ctx, arena, server, tool);
 }
 
 fn mcpCallHook(ctx: *anyopaque, arena: std.mem.Allocator, server: []const u8, tool: []const u8, arguments_json: []const u8) []const u8 {
-    const reg: *mcp_mod.Registry = @ptrCast(@alignCast(ctx));
-    if (reg == mcp_registry_sentinel) return "error: MCP not configured";
-    const res = reg.call(arena, server, tool, arguments_json) catch |err| {
-        return std.fmt.allocPrint(arena, "error: mcp call failed: {s}", .{@errorName(err)}) catch "error: mcp call failed";
-    };
-    if (res.is_error) {
-        return std.fmt.allocPrint(arena, "mcp error: {s}", .{res.text}) catch res.text;
-    }
-    return res.text;
+    if (ctx == @as(*anyopaque, mcp_registry_sentinel)) return "error: MCP not configured";
+    return mcp_mod.callHook(ctx, arena, server, tool, arguments_json);
 }
 
 fn execStartHook(ctx: *anyopaque, arena: std.mem.Allocator, command: []const u8) []const u8 {

@@ -17,7 +17,7 @@
       "properties": {
         "provider": {
           "type": "string",
-          "enum": ["openai", "anthropic"]
+          "enum": ["openai", "anthropic", "openai-responses"]
         },
         "model": {
           "type": "string",
@@ -230,8 +230,49 @@
     },
     "mcp_servers": {
       "type": "object",
-      "additionalProperties": true,
-      "description": "MCP server definitions, keyed by server name."
+      "description": "MCP server definitions, keyed by server name. Each sets exactly one of command (stdio) or url (Streamable HTTP).",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Stdio server: program to spawn. Exclusive with url."
+          },
+          "args": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Stdio server: arguments."
+          },
+          "env": {
+            "type": "object",
+            "additionalProperties": { "type": "string" },
+            "description": "Stdio server: extra environment variables."
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "url": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Streamable HTTP server endpoint. Exclusive with command."
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": { "type": "string" },
+            "description": "HTTP server: extra request headers (for example Authorization)."
+          },
+          "agents": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Agent identities allowed to use the server: parent, research, implement, review. Absent or empty means every agent."
+          }
+        },
+        "oneOf": [
+          { "required": ["command"] },
+          { "required": ["url"] }
+        ]
+      }
     }
   }
 }

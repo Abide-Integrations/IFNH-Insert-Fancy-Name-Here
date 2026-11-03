@@ -181,7 +181,7 @@ pub const Accumulator = struct {
             }) catch {},
             .usage => |u| self.usage = u,
             .failure => |f| self.failure_message = self.arena.dupe(u8, f.message) catch "",
-            .reasoning_delta, .done => {},
+            .reasoning_delta, .reasoning_block, .done => {},
         }
     }
 

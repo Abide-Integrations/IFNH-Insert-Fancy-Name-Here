@@ -125,11 +125,13 @@ const core_types = @import("../core/types.zig");
 
 /// Event kinds in arrival order, so tests can prove *when* a `tool_call`
 /// was emitted rather than only that it eventually was.
-const EventKind = enum { content_delta, reasoning_delta, tool_call, usage, done, failure };
+pub const EventKind = enum { content_delta, reasoning_delta, reasoning_block, tool_call, usage, done, failure };
 
-const Collector = struct {
+pub const Collector = struct {
     arena: std.mem.Allocator,
     text: std.ArrayListUnmanaged(u8) = .empty,
+    reasoning: std.ArrayListUnmanaged(u8) = .empty,
+    reasoning_block: ?core_types.ReasoningBlock = null,
     tool_calls: std.ArrayListUnmanaged(core_types.ToolCall) = .empty,
     events: std.ArrayListUnmanaged(EventKind) = .empty,
     failure: ?[]const u8 = null,
@@ -143,6 +145,7 @@ const Collector = struct {
         const kind: EventKind = switch (ev) {
             .content_delta => .content_delta,
             .reasoning_delta => .reasoning_delta,
+            .reasoning_block => .reasoning_block,
             .tool_call => .tool_call,
             .usage => .usage,
             .done => .done,
@@ -161,15 +164,20 @@ const Collector = struct {
             },
             .done => self.done = true,
             .usage => |u| self.usage = u,
-            else => {},
+            .reasoning_delta => |d| self.reasoning.appendSlice(self.arena, d) catch {},
+            .reasoning_block => |b| self.reasoning_block = .{
+                .text = self.arena.dupe(u8, b.text) catch "",
+                .signature = self.arena.dupe(u8, b.signature) catch "",
+                .redacted = b.redacted,
+            },
         }
     }
 
-    fn firstIndexOf(self: *const Collector, kind: EventKind) ?usize {
+    pub fn firstIndexOf(self: *const Collector, kind: EventKind) ?usize {
         return std.mem.indexOfScalar(EventKind, self.events.items, kind);
     }
 
-    fn lastIndexOf(self: *const Collector, kind: EventKind) ?usize {
+    pub fn lastIndexOf(self: *const Collector, kind: EventKind) ?usize {
         return std.mem.lastIndexOfScalar(EventKind, self.events.items, kind);
     }
 };
@@ -330,13 +338,25 @@ test "openai adapter accumulates tool calls from stream" {
 }
 
 /// Serve `body` as raw SSE bytes and run one adapter round against it.
-fn streamFixture(
+pub fn streamFixture(
     io: std.Io,
     arena: std.mem.Allocator,
     comptime adapter: type,
     body: []const u8,
 ) !Collector {
-    const srv = try FakeServer.start(io, arena, body);
+    return streamFixtureWith(io, arena, adapter, "200 OK", "Content-Type: text/event-stream\r\n", body);
+}
+
+/// `streamFixture` with a custom status line and headers (error paths).
+pub fn streamFixtureWith(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    comptime adapter: type,
+    status_line: []const u8,
+    extra_headers: []const u8,
+    body: []const u8,
+) !Collector {
+    const srv = try FakeServer.startWith(io, arena, status_line, extra_headers, body);
     defer srv.stop();
     var cancel = std.atomic.Value(bool).init(false);
     var collector = Collector{ .arena = arena };
@@ -483,4 +503,68 @@ test "wire sse anthropic fixture: a torn tool_use block is still flushed once" {
     try std.testing.expectEqualStrings("toolu_9", c.tool_calls.items[0].id);
     try std.testing.expectEqualStrings("{}", c.tool_calls.items[0].arguments_json);
     try std.testing.expect(c.done);
+}
+
+test "wire sse anthropic fixture: thinking deltas, signature, then a tool_use" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const body =
+        "event: message_start\n" ++
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":9}}}\n\n" ++
+        "event: content_block_start\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Let me \"}}\n\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"think.\"}}\n\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"SIG\"}}\n\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"NATURE\"}}\n\n" ++
+        "event: content_block_stop\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+        "event: content_block_start\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"OPAQUE\"}}\n\n" ++
+        "event: content_block_stop\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n" ++
+        "event: content_block_start\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"read\",\"input\":{}}}\n\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n" ++
+        "event: content_block_stop\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":2}\n\n" ++
+        "event: message_stop\n" ++
+        "data: {\"type\":\"message_stop\"}\n\n";
+
+    const c = try streamFixture(std.testing.io, arena, anthropic_adapter, body);
+    try std.testing.expect(c.failure == null);
+    try std.testing.expectEqualStrings("Let me think.", c.reasoning.items);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(EventKind, c.events.items, &.{.reasoning_delta}));
+    // The last block seen is the redacted one; the signed block came first.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(EventKind, c.events.items, &.{.reasoning_block}));
+    try std.testing.expectEqualStrings("OPAQUE", c.reasoning_block.?.signature);
+    try std.testing.expect(c.reasoning_block.?.redacted);
+    try std.testing.expectEqual(@as(usize, 1), c.tool_calls.items.len);
+    try std.testing.expectEqualStrings("toolu_1", c.tool_calls.items[0].id);
+    try std.testing.expect(c.lastIndexOf(.reasoning_block).? < c.firstIndexOf(.tool_call).?);
+    try std.testing.expect(c.done);
+}
+
+test "wire sse anthropic fixture: a signed thinking block is delivered whole" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const body =
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hm\"}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"SIGNATURE\"}}\n\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+        "data: {\"type\":\"message_stop\"}\n\n";
+    const c = try streamFixture(std.testing.io, arena, anthropic_adapter, body);
+    try std.testing.expectEqualStrings("hm", c.reasoning_block.?.text);
+    try std.testing.expectEqualStrings("SIGNATURE", c.reasoning_block.?.signature);
+    try std.testing.expect(!c.reasoning_block.?.redacted);
 }

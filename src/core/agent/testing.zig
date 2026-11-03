@@ -8,6 +8,8 @@ const provider_mod = @import("../../providers/provider.zig");
 
 pub const Action = union(enum) {
     text: []const u8,
+    reasoning: []const u8,
+    reasoning_block: core_types.ReasoningBlock,
     tool_call: struct { id: []const u8, name: []const u8, arguments_json: []const u8 },
     usage: core_types.Usage,
     failure: core_types.ProviderFailure,
@@ -51,6 +53,8 @@ fn streamFn(
                 const duped = try alloc.dupe(u8, t);
                 sink.emit(.{ .content_delta = duped });
             },
+            .reasoning => |t| sink.emit(.{ .reasoning_delta = t }),
+            .reasoning_block => |b| sink.emit(.{ .reasoning_block = b }),
             .tool_call => |tc| sink.emit(.{ .tool_call = .{
                 .id = tc.id,
                 .name = tc.name,
