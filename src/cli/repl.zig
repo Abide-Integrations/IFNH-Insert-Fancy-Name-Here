@@ -1384,9 +1384,6 @@ fn handleCommand(
     return .none;
 }
 
-/// Disk-backed slash command (D030, M0-T37): `.ifnh/commands/<name>.md`
-/// with optional frontmatter; `$ARGS` in the body is replaced by the
-/// command arguments. The body is submitted as the user's prompt.
 /// `/skills [list]`, `/skills install ...`, `/skills remove <name>` (E-05b).
 /// Install and remove rescan the catalog, so no `/reload` is needed.
 fn skillsCommand(
@@ -1529,6 +1526,9 @@ fn memoryCommand(
     if (res.skipped > 0) out(io, "  ({d} malformed line(s) skipped)\n", .{res.skipped}) catch {};
 }
 
+/// Disk-backed slash command (D030, M0-T37): `.ifnh/commands/<name>.md`
+/// with optional frontmatter; `$ARGS` in the body is replaced by the
+/// command arguments. The body is submitted as the user's prompt.
 fn loadDiskCommand(io: std.Io, arena: std.mem.Allocator, cwd: std.Io.Dir, cmd: []const u8, args: []const u8) ?[]const u8 {
     var name_buf: [128]u8 = undefined;
     if (cmd.len == 0 or cmd.len > 64) return null;
