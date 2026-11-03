@@ -172,7 +172,7 @@ pub const SessionRuntime = struct {
         else
             try session_mod.Session.create(cwd, io, arena, opts.sessions_dir, opts.cwd_label);
         errdefer store.close();
-        const j = try journal_mod.Journal.open(io, arena, store.dir);
+        const j = try journal_mod.Journal.open(io, arena, store.dir, cwd);
         errdefer j.close();
 
         var self = SessionRuntime{
@@ -456,6 +456,28 @@ pub const SessionRuntime = struct {
                 .max_output_tokens = resolved.max_output_tokens,
             });
         }
+        var alias_models: std.ArrayListUnmanaged(subagent_mod.ChildModels.NamedModel) = .empty;
+        var alias_names: std.ArrayListUnmanaged([]const u8) = .empty;
+        alias_names.append(arena, "default") catch {};
+        if (cfg.get("models.aliases")) |av| {
+            if (av == .object) {
+                var ait = av.object.iterator();
+                while (ait.next()) |entry| alias_names.append(arena, entry.key_ptr.*) catch {};
+            }
+        }
+        for (alias_names.items) |name| {
+            const resolved = resolve_mod.resolveAlias(cfg, arena, name) catch continue;
+            alias_models.append(arena, .{ .name = name, .model = .{
+                .provider = resolved.provider,
+                .model = resolved.model,
+                .base_url = resolved.base_url,
+                .api_key = self.keyFor(resolved.api_key_env),
+                .provider_options = resolved.provider_options,
+                .temperature = resolved.temperature,
+                .max_output_tokens = resolved.max_output_tokens,
+            } }) catch {};
+        }
+        child_models.aliases = alias_models.items;
         var host = subagent_mod.Host{
             .io = io,
             .workspace = cwd,
@@ -838,11 +860,7 @@ fn mcpListHook(ctx: *anyopaque, arena: std.mem.Allocator) []const u8 {
 fn mcpDescribeHook(ctx: *anyopaque, arena: std.mem.Allocator, server: []const u8, tool: []const u8) []const u8 {
     const reg: *mcp_mod.Registry = @ptrCast(@alignCast(ctx));
     if (reg == mcp_registry_sentinel or reg.configs.len == 0) return "error: no MCP servers configured";
-    const found = reg.describe(arena, server, tool) catch
-        return std.fmt.allocPrint(arena, "error: server '{s}' unavailable", .{server}) catch "error: server unavailable";
-    const t = found orelse
-        return std.fmt.allocPrint(arena, "error: unknown tool {s}.{s}", .{ server, tool }) catch "error: unknown tool";
-    return std.fmt.allocPrint(arena, "{s}.{s}: {s}\ninput schema: {s}", .{ server, t.name, t.description, t.input_schema_json }) catch "error: oom";
+    return reg.describeText(arena, server, tool);
 }
 
 fn mcpCallHook(ctx: *anyopaque, arena: std.mem.Allocator, server: []const u8, tool: []const u8, arguments_json: []const u8) []const u8 {
@@ -931,7 +949,7 @@ test "replay keeps assistant tool calls and tool results" {
     var rt = SessionRuntime{
         .io = io,
         .store = try session_mod.Session.create(tmp.dir, io, arena, "sessions", "/tmp/proj"),
-        .journal = try journal_mod.Journal.open(io, arena, tmp.dir),
+        .journal = try journal_mod.Journal.open(io, arena, tmp.dir, tmp.dir),
         .engine = engine_mod.Engine.init(arena, .ask),
         .user_keys = keys_mod.Keys.init(arena),
         .turn_cache = turn_cache_mod.TurnCache.init(io, arena),

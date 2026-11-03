@@ -109,10 +109,11 @@ pub const Set = struct {
             }
         }.lt);
 
-        var capped = false;
+        // Set when a tool beyond `max_tools` is seen, not when the cap is reached.
+        var over_cap = false;
         for (names.items) |name| {
             const label = std.fmt.allocPrint(arena, dir_path ++ "/{s}", .{name}) catch name;
-            if (capped) break;
+            if (over_cap) break;
             const text = dir.readFileAlloc(io, name, arena, .limited(max_file_bytes)) catch |err| {
                 switch (err) {
                     error.StreamTooLong => warn(arena, &warnings, "{s}: larger than {d} bytes; skipped", .{ label, max_file_bytes }),
@@ -126,17 +127,22 @@ pub const Set = struct {
                 continue;
             };
             switch (parsed) {
-                .object => parseOne(arena, label, parsed, &tools, &warnings),
+                .object => if (tools.items.len >= max_tools) {
+                    over_cap = true;
+                } else parseOne(arena, label, parsed, &tools, &warnings),
                 .array => |items| {
-                    for (items.items) |item| parseOne(arena, label, item, &tools, &warnings);
+                    for (items.items) |item| {
+                        if (tools.items.len >= max_tools) {
+                            over_cap = true;
+                            break;
+                        }
+                        parseOne(arena, label, item, &tools, &warnings);
+                    }
                 },
                 else => warn(arena, &warnings, "{s}: expected a tool object or an array of them; skipped", .{label}),
             }
-            if (tools.items.len >= max_tools) {
-                capped = true;
-                warn(arena, &warnings, "more than {d} custom tools defined; the rest were ignored", .{max_tools});
-            }
         }
+        if (over_cap) warn(arena, &warnings, "more than {d} custom tools defined; the rest were ignored", .{max_tools});
         return .{ .tools = tools.items, .warnings = warnings.items };
     }
 };
@@ -154,7 +160,6 @@ fn parseOne(
     tools: *std.ArrayListUnmanaged(CustomTool),
     warnings: *std.ArrayListUnmanaged([]const u8),
 ) void {
-    if (tools.items.len >= max_tools) return;
     if (value != .object) {
         warn(arena, warnings, "{s}: tool definition must be a JSON object; skipped", .{label});
         return;
@@ -371,6 +376,39 @@ fn expectRenderError(arena: std.mem.Allocator, tool: CustomTool, json: []const u
             try testing.expect(std.mem.indexOf(u8, e, needle) != null);
         },
     }
+}
+
+fn writeManyTools(arena: std.mem.Allocator, dir: std.Io.Dir, io: std.Io, n: usize) !void {
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    try body.append(arena, '[');
+    for (0..n) |i| {
+        if (i != 0) try body.append(arena, ',');
+        try body.print(arena, "{{\"name\":\"t{d}\",\"description\":\"d\",\"parameters\":{{\"type\":\"object\"}},\"command\":\"true\",\"permission\":\"read\"}}", .{i});
+    }
+    try body.append(arena, ']');
+    try writeToolFile(dir, io, "many.json", body.items);
+}
+
+test "custom tools: cap warns only past max_tools, not at it" {
+    const io = testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var at = testing.tmpDir(.{});
+    defer at.cleanup();
+    try writeManyTools(arena, at.dir, io, max_tools);
+    const set_at = Set.load(arena, io, at.dir, true);
+    try testing.expectEqual(max_tools, set_at.tools.len);
+    try testing.expectEqual(@as(usize, 0), set_at.warnings.len);
+
+    var over = testing.tmpDir(.{});
+    defer over.cleanup();
+    try writeManyTools(arena, over.dir, io, max_tools + 1);
+    const set_over = Set.load(arena, io, over.dir, true);
+    try testing.expectEqual(max_tools, set_over.tools.len);
+    try testing.expectEqual(@as(usize, 1), set_over.warnings.len);
+    try testing.expect(std.mem.indexOf(u8, set_over.warnings[0], "more than 64") != null);
 }
 
 test "custom tools: loads a single file and an array file in filename order" {

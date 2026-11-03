@@ -135,6 +135,7 @@ const Collector = struct {
     failure: ?[]const u8 = null,
     failure_kind: ?core_types.ProviderFailureKind = null,
     retry_after_s: ?u32 = null,
+    usage: ?core_types.Usage = null,
     done: bool = false,
 
     fn emit(ctx: *anyopaque, ev: core_types.StreamEvent) void {
@@ -159,6 +160,7 @@ const Collector = struct {
                 self.retry_after_s = f.retry_after_s;
             },
             .done => self.done = true,
+            .usage => |u| self.usage = u,
             else => {},
         }
     }
@@ -325,4 +327,160 @@ test "openai adapter accumulates tool calls from stream" {
     try std.testing.expectEqualStrings("c1", tc.id);
     try std.testing.expectEqualStrings("read", tc.name);
     try std.testing.expectEqualStrings("{\"path\":\"x\"}", tc.arguments_json);
+}
+
+/// Serve `body` as raw SSE bytes and run one adapter round against it.
+fn streamFixture(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    comptime adapter: type,
+    body: []const u8,
+) !Collector {
+    const srv = try FakeServer.start(io, arena, body);
+    defer srv.stop();
+    var cancel = std.atomic.Value(bool).init(false);
+    var collector = Collector{ .arena = arena };
+    const base = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}", .{srv.port});
+    try adapter.streamFn(undefined, arena, io, .{
+        .model = "test-model",
+        .base_url = base,
+        .api_key = "test-key-1234567890",
+        .system = "",
+        .messages = &.{},
+        .cancel = &cancel,
+    }, .{ .ctx = &collector, .emit_fn = Collector.emit });
+    srv.wait();
+    return collector;
+}
+
+test "wire sse openai fixture: text, two interleaved tool calls, usage, DONE" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Raw Chat Completions stream: role-only first chunk, a keep-alive
+    // comment, a text split across chunks, two tool calls whose arguments
+    // arrive in fragments, a finish chunk and a trailing usage chunk.
+    const body =
+        "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n" ++
+        ": keep-alive\n\n" ++
+        "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Let me \"}}]}\n\n" ++
+        "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"look.\"}}]}\n\n" ++
+        "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"\"}}]}}]}\n\n" ++
+        "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n" ++
+        "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"a.txt\\\"}\"}}]}}]}\n\n" ++
+        "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_b\",\"type\":\"function\",\"function\":{\"name\":\"grep\",\"arguments\":\"{\\\"pattern\\\":\\\"x\\\"}\"}}]}}]}\n\n" ++
+        "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" ++
+        "data: {\"id\":\"c1\",\"choices\":[],\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":30,\"total_tokens\":150,\"prompt_tokens_details\":{\"cached_tokens\":100}}}\n\n" ++
+        "data: [DONE]\n\n";
+
+    const c = try streamFixture(std.testing.io, arena, openai_adapter, body);
+    try std.testing.expect(c.failure == null);
+    try std.testing.expect(c.done);
+    try std.testing.expectEqualStrings("Let me look.", c.text.items);
+
+    try std.testing.expectEqual(@as(usize, 2), c.tool_calls.items.len);
+    try std.testing.expectEqualStrings("call_a", c.tool_calls.items[0].id);
+    try std.testing.expectEqualStrings("read", c.tool_calls.items[0].name);
+    try std.testing.expectEqualStrings("{\"path\":\"a.txt\"}", c.tool_calls.items[0].arguments_json);
+    try std.testing.expectEqualStrings("call_b", c.tool_calls.items[1].id);
+    try std.testing.expectEqualStrings("grep", c.tool_calls.items[1].name);
+    try std.testing.expectEqualStrings("{\"pattern\":\"x\"}", c.tool_calls.items[1].arguments_json);
+
+    const u = c.usage.?;
+    try std.testing.expectEqual(@as(u64, 120), u.input_tokens);
+    try std.testing.expectEqual(@as(u64, 30), u.output_tokens);
+    try std.testing.expectEqual(@as(u64, 100), u.cache_read_tokens);
+
+    // Order: text first, tool calls after it, `done` last.
+    try std.testing.expect(c.lastIndexOf(.content_delta).? < c.firstIndexOf(.tool_call).?);
+    try std.testing.expectEqual(EventKind.done, c.events.items[c.events.items.len - 1]);
+}
+
+test "wire sse openai fixture: an error event ends the stream with a failure" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const body =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"par\"}}]}\n\n" ++
+        "data: {\"error\":{\"message\":\"context length exceeded\"}}\n\n";
+    const c = try streamFixture(std.testing.io, arena, openai_adapter, body);
+    try std.testing.expect(!c.done);
+    try std.testing.expectEqualStrings("par", c.text.items);
+    try std.testing.expectEqualStrings("context length exceeded", c.failure.?);
+    try std.testing.expectEqual(core_types.ProviderFailureKind.invalid_request, c.failure_kind.?);
+}
+
+test "wire sse anthropic fixture: text block, tool_use block, usage, message_stop" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Raw Messages stream with `event:` lines, a ping, a text block, a
+    // tool_use block whose input arrives as partial JSON, and the closing
+    // message_delta / message_stop pair.
+    const body =
+        "event: message_start\n" ++
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":25,\"cache_read_input_tokens\":10,\"cache_creation_input_tokens\":5,\"output_tokens\":1}}}\n\n" ++
+        "event: ping\n" ++
+        "data: {\"type\":\"ping\"}\n\n" ++
+        "event: content_block_start\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Checking \"}}\n\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"the file.\"}}\n\n" ++
+        "event: content_block_stop\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+        "event: content_block_start\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"read\",\"input\":{}}}\n\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\"}}\n\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"a.txt\\\"}\"}}\n\n" ++
+        "event: content_block_stop\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n" ++
+        "event: message_delta\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":42}}\n\n" ++
+        "event: message_stop\n" ++
+        "data: {\"type\":\"message_stop\"}\n\n";
+
+    const c = try streamFixture(std.testing.io, arena, anthropic_adapter, body);
+    try std.testing.expect(c.failure == null);
+    try std.testing.expect(c.done);
+    try std.testing.expectEqualStrings("Checking the file.", c.text.items);
+
+    try std.testing.expectEqual(@as(usize, 1), c.tool_calls.items.len);
+    try std.testing.expectEqualStrings("toolu_1", c.tool_calls.items[0].id);
+    try std.testing.expectEqualStrings("read", c.tool_calls.items[0].name);
+    try std.testing.expectEqualStrings("{\"path\":\"a.txt\"}", c.tool_calls.items[0].arguments_json);
+
+    const u = c.usage.?;
+    try std.testing.expectEqual(@as(u64, 25), u.input_tokens);
+    try std.testing.expectEqual(@as(u64, 42), u.output_tokens);
+    try std.testing.expectEqual(@as(u64, 10), u.cache_read_tokens);
+    try std.testing.expectEqual(@as(u64, 5), u.cache_write_tokens);
+
+    try std.testing.expect(c.lastIndexOf(.content_delta).? < c.firstIndexOf(.tool_call).?);
+    try std.testing.expect(c.firstIndexOf(.tool_call).? < c.firstIndexOf(.usage).?);
+    try std.testing.expectEqual(EventKind.done, c.events.items[c.events.items.len - 1]);
+}
+
+test "wire sse anthropic fixture: a torn tool_use block is still flushed once" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // No content_block_stop and no message_stop: the stream just ends.
+    const body =
+        "event: content_block_start\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_9\",\"name\":\"ls\",\"input\":{}}}\n\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n";
+    const c = try streamFixture(std.testing.io, arena, anthropic_adapter, body);
+    try std.testing.expectEqual(@as(usize, 1), c.tool_calls.items.len);
+    try std.testing.expectEqualStrings("toolu_9", c.tool_calls.items[0].id);
+    try std.testing.expectEqualStrings("{}", c.tool_calls.items[0].arguments_json);
+    try std.testing.expect(c.done);
 }

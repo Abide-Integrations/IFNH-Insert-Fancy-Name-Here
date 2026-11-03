@@ -321,6 +321,16 @@ pub const Registry = struct {
         return null;
     }
 
+    /// `describe` rendered for the model: description and input schema, or an
+    /// `error: ...` line (the `mcp_describe` tool reports that prefix as failed).
+    pub fn describeText(self: *Registry, arena: std.mem.Allocator, server: []const u8, tool: []const u8) []const u8 {
+        const found = self.describe(arena, server, tool) catch
+            return std.fmt.allocPrint(arena, "error: server '{s}' unavailable", .{server}) catch "error: server unavailable";
+        const t = found orelse
+            return std.fmt.allocPrint(arena, "error: unknown tool {s}.{s}", .{ server, tool }) catch "error: unknown tool";
+        return std.fmt.allocPrint(arena, "{s}.{s}: {s}\ninput schema: {s}", .{ server, t.name, t.description, t.input_schema_json }) catch "error: oom";
+    }
+
     pub fn call(self: *Registry, arena: std.mem.Allocator, server: []const u8, tool: []const u8, arguments_json: []const u8) !CallResult {
         const c = try self.clientFor(server);
         return c.callTool(arena, tool, arguments_json);
@@ -410,4 +420,12 @@ test "registry parses config and dispatches calls" {
     try std.testing.expectEqualStrings("{\"type\":\"object\"}", described.input_schema_json);
     try std.testing.expect((try reg.describe(arena, "fake", "nope")) == null);
     try std.testing.expectError(error.UnknownServer, reg.describe(arena, "ghost", "echo"));
+
+    // The text the model sees: description plus the schema as compact JSON.
+    try std.testing.expectEqualStrings(
+        "fake.echo: Echo back\ninput schema: {\"type\":\"object\"}",
+        reg.describeText(arena, "fake", "echo"),
+    );
+    try std.testing.expectEqualStrings("error: unknown tool fake.nope", reg.describeText(arena, "fake", "nope"));
+    try std.testing.expectEqualStrings("error: server 'ghost' unavailable", reg.describeText(arena, "ghost", "echo"));
 }

@@ -148,7 +148,6 @@
         "max_retries": { "type": "integer", "minimum": 0 },
         "max_tool_rounds": { "type": "integer", "minimum": 1 },
         "timeout_tool_s": { "type": "integer", "minimum": 1 },
-        "timeout_turn_s": { "type": "integer", "minimum": 1 },
         "budget_usd": { "type": ["number", "null"], "minimum": 0 }
       }
     },
@@ -176,13 +175,6 @@
         }
       }
     },
-    "planning": {
-      "type": "object",
-      "additionalProperties": true,
-      "properties": {
-        "auto_call_threshold": { "type": "integer", "minimum": 1 }
-      }
-    },
     "sessions": {
       "type": "object",
       "additionalProperties": true,
@@ -199,16 +191,13 @@
       "additionalProperties": true,
       "properties": {
         "colors": { "type": "boolean" },
-        "footer": { "type": "boolean" },
-        "symbols": { "type": "string", "enum": ["unicode", "ascii"] },
-        "verbosity": { "type": "string", "enum": ["quiet", "normal", "verbose"] }
+        "footer": { "type": "boolean" }
       }
     },
     "debug": {
       "type": "object",
       "additionalProperties": true,
       "properties": {
-        "level": { "type": "string", "enum": ["debug", "info", "warn", "error"] },
         "redact": { "type": "boolean" }
       }
     },
