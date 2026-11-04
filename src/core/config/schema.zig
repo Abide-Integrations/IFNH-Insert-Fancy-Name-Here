@@ -168,7 +168,7 @@ test "config schema pins the sandbox section to the modes the sandbox module par
     const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), json_schema, .{});
 
     const modes = nodeAt(schema, "sandbox.mode").?.object.get("enum").?.array;
-    try std.testing.expectEqual(@typeInfo(@import("../sandbox.zig").Mode).@"enum".field_names.len, modes.items.len);
+    try std.testing.expectEqual(@typeInfo(@import("../sandbox.zig").Mode).@"enum".fields.len, modes.items.len);
     for (modes.items) |item| try std.testing.expect(@import("../sandbox.zig").Mode.parse(item.string) != null);
     try std.testing.expectEqualStrings("boolean", nodeAt(schema, "sandbox.network").?.object.get("type").?.string);
     try std.testing.expect(!nodeAt(schema, "sandbox.network").?.object.get("default").?.bool);

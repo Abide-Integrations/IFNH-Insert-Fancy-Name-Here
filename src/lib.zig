@@ -205,7 +205,7 @@ const CSink = struct {
     fn emit(self: *CSink, kind: EventKind, text: []const u8, status: c_int) void {
         const z = c_alloc.dupeSentinel(u8, text, 0) catch return;
         defer c_alloc.free(z);
-        self.cb(self.user, @backingInt(kind), z.ptr, status);
+        self.cb(self.user, @intFromEnum(kind), z.ptr, status);
     }
 
     fn onText(ctx: *anyopaque, chunk: []const u8) void {
@@ -215,7 +215,7 @@ const CSink = struct {
 
     fn onStatus(ctx: *anyopaque, level: session_runtime.Level, text: []const u8) void {
         const self: *CSink = @ptrCast(@alignCast(ctx));
-        self.emit(.status, text, @backingInt(level));
+        self.emit(.status, text, @intFromEnum(level));
     }
 
     fn onNotice(ctx: *anyopaque, text: []const u8) void {
@@ -235,7 +235,7 @@ const CSink = struct {
         _ = name;
         const self: *CSink = @ptrCast(@alignCast(ctx));
         if (status == .denied) self.denied = true;
-        self.emit(.tool_result, output, @backingInt(status));
+        self.emit(.tool_result, output, @intFromEnum(status));
     }
 
     fn onAssistantMessage(ctx: *anyopaque, content: []const u8, tool_calls_json: ?[]const u8) void {
@@ -507,7 +507,7 @@ fn recordCb(user: ?*anyopaque, kind: c_int, text: [*:0]const u8, status: c_int) 
     const rec: *CRecord = @ptrCast(@alignCast(user.?));
     if (rec.count < rec.kinds.len) rec.kinds[rec.count] = kind;
     rec.count += 1;
-    if (kind == @backingInt(EventKind.text)) {
+    if (kind == @intFromEnum(EventKind.text)) {
         const s = std.mem.span(text);
         const n = @min(s.len, rec.text.len - rec.text_len);
         @memcpy(rec.text[rec.text_len..][0..n], s[0..n]);
@@ -569,7 +569,7 @@ test "C ABI: a prompt with no model returns 1 with a message" {
     try testing.expect(err != null);
     stringFree(err);
     // The "no model configured" status reached the callback as a status event.
-    try testing.expectEqual(@as(c_int, @backingInt(EventKind.status)), rec.kinds[0]);
+    try testing.expectEqual(@as(c_int, @intFromEnum(EventKind.status)), rec.kinds[0]);
     runtimeFree(null);
     stringFree(null);
 }

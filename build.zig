@@ -61,7 +61,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
-        .strip = optimize != .debug,
+        .strip = optimize != .Debug,
         .link_libc = true,
         .error_tracing = false,
     });

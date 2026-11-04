@@ -399,7 +399,7 @@ pub fn applyLandlock(plan: ExecPlan) ?linux.E {
         if (e != .NOENT) return e;
     }
 
-    const nnp = linux.prctl(@backingInt(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0);
+    const nnp = linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0);
     if (linux.errno(nnp) != .SUCCESS) return linux.errno(nnp);
     const restricted = linux.syscall3(.landlock_restrict_self, ruleset, 0, 0);
     if (linux.errno(restricted) != .SUCCESS) return linux.errno(restricted);
