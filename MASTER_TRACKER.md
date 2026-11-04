@@ -25,7 +25,7 @@
 
 | ID | Task | Depends | Status | Notes |
 |---|---|---|---|---|
-| M0-T01 | Scaffold: `build.zig`/`build.zig.zon` (zero deps, min 0.17.0), release flags, catch-all test wiring | — | `[x]` | done 2026-09-14 (scaffold commit) |
+| M0-T01 | Scaffold: `build.zig`/`build.zig.zon` (zero deps, min 0.16.0), release flags, catch-all test wiring | — | `[x]` | done 2026-09-14 (scaffold commit) |
 | M0-T02 | `core/fsutil.zig`: atomic durable replace (fsync file+dir), realpath helper, safe mkdirs, advisory flock | M0-T01 | `[x]` | with unit tests |
 | M0-T03 | `cli/args.zig`: subcommand parsing, kebab-case flags, `--json` plumbing, FixedBufferAllocator help path | M0-T01 | `[x]` | |
 | M0-T04 | `core/types.zig`: shared event/message/result types | M0-T01 | `[x]` | |
@@ -155,7 +155,7 @@
 
 | ID | Task | Status |
 |---|---|---|
-| ST-1 | Validate 0.17.0 compatibility when released (M4); adapt or pin | `[?]` 2026-11-03 (E-07): adapted, not pinned. The tree builds and tests clean on Zig 0.17.1 (`minimum_zig_version` 0.17.0); 0.16 no longer compiles. Changes: `**` array repetition is gone (`@splat`), `zig fmt` rewrites `@intFromEnum` to `@backingInt`, `Uri.getHost` became `Io.net.HostName.fromUri`, `ascii.indexOfIgnoreCase` became `findIgnoreCase`, `std.Build` `Optimize.debug` / `addPassthruArgs` |
+| ST-1 | Validate 0.17.0 compatibility when released (M4); adapt or pin | `[?]` 2026-11-04 (E-07): PINNED to Zig 0.16.0 (`minimum_zig_version` 0.16.0). The 0.17.1 port of 2026-11-03 was reverted because CI and the test host run 0.16.0 and it could not be verified green. Full suite on 0.16.0: 466 pass / 471 total (5 skips), exit 0, no leaks. Breakages a future port must handle: `builtin.OptimizeMode.debug` -> `.Debug`, `std.Build.addPassthruArgs` -> `addArgs`, `@backingInt` -> `@intFromEnum`, `Enum.field_names` -> `.fields`, `std.Io.net.HostName.fromUri` (transport), module-level `.link_libc`, test string repetition `"x" ** n` -> `@splat`. A nightly, non-blocking `zig-0.17` workflow (`.github/workflows/zig-0.17.yml`) tracks the port |
 | ST-2 | Update DECISIONS.md changelog for any decision change | `[ ]` |
 | ST-3 | ADR for any interface/dependency/security change | `[ ]` |
 | ST-4 | Keep `zig build test` green; `zig fmt src/` clean | `[ ]` |
@@ -169,6 +169,7 @@
 | 2026-09-14 | M1 config format | YAML → JSON | stdlib-only, fx-proven (owner) |
 | 2026-09-14 | M4 toolchain | 0.17.0 requested → 0.16.0 stable baseline | 0.17.0 unreleased; compat tracked (ST-1) |
 | 2026-11-03 | Toolchain | 0.16.0 → 0.17.1 (min 0.17.0) | 0.17 released; the port is source-incompatible with 0.16 (E-07, ST-1) |
+| 2026-11-04 | Toolchain | 0.17.1 -> 0.16.0 (min 0.16.0) | The 0.17 port was reverted: CI and the test host run 0.16.0 and it could not be verified green; ST-1 allows pinning. A non-blocking 0.17.1 nightly workflow tracks the future port |
 
 ---
 
