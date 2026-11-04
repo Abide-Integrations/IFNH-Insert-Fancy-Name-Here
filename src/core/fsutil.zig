@@ -114,7 +114,7 @@ test "readSmallFile enforces size cap" {
     var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(io, .{ .sub_path = "big.txt", .data = &@as([64]u8, @splat('x')) });
+    try tmp.dir.writeFile(io, .{ .sub_path = "big.txt", .data = "x" ** 64 });
     const ok = try readSmallFile(tmp.dir, io, alloc, "big.txt", 1024);
     defer alloc.free(ok);
     try std.testing.expectEqual(@as(usize, 64), ok.len);

@@ -111,7 +111,7 @@ pub fn streamFn(
     if (response.head.status.class() != .success) {
         // Read the headers before the body: `head.bytes` borrows the
         // connection read buffer that the body reader refills.
-        const status: u16 = @backingInt(response.head.status);
+        const status: u16 = @intFromEnum(response.head.status);
         const now_s: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_s));
         const retry_after_s = transport.retryAfterFromHead(response.head, now_s);
         var err_body: [16 * 1024]u8 = undefined;
@@ -731,9 +731,9 @@ test "request: api_key mode sends x-goog-api-key to the streamGenerateContent pa
     const r = try runWith(arena, "200 OK", "Content-Type: text/event-stream\r\n", "data: {\"candidates\":[{\"finishReason\":\"STOP\"}]}\n\n", "secret-key", .api_key, "gemini-2.5-pro");
     try std.testing.expect(r.c.done);
     try std.testing.expect(std.mem.startsWith(u8, r.head, "POST /v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse HTTP/1.1"));
-    try std.testing.expect(std.ascii.findIgnoreCase(r.head, "x-goog-api-key: secret-key") != null);
-    try std.testing.expect(std.ascii.findIgnoreCase(r.head, "authorization:") == null);
-    try std.testing.expect(std.ascii.findIgnoreCase(r.head, "accept: text/event-stream") != null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(r.head, "x-goog-api-key: secret-key") != null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(r.head, "authorization:") == null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(r.head, "accept: text/event-stream") != null);
 }
 
 test "request: oauth mode sends a Bearer token and no x-goog-api-key" {
@@ -743,8 +743,8 @@ test "request: oauth mode sends a Bearer token and no x-goog-api-key" {
 
     const r = try runWith(arena, "200 OK", "Content-Type: text/event-stream\r\n", "data: {\"candidates\":[{\"finishReason\":\"STOP\"}]}\n\n", "ya29.token", .oauth, "gemini-test");
     try std.testing.expect(r.c.done);
-    try std.testing.expect(std.ascii.findIgnoreCase(r.head, "authorization: Bearer ya29.token") != null);
-    try std.testing.expect(std.ascii.findIgnoreCase(r.head, "x-goog-api-key") == null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(r.head, "authorization: Bearer ya29.token") != null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(r.head, "x-goog-api-key") == null);
 }
 
 test "request: a missing key sends no credential and the 401 is unauthorized" {
@@ -753,8 +753,8 @@ test "request: a missing key sends no credential and the 401 is unauthorized" {
     const arena = arena_state.allocator();
 
     const r = try runWith(arena, "401 Unauthorized", "Content-Type: application/json\r\n", "{\"error\":{\"code\":401,\"message\":\"missing credentials\",\"status\":\"UNAUTHENTICATED\"}}", "", .api_key, "gemini-test");
-    try std.testing.expect(std.ascii.findIgnoreCase(r.head, "x-goog-api-key") == null);
-    try std.testing.expect(std.ascii.findIgnoreCase(r.head, "authorization") == null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(r.head, "x-goog-api-key") == null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(r.head, "authorization") == null);
     try std.testing.expectEqual(core_types.ProviderFailureKind.unauthorized, r.c.failure_kind.?);
     try std.testing.expectEqualStrings("HTTP 401: missing credentials", r.c.failure.?);
 }

@@ -117,7 +117,7 @@ fn fetchPage(arena: std.mem.Allocator, client: *std.http.Client, url: []const u8
         return .{ .failure = @errorName(err) };
     };
     if (response.head.status.class() != .success) {
-        return .{ .failure = std.fmt.allocPrint(arena, "HTTP {d}", .{@backingInt(response.head.status)}) catch "HTTP error" };
+        return .{ .failure = std.fmt.allocPrint(arena, "HTTP {d}", .{@intFromEnum(response.head.status)}) catch "HTTP error" };
     }
 
     var transfer: [16 * 1024]u8 = undefined;

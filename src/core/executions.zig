@@ -60,7 +60,7 @@ pub const Registry = struct {
     alloc: std.mem.Allocator, // registry-lifetime arena
     workspace: std.Io.Dir,
     artifact_dir: []const u8 = ".ifnh/cache/exec",
-    slots: [max_executions]Slot = @splat(.{}),
+    slots: [max_executions]Slot = [_]Slot{.{}} ** max_executions,
     next_id: std.atomic.Value(u32) = .init(1),
     io_mutex: std.Io.Mutex = .init,
 

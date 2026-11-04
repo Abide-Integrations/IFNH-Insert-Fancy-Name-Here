@@ -16,8 +16,7 @@ them before making architectural choices:
 
 ## Toolchain
 
-- Zig 0.17.1 (`minimum_zig_version = 0.17.0`; 0.16 no longer compiles: `**`
-  array repetition and `@intFromEnum` are gone). No Node, no Python, no
+- Zig 0.16.0 (`minimum_zig_version = 0.16.0`). No Node, no Python, no
   JavaScript build step for the binary.
 - Zero third-party Zig dependencies, permanently (`build.zig.zon` has an
   empty `dependencies` table). A dependency proposal requires an ADR and a
@@ -32,7 +31,7 @@ zig fmt src/           # format; the canonical check is `zig fmt --check src/`
 ## Verification rules
 
 The owner runs the Zig toolchain on their own test host (resource-limited;
-builds are kept cheap). It must be Zig 0.17.x; distro packages
+builds are kept cheap). It must be exactly Zig 0.16.0; distro packages
 (e.g. Zig 0.14) cannot compile this code. Agents write code and colocated
 tests but do not run `zig`.
 
@@ -50,7 +49,7 @@ For every change, an agent must:
 
 Heavy checks (ReleaseSafe, size/startup budgets, kill-9, bench) run in CI.
 Keep changes small (one task per verify cycle) and mirror existing patterns,
-because agent-written Zig 0.17 `std.Io` code is not compiler-checked before
+because agent-written Zig 0.16 `std.Io` code is not compiler-checked before
 hand-off.
 
 ## Code style
@@ -62,7 +61,7 @@ hand-off.
 - Keep `pub` surface minimal; only mark declarations `pub` when used outside the file.
 - Bounded error sets and `errdefer` for partial state; never panic on bad
   runtime input; test allocation-failure paths where practical.
-- Allocators: explicit `io`-style parameter passing (Zig 0.17 `std.Io`);
+- Allocators: explicit `io`-style parameter passing (Zig 0.16 `std.Io`);
   arena for request-scoped scratch, caller-owned results documented in doc
   comments.
 

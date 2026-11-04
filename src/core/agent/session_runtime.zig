@@ -782,7 +782,7 @@ pub const Gate = struct {
     events: *const Events,
     mutex: std.Io.Mutex = .init,
     /// SHA-256 of policy-relevant files at session start (G99/M0-T30).
-    policy_hash: [32]u8 = @splat(0),
+    policy_hash: [32]u8 = [_]u8{0} ** 32,
     policy_hashed: bool = false,
 
     pub fn init(rt: *SessionRuntime, events: *const Events) Gate {
@@ -796,11 +796,11 @@ pub const Gate = struct {
     /// Fail-closed on policy tampering between session start and now (G99).
     fn verifyPolicy(self: *Gate) bool {
         if (!self.policy_hashed) {
-            self.policy_hash = self.policyFingerprint() orelse @as([32]u8, @splat(0));
+            self.policy_hash = self.policyFingerprint() orelse [_]u8{0} ** 32;
             self.policy_hashed = true;
             return true;
         }
-        const current = self.policyFingerprint() orelse @as([32]u8, @splat(0));
+        const current = self.policyFingerprint() orelse [_]u8{0} ** 32;
         if (!std.mem.eql(u8, &current, &self.policy_hash)) {
             self.events.on_status(self.events.ctx, .err, "\nPOLICY CHANGE DETECTED: .ifnh policy files changed since session start.\nApproval denied (fail-closed). Restart the session to adopt the new policy.\n");
             return false;

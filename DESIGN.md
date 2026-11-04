@@ -3,7 +3,7 @@
 > **Status:** Authoritative implementation spec (v1, 2026-09-14)
 > **Derives from:** PLAN.md (philosophy, D001–D049), DECISIONS.md (backlog resolution, meta-decisions M1–M4)
 > **Reference:** Vercel Labs `fx` (architecture reference only — clean-room implementation, Meta-M2)
-> **Language:** Zig 0.17.x (see `build.zig.zon`; ported from 0.16.0 in E-07); zero third-party dependencies
+> **Language:** Zig 0.16.0 stable (M4); zero third-party dependencies
 
 ---
 
@@ -50,7 +50,7 @@ Layering rules (enforced by review, stated in AGENTS.md):
 ```text
 ifnh/
 ├── build.zig                # single exe + test step; release size flags
-├── build.zig.zon            # name ifnh, min zig 0.17.0, dependencies = .{}
+├── build.zig.zon            # name ifnh, min zig 0.16.0, dependencies = .{}
 ├── src/
 │   ├── main.zig             # composition root: argv, io install, DI wiring
 │   ├── version.zig          # pub const version = "0.0.1";

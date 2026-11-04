@@ -749,8 +749,8 @@ pub const Editor = struct {
         raw.lflag.IEXTEN = false;
         raw.iflag.ICRNL = false;
         raw.iflag.IXON = false;
-        raw.cc[@backingInt(std.posix.V.MIN)] = 1;
-        raw.cc[@backingInt(std.posix.V.TIME)] = 0;
+        raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
+        raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
         std.posix.tcsetattr(0, .NOW, raw) catch return error.NotATerminal;
         self.saved_termios = t;
 

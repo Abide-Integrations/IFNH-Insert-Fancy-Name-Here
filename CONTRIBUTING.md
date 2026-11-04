@@ -7,7 +7,7 @@ proposing changes.
 
 ## Setup
 
-- Zig 0.17.1 (see `build.zig.zon`). No other toolchain, no third-party
+- Zig 0.16.0 (see `build.zig.zon`). No other toolchain, no third-party
   Zig dependencies — ever (see `docs/adr/0001`).
 
 ```bash

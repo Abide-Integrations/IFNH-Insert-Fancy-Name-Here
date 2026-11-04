@@ -91,7 +91,7 @@ pub fn streamFn(
         const text = r.allocRemaining(arena, .limited(16 * 1024)) catch "";
         const now_s: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_s));
         sink.emit(.{ .failure = .{
-            .kind = provider.failureKindForStatus(@backingInt(response.head.status)),
+            .kind = provider.failureKindForStatus(@intFromEnum(response.head.status)),
             .message = extractErrorMessage(arena, text) catch text,
             .retry_after_s = transport.retryAfterFromHead(response.head, now_s),
         } });

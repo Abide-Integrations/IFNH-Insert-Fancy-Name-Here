@@ -97,7 +97,7 @@ pub fn streamFn(
         // connection read buffer that the body reader refills.
         const now_s: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_s));
         const retry_after_s = transport.retryAfterFromHead(response.head, now_s);
-        const kind = provider.failureKindForStatus(@backingInt(response.head.status));
+        const kind = provider.failureKindForStatus(@intFromEnum(response.head.status));
         var err_body: [16 * 1024]u8 = undefined;
         const r = response.reader(&err_body);
         const text = r.allocRemaining(arena, .limited(16 * 1024)) catch "";

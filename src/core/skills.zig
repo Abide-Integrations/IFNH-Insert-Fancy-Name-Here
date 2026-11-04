@@ -587,7 +587,7 @@ test "catalog rendering is budgeted" {
     for (0..64) |i| {
         try skills.append(a, .{
             .name = try std.fmt.allocPrint(a, "skill-{d}", .{i}),
-            .description = &@as([300]u8, @splat('x')),
+            .description = "x" ** 300,
             .path = "p",
             .scope = "project",
         });
@@ -628,7 +628,7 @@ test "skills source guard: https, ssh and scp-style only" {
 test "skills names: validation and defaults from the URL" {
     try std.testing.expect(validName("pdf-review"));
     try std.testing.expect(validName("a.b_c-1"));
-    for ([_][]const u8{ "", ".", "..", "a/b", "a b", "../x", ".tmp-x", ".old-x", &@as([65]u8, @splat('x')), "naïve" }) |bad| {
+    for ([_][]const u8{ "", ".", "..", "a/b", "a b", "../x", ".tmp-x", ".old-x", "x" ** 65, "naïve" }) |bad| {
         try std.testing.expect(!validName(bad));
     }
     try std.testing.expectEqualStrings("skill", defaultName("https://github.com/o/skill.git"));

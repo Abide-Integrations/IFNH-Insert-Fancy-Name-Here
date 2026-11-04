@@ -1898,7 +1898,7 @@ test "grep finds a match late in a large file" {
     var tmp = try makeTmp();
     defer tmp.cleanup();
 
-    const line = &@as([1023]u8, @splat('x')) ++ "\n";
+    const line = "x" ** 1023 ++ "\n";
     var data: std.ArrayListUnmanaged(u8) = .empty;
     defer data.deinit(std.testing.allocator);
     while (data.items.len < 900 * 1024) {
@@ -1923,7 +1923,7 @@ test "grep discards overlong lines but keeps line numbers" {
     const io = std.testing.io;
     var tmp = try makeTmp();
     defer tmp.cleanup();
-    const data = &@as([9000]u8, @splat('x')) ++ "\nneedle\nafter\n";
+    const data = "x" ** 9000 ++ "\nneedle\nafter\n";
     try tmp.dir.writeFile(io, .{ .sub_path = "long.txt", .data = data });
 
     var e = engine_mod.Engine.init(std.testing.allocator, .ask);

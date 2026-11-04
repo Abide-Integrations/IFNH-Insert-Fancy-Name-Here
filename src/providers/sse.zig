@@ -117,7 +117,7 @@ test "multi-line data joined with newline" {
 }
 
 test "event too large" {
-    var stream = std.Io.Reader.fixed("data: " ++ &@as([32]u8, @splat('x')) ++ "\n\n");
+    var stream = std.Io.Reader.fixed("data: " ++ "x" ** 32 ++ "\n\n");
     var p = Parser{ .reader = &stream, .max_event_bytes = 8 };
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

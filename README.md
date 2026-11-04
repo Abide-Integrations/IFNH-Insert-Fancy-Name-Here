@@ -55,7 +55,7 @@ bubblewrap/Landlock/Seatbelt), `ifnh serve` (JSON-RPC/ACP over stdio) and
 
 ## Build
 
-Requires [Zig 0.17.1](https://ziglang.org/download/) (`minimum_zig_version` is 0.17.0; 0.16 no longer compiles):
+Requires [Zig 0.16.0](https://ziglang.org/download/):
 
 ```bash
 zig build -Doptimize=ReleaseSafe
