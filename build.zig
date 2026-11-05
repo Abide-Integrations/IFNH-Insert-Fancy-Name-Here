@@ -110,7 +110,7 @@ pub fn build(b: *std.Build) void {
 /// `git rev-parse --short HEAD` in the build root; `unknown` when git or
 /// `.git` is missing (source tarballs, unusual checkouts).
 fn gitShortHead(b: *std.Build) []const u8 {
-    var code: u8 = undefined;
+    var code: u8 = 0; // runAllowFail only sets it on failure
     const out = b.runAllowFail(
         &.{ "git", "-C", b.build_root.path orelse ".", "rev-parse", "--short", "HEAD" },
         &code,
