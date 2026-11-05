@@ -1,0 +1,43 @@
+name: macos
+
+# Nightly / on-demand macOS arm64 (Apple Silicon) build and test (E-09).
+# Deliberately not a PR or push check: macOS minutes are billed at a multiple
+# of ubuntu's, so this runs on a schedule and by hand only. The ubuntu `ci`
+# workflow stays the required check. A failing nightly run is reported by
+# GitHub's notification email to whoever last touched the schedule, not as a
+# required status.
+# Covers what ubuntu cannot: Zig's macOS target at runtime, the Seatbelt
+# sandbox backend (tests/smoke-sandbox-macos.sh) and the libifnh C ABI there.
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Format check
+        run: zig fmt --check src build.zig tests
+      - name: Type-check
+        run: zig build check
+      - name: Test
+        run: zig build test
+      - name: Build (ReleaseSafe)
+        run: zig build -Doptimize=ReleaseSafe
+      - name: Sandbox smoke (Seatbelt)
+        run: ./tests/smoke-sandbox-macos.sh ./zig-out/bin/ifnh
+      - name: libifnh smoke (C ABI)
+        run: ./tests/smoke-lib.sh

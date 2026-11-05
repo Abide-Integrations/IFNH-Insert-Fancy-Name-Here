@@ -70,6 +70,12 @@ pub const Registry = struct {
 
     /// Start a background command. Returns the execution id.
     pub fn start(self: *Registry, argv: []const []const u8) !u32 {
+        return self.startAs(argv, null);
+    }
+
+    /// Like `start`; `label` is what listings show instead of the joined
+    /// argv (a sandbox wrapper would otherwise bury the command).
+    pub fn startAs(self: *Registry, argv: []const []const u8, label: ?[]const u8) !u32 {
         try self.io_mutex.lock(self.io);
         defer self.io_mutex.unlock(self.io);
 
@@ -91,7 +97,12 @@ pub const Registry = struct {
         const of = std.fmt.bufPrint(&s.output_file, "{s}/exec-{d}.log", .{ self.artifact_dir, id }) catch return error.OutOfMemory;
         s.output_file_len = of.len;
         var cmd_end: usize = 0;
-        for (argv) |a| {
+        var label_part: [1][]const u8 = undefined;
+        const shown: []const []const u8 = if (label) |l| blk: {
+            label_part[0] = l;
+            break :blk &label_part;
+        } else argv;
+        for (shown) |a| {
             if (cmd_end + a.len + 1 >= s.command.len) break;
             if (cmd_end > 0) {
                 s.command[cmd_end] = ' ';
@@ -276,4 +287,19 @@ test "stop a long-running execution" {
     try std.testing.expect(reg.stop(id));
     try std.testing.expectEqual(State.stopped, reg.snapshot(id).?.state);
     _ = reg.reap();
+}
+
+test "startAs shows the label instead of the wrapped argv" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var reg = Registry.init(io, arena_state.allocator(), tmp.dir);
+    defer reg.deinit();
+    const id = try reg.startAs(&.{ "sh", "-c", "true" }, "the real command");
+    try std.testing.expectEqualStrings("the real command", reg.snapshot(id).?.command);
+    const plain = try reg.start(&.{ "sh", "-c", "true" });
+    try std.testing.expectEqualStrings("sh -c true", reg.snapshot(plain).?.command);
 }

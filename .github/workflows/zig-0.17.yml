@@ -1,0 +1,32 @@
+name: zig-0.17
+
+# Informational only until E-07's port is picked up (MASTER_TRACKER ST-1).
+# The project is pinned to Zig 0.16.0; this job shows how far the tree is from
+# a 0.17.1 build. It is deliberately not a PR/push check and not required to
+# pass -- continue-on-error keeps a red run from blocking anything.
+
+on:
+  schedule:
+    - cron: "43 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zig-0.17-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-0-17:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: Type-check
+        run: zig build check
+      - name: Test
+        run: zig build test

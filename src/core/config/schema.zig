@@ -161,3 +161,17 @@ test "config schema covers the providers and the MCP server keys the loader read
         try std.testing.expect(props.get(key) != null);
     }
 }
+
+test "config schema pins the sandbox section to the modes the sandbox module parses" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), json_schema, .{});
+
+    const modes = nodeAt(schema, "sandbox.mode").?.object.get("enum").?.array;
+    try std.testing.expectEqual(@typeInfo(@import("../sandbox.zig").Mode).@"enum".fields.len, modes.items.len);
+    for (modes.items) |item| try std.testing.expect(@import("../sandbox.zig").Mode.parse(item.string) != null);
+    try std.testing.expectEqualStrings("boolean", nodeAt(schema, "sandbox.network").?.object.get("type").?.string);
+    try std.testing.expect(!nodeAt(schema, "sandbox.network").?.object.get("default").?.bool);
+    try std.testing.expectEqualStrings("array", nodeAt(schema, "sandbox.write_extra").?.object.get("type").?.string);
+    try std.testing.expectEqualStrings("off", nodeAt(schema, "sandbox.mode").?.object.get("default").?.string);
+}

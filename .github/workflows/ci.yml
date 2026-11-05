@@ -34,3 +34,5 @@ jobs:
         run: ./scripts/bench.sh
       - name: Integration harnesses
         run: ./tests/integration-kill9.sh
+      - name: libifnh smoke (C ABI)
+        run: ./tests/smoke-lib.sh

@@ -63,6 +63,7 @@ ifnh/
 │   │   ├── instructions/    # AGENTS.md/CLAUDE.md/.ifnh discovery + assembly
 │   │   ├── lifecycle/       # lifecycle schema + stage runner (M2)
 │   │   ├── context/         # assembly log, compaction pipeline (M1)
+│   │   ├── sandbox.zig      # OS sandbox argv builders + Landlock helper (E-04)
 │   │   ├── fsutil.zig       # atomic durable write, realpath, safe ops
 │   │   └── types.zig        # shared event/message/result types
 │   ├── providers/
@@ -80,9 +81,11 @@ ifnh/
 │   │   ├── render.zig       # inline streaming renderer, ANSI subset
 │   │   ├── input.zig        # raw mode, line editor, escape parsing
 │   │   └── approval.zig     # approval prompt rendering
+│   ├── lib.zig              # libifnh: Zig Runtime + C ABI (E-06b); include/ifnh.h
 │   └── cli/
 │       ├── args.zig         # subcommand/flag parsing
 │       ├── commands.zig     # init, config, sessions, doctor, resume...
+│       ├── ask.zig  serve.zig  # headless one-shot; JSON-RPC/ACP server (E-06)
 │       └── output.zig       # human + --json output contracts
 ├── tests/                   # integration tests (fake provider harness)
 ├── docs/
@@ -338,6 +341,15 @@ user prompt
 
 Concurrency: one UI thread + one agent loop thread (M0); tool batches parallelize read-only groups on `std.Thread` with per-call arenas (M1 for subagents; the batch machinery lands in M0).
 
+### 6.1 Drivers (one loop, several front ends)
+
+`SessionRuntime.submitTurn` is the only agent loop. It reports through the `Events` struct of function pointers and takes approvals from `Events.on_approval`; the front end owns all I/O. Front ends: the REPL (`cli/repl.zig`), `ifnh ask` (`cli/ask.zig`, NDJSON), `ifnh serve` and `libifnh`.
+
+- **`ifnh serve` (`cli/serve.zig`, E-06a).** JSON-RPC 2.0 over stdio, ACP core (`initialize`, `session/new|load|prompt|cancel|close`) plus `ifnh/notice`. One `SessionRuntime` per ACP session; turns run synchronously on the main thread. A reader thread frames stdin (newline-delimited by default, `Content-Length` with `--framing content-length`; messages over 1 MiB are answered `-32600` and skipped) and handles `session/cancel` by flipping the session's cancel flag (`SessionRuntime.cancel_flag`), so a cancel lands mid-turn. `Events` map to `session/update` (`agent_message_chunk`, `tool_call`, `tool_call_update`) and `ifnh/notice`; `on_approval` becomes a `session/request_permission` request answered from the same input queue (30 s timeout, any non-allow answer is a rejection). Stdout is protocol only; the process working directory is switched to the session's `cwd` while a prompt runs.
+- **`libifnh` (`src/lib.zig`, E-06b).** `Runtime` wraps one `SessionRuntime` (heap-allocated, never moved) for Zig callers; a C ABI (`include/ifnh.h`) is exported when libc is linked. No terminal, no signal handlers, no config files (the embedder passes JSON). Approvals are refused (no channel). Built as `libifnh.a` by `zig build`.
+
+Sandboxing (E-04): `core/sandbox.zig` wraps the argv of model-issued shell commands (bash, custom tools, background executions) via `ToolContext.sandbox_fn`; the REPL's `!cmd` and the `git` tool are never wrapped. See USAGE section 16.
+
 ## 7. Performance budgets
 
 | Metric | Budget | Enforcement |
@@ -364,7 +376,7 @@ Build flags (fx-proven): `link_libc`, strip in all non-Debug modes, `omit_frame_
 |---|---|
 | Malicious repo instructions (AGENTS.md/skills/docs) | Untrusted-input framing; provenance in approvals; permission gates are the real boundary |
 | Prompt injection via tool output | Outputs framed as data; injection patterns flagged; dangerous ops always gated |
-| Agent writes outside scope | Path grants + realpath resolution + journal-verified mutations; `.ifnh/` write-denied |
+| Agent writes outside scope | Path grants + realpath resolution + journal-verified mutations; `.ifnh/` write-denied; optional OS sandbox for shell commands (`sandbox.mode`) |
 | Destructive shell | Lexicon + heuristics → ask; unknown write-ish → ask; pipeline intersection |
 | Secret leakage | Env allowlist; redaction at write time; `.env` unreadable by default; zeroized credentials |
 | Policy tampering | `.ifnh/` agent-write-deny + config snapshot hash checked at approval boundaries |

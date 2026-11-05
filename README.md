@@ -5,7 +5,9 @@ open-source agentic coding harness written in Zig — for developers who want
 to control their models, tools, agents, workflows, permissions, and
 development lifecycle without adopting a heavyweight AI coding environment.
 
-Status: pre-alpha, active architecture/scaffolding phase.
+Status: pre-1.0. Phases A-D (correctness, performance, headless and
+scripting, extensibility) have landed and Phase E hardening is in progress;
+interfaces and config keys may still move. Current work: [ACTIVE_PLAN.md](ACTIVE_PLAN.md).
 
 ## Documentation
 
@@ -21,8 +23,9 @@ Status: pre-alpha, active architecture/scaffolding phase.
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Abide-Integrations/ifnh/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Abide-Integrations/IFNH-Insert-Fancy-Name-Here/main/install.sh | sh
 ```
+The repository is planned to be renamed; the old path will redirect.
 Or from source:
 
 ```bash
@@ -46,6 +49,10 @@ for configuration, permissions, subagents, MCP, skills (`/skills install`
 from git, pinned in a lockfile), opt-in advisory memory, hooks, and
 lifecycles.
 
+Also: an optional OS sandbox for model-issued shell commands (`sandbox.mode`,
+bubblewrap/Landlock/Seatbelt), `ifnh serve` (JSON-RPC/ACP over stdio) and
+`libifnh.a` with a C ABI (`include/ifnh.h`) for embedding.
+
 ## Build
 
 Requires [Zig 0.16.0](https://ziglang.org/download/):
@@ -58,7 +65,7 @@ zig build test
 
 Zero third-party dependencies. Linux and macOS. Cross-compiles to any
 target (`-Dtarget=aarch64-linux-gnu` etc.); tagging a release builds all
-four platform artifacts in CI.
+five platform artifacts in CI.
 
 ## License
 

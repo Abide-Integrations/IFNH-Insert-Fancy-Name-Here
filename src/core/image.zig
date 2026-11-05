@@ -37,6 +37,23 @@ pub fn mediaTypeFor(path: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Validate an image that arrived already encoded (ACP `image` content).
+/// The media type must be one of the supported types and the data valid
+/// base64 within the size cap; `data_base64` is used as given.
+pub fn fromBase64(arena: std.mem.Allocator, media_type: []const u8, data_base64: []const u8) !Loaded {
+    const known = [_][]const u8{ "image/png", "image/jpeg", "image/gif", "image/webp" };
+    for (known) |m| {
+        if (std.mem.eql(u8, m, media_type)) break;
+    } else return .{ .err = try std.fmt.allocPrint(arena, "unsupported image type '{s}' ({s})", .{ media_type, supported }) };
+    const size = std.base64.standard.Decoder.calcSizeForSlice(data_base64) catch
+        return .{ .err = try arena.dupe(u8, "image data is not valid base64") };
+    if (size > max_bytes) return .{ .err = try std.fmt.allocPrint(arena, "image too large: {d} bytes > {d}", .{ size, max_bytes }) };
+    const scratch = try arena.alloc(u8, size);
+    std.base64.standard.Decoder.decode(scratch, data_base64) catch
+        return .{ .err = try arena.dupe(u8, "image data is not valid base64") };
+    return .{ .ok = .{ .media_type = media_type, .data_base64 = data_base64 } };
+}
+
 /// Read `path` (relative to `dir`) and encode it. The type is checked before
 /// the file is opened, the size before it is read.
 pub fn load(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) !Loaded {
@@ -179,4 +196,14 @@ test "queue keeps order, drains on take and caps at max_per_turn" {
     try std.testing.expect(!(try q.add(arena, .{ .media_type = "image/png", .data_base64 = "y" })));
     q.clear();
     try std.testing.expectEqual(@as(usize, 0), q.items.items.len);
+}
+
+test "fromBase64 accepts a tiny png and rejects bad types and bad data" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const ok = try fromBase64(arena, "image/png", tiny_png_b64);
+    try std.testing.expectEqualStrings("image/png", ok.ok.media_type);
+    try std.testing.expect((try fromBase64(arena, "image/bmp", tiny_png_b64)) == .err);
+    try std.testing.expect((try fromBase64(arena, "image/png", "not base64!!")) == .err);
 }

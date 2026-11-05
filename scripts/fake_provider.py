@@ -117,7 +117,10 @@ def main():
     ap.add_argument("--port-file")
     ap.add_argument("--mode", choices=("text", "error", "advertised") + tuple(TOOL_CALLS), default="text")
     ap.add_argument("--delay", type=float, default=0.03)
+    ap.add_argument("--bash-command", help="command of the scripted bash call in --mode tool")
     a = ap.parse_args()
+    if a.bash_command:
+        TOOL_CALLS["tool"] = ("bash", {"command": a.bash_command})
     srv = HTTPServer(("127.0.0.1", a.port), Handler)
     srv.delay = a.delay
     srv.mode = a.mode

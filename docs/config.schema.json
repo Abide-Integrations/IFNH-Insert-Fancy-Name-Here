@@ -233,6 +233,30 @@
         }
       }
     },
+    "sandbox": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "OS sandbox for commands the model issues (bash, custom tools, background executions; never the REPL !cmd or the git tool). Linux: bubblewrap, else Landlock. macOS: Seatbelt.",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["off", "auto", "required"],
+          "default": "off",
+          "description": "off: never sandbox. auto: use the first available backend; without one, run unsandboxed and say so once per session. required: without a backend the tool call fails with 'sandbox unavailable: <reason>'."
+        },
+        "network": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow network access inside the sandbox. false denies it (bwrap: no network namespace; Landlock: TCP bind/connect on kernels with ABI 4+; Seatbelt: no network rules)."
+        },
+        "write_extra": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "default": [],
+          "description": "Paths (absolute, or relative to the workspace) that may be written in addition to the workspace, the temp dir and /dev/null. They must exist for bwrap and Landlock."
+        }
+      }
+    },
     "hooks": {
       "type": "object",
       "description": "Lifecycle hooks (D-07): event name (session_start, session_end, before_agent, after_agent, before_stage, after_stage, before_tool, after_tool, before_merge, after_merge) mapped to a command, a list of commands, or a list of objects.",

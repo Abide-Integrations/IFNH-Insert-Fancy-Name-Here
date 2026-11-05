@@ -22,6 +22,7 @@ const journal_mod = @import("../journal.zig");
 const fsutil = @import("../fsutil.zig");
 const git_mod = @import("../git.zig");
 const mcp_mod = @import("../mcp.zig");
+const sandbox_mod = @import("../sandbox.zig");
 
 pub const max_summary_bytes: usize = 4 * 1024;
 
@@ -119,6 +120,9 @@ pub const Host = struct {
     custom: []const tool_mod.CustomTool = &.{},
     /// `agents.timeout_tool_s` for the child's captured commands.
     timeout_tool_s: u32 = 120,
+    /// The parent's OS sandbox, shared read-only (E-04); null runs open.
+    sandbox_fn: ?sandbox_mod.WrapFn = null,
+    sandbox_ctx: ?*anyopaque = null,
     journal: ?*journal_mod.Journal,
     approval_ctx: *anyopaque,
     approval_fn: *const fn (ctx: *anyopaque, req: tool_mod.ApprovalRequest) tool_mod.ApprovalResponse,
@@ -316,6 +320,8 @@ fn runChild(
         .timeout_s = host.timeout_tool_s,
         .use_external_tools = host.use_external_tools,
         .custom = host.custom,
+        .sandbox_fn = host.sandbox_fn,
+        .sandbox_ctx = host.sandbox_ctx,
         .approval_ctx = host.approval_ctx,
         .approval_fn = host.approval_fn,
         .agent_spawn_fn = spawnHookFn,
