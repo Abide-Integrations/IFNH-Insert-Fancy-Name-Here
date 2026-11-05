@@ -1,0 +1,56 @@
+name: snap
+
+# Packs the classic snap (packaging/snap/snapcraft.yaml; it downloads the
+# released linux-musl tarball, nothing is compiled) on a runner of each
+# architecture and uploads the .snap as an artifact. Pull requests do not
+# trigger it. `snapcraft upload --release=stable` runs only on a published
+# release AND when the SNAPCRAFT_STORE_CREDENTIALS secret exists; the Store must
+# already have approved the classic confinement request for the name.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version to pack (e.g. 0.1.7); the release must exist"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  snap:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || format('v{0}', inputs.version) }}
+      SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Version consistency
+        run: ./scripts/check-version.sh --tag "$TAG"
+      - name: Install snapcraft
+        run: sudo snap install snapcraft --classic
+      - name: Pack
+        run: |
+          mkdir -p snap
+          cp packaging/snap/snapcraft.yaml snap/snapcraft.yaml
+          sudo snapcraft pack --destructive-mode
+      - uses: actions/upload-artifact@v4
+        with:
+          name: snap-${{ matrix.arch }}
+          path: ifnh_*.snap
+          if-no-files-found: error
+      - name: Upload to the Snap Store (stable)
+        if: github.event_name == 'release' && env.SNAPCRAFT_STORE_CREDENTIALS != ''
+        run: snapcraft upload --release=stable ifnh_*.snap

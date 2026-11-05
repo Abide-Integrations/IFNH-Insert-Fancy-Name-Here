@@ -1,0 +1,59 @@
+# Snap for ifnh (ACTIVE_PLAN F-07). Classic confinement: ifnh runs arbitrary
+# commands for the user, which strict confinement would break, so the Snap Store
+# must approve a classic request before `snapcraft upload` is accepted.
+# Nothing is compiled: the part downloads the released linux-musl tarball for the
+# build architecture (checksum-verified) and stages it. The version is read from
+# src/version.zig through scripts/check-version.sh, so a snap is only buildable
+# for a version whose release already exists.
+# Snapcraft only finds snap/snapcraft.yaml in the project root, so to build:
+#   mkdir -p snap && cp packaging/snap/snapcraft.yaml snap/ && snapcraft pack --destructive-mode
+# (.github/workflows/snap.yml does exactly this.)
+name: ifnh
+title: IFNH
+base: core24
+adopt-info: ifnh
+summary: Lightweight agentic coding harness
+description: |
+  IFNH is a lightweight, provider-agnostic agentic coding harness written in
+  Zig: a single static binary with explicit permissions, MCP, skills and
+  headless scripting. This snap uses classic confinement because the agent
+  runs shell commands and reads and writes your projects.
+license: MIT
+contact: https://github.com/Abide-Integrations/IFNH-Insert-Fancy-Name-Here/issues
+issues: https://github.com/Abide-Integrations/IFNH-Insert-Fancy-Name-Here/issues
+source-code: https://github.com/Abide-Integrations/IFNH-Insert-Fancy-Name-Here
+website: https://github.com/Abide-Integrations/IFNH-Insert-Fancy-Name-Here
+grade: stable
+confinement: classic
+
+platforms:
+  amd64:
+  arm64:
+
+apps:
+  ifnh:
+    command: bin/ifnh
+    completer: share/bash-completion/completions/ifnh
+    plugs: [home, network, network-bind]
+
+parts:
+  ifnh:
+    plugin: nil
+    build-packages: [curl]
+    override-pull: |
+      craftctl set version="$("$CRAFT_PROJECT_DIR/scripts/check-version.sh" --print)"
+    override-build: |
+      ver=$("$CRAFT_PROJECT_DIR/scripts/check-version.sh" --print)
+      case "$CRAFT_ARCH_BUILD_FOR" in
+        amd64) arch=x86_64 ;;
+        arm64) arch=aarch64 ;;
+        *) echo "unsupported architecture $CRAFT_ARCH_BUILD_FOR" >&2; exit 1 ;;
+      esac
+      name="ifnh-$ver-linux-$arch-musl"
+      base="https://github.com/Abide-Integrations/IFNH-Insert-Fancy-Name-Here/releases/download/v$ver"
+      curl -fsSLO "$base/$name.tar.gz"
+      curl -fsSLO "$base/$name.tar.gz.sha256"
+      sha256sum -c "$name.tar.gz.sha256"
+      tar -xzf "$name.tar.gz"
+      install -Dm755 "$name/ifnh" "$CRAFT_PART_INSTALL/bin/ifnh"
+      cp -R "$name/share" "$CRAFT_PART_INSTALL/share"
