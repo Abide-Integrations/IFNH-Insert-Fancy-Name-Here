@@ -31,7 +31,7 @@ The owner asked for "the new 0.17.0". As of 2026-09-14, 0.17.0 is **unreleased**
 # A. Persistence, sessions, and `.ifnh/`
 
 1. **Hybrid: plain files + append-only JSONL event logs per session.** No SQLite. [core] fx: event-sourced `events.jsonl` + `session.json` manifest + recovery files; proven durable and resumable.
-2. **Project `.ifnh/`** owns: `config.json`, `config.d/`, `instructions/`, `skills/`, `commands/`, `lifecycle/`, `plans/`, `reports/`, `tool-notes/`, `cache/`, `sessions/` (default). **User level** owns: config (`~/.config/ifnh/` on Linux, `~/Library/Application Support/ifnh/` on macOS), user skills/commands, logs/state (`~/.local/state/ifnh/` on Linux). [cfg]
+2. **Project `.ifnh/`** owns: `config.json`, `config.d/`, `instructions/`, `skills/`, `commands/`, `lifecycle/`, `plans/`, `reports/`, `tool-notes/`, `cache/`, `sessions/` (default). **User level** owns: config (`~/.config/ifnh/` on Linux, `~/Library/Application Support/ifnh/` on macOS) *[macOS part superseded: XDG everywhere, see changelog 2026-10-23]*, user skills/commands, logs/state (`~/.local/state/ifnh/` on Linux). [cfg]
 3. **Committed:** `config.json`, `instructions/`, `skills/`, `commands/`, `lifecycle/`, `tool-notes/`. **Gitignored:** `sessions/`, `cache/`, `debug/`, `worktrees/`. Reports commit-optional (default ignored, flag to commit). IFNH writes/maintains `.ifnh/.gitignore` itself. [core]
 4. **Session =** one parent conversation + its child-agent records + lifecycle state + config snapshot + undo journal, persisted under `.ifnh/sessions/<id>/`. [core]
 5. **Multiple concurrent sessions: yes**, different sessions may target the same repo (isolation policy prevents mutation conflicts, L164-166); the *same* session is guarded by an advisory `flock` (`error.SessionBusy`, 2s deadline). fx: session locks. [M0]
@@ -47,7 +47,7 @@ The owner asked for "the new 0.17.0". As of 2026-09-14, 0.17.0 is **unreleased**
 
 # B. Configuration
 
-15. **User locations:** Linux `~/.config/ifnh/` (XDG_CONFIG_HOME honored) for config; `~/.local/state/ifnh/` for logs/transient state. macOS: `~/Library/Application Support/ifnh/` for both. [core]
+15. **User locations:** Linux `~/.config/ifnh/` (XDG_CONFIG_HOME honored) for config; `~/.local/state/ifnh/` for logs/transient state. macOS: `~/Library/Application Support/ifnh/` for both. *[macOS part superseded: `~/.config/ifnh/` on every platform, state `~/.local/state/ifnh/`; see changelog 2026-10-23]* [core]
 16. **Project config:** `.ifnh/config.json`. [core]
 17. **Both:** `config.json` plus `config.d/*.json` merged in alphabetical filename order (later files override). [M0]
 18. **No includes/imports** — `config.d/` covers composition. [M0]
@@ -323,7 +323,7 @@ The owner asked for "the new 0.17.0". As of 2026-09-14, 0.17.0 is **unreleased**
 
 249. **Levels: error | info | debug | trace** (trace = full transcripts + provider payloads). [M0]
 250. **debug** records tool I/O summaries, decisions, config resolutions; **trace** adds transcripts/provider bodies. [M0]
-251. **Storage:** `~/.local/state/ifnh/logs/` (Linux) / `~/Library/Application Support/ifnh/logs/` (macOS); project `.ifnh/debug/` opt-in. [M0]
+251. **Storage:** `~/.local/state/ifnh/logs/` (Linux) / `~/Library/Application Support/ifnh/logs/` (macOS); project `.ifnh/debug/` opt-in. *[macOS part superseded: `~/.local/state/ifnh/` everywhere; see changelog 2026-10-23]* [M0]
 252. **Redirection:** `--log-file` flag; `IFNH_LOG_LEVEL` env. [M0]
 253. **Redaction at write time:** configured secret names + token patterns; always on for debug/trace. [M0]
 254–258. **Usage tracking per agent:** tokens, cost, time, tool calls, compaction events in session `usage.jsonl`; `/agents` displays them. [M1]
