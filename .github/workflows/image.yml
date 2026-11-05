@@ -1,0 +1,105 @@
+name: image
+
+# OCI image (packaging/docker/Dockerfile: the static musl binary on scratch).
+# Pull requests that touch the packaging build both architectures with buildx and
+# push nothing (the binaries are cross-built from the PR, since no release exists
+# for it). Only a published release pushes to ghcr.io, and then from the released
+# linux-musl tarballs, not from source. workflow_dispatch (version of an existing
+# release) builds from those tarballs and never pushes.
+
+on:
+  pull_request:
+    paths:
+      - "packaging/docker/**"
+      - ".github/workflows/image.yml"
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version to build (e.g. 0.1.7); the release must exist"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/abide-integrations/ifnh
+  VERSION: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.version }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Stage binaries from the released tarballs
+        if: github.event_name != 'pull_request'
+        run: |
+          ver="${VERSION#v}"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/v$ver"
+          for pair in x86_64:amd64 aarch64:arm64; do
+            name="ifnh-$ver-linux-${pair%%:*}-musl"
+            curl -fsSLO "$base/$name.tar.gz"
+            curl -fsSLO "$base/$name.tar.gz.sha256"
+            sha256sum -c "$name.tar.gz.sha256"
+            mkdir -p "ctx/linux/${pair##*:}"
+            tar -xzf "$name.tar.gz" -C "ctx/linux/${pair##*:}" --strip-components=1 "$name/ifnh"
+          done
+      - uses: mlugg/setup-zig@v2
+        if: github.event_name == 'pull_request'
+        with:
+          version: 0.16.0
+      - name: Stage binaries cross-built from this PR
+        if: github.event_name == 'pull_request'
+        run: |
+          for pair in x86_64:amd64 aarch64:arm64; do
+            zig build -Doptimize=ReleaseSafe -Dtarget="${pair%%:*}-linux-musl" -p "prefix-${pair##*:}"
+            mkdir -p "ctx/linux/${pair##*:}"
+            cp "prefix-${pair##*:}/bin/ifnh" "ctx/linux/${pair##*:}/ifnh"
+          done
+      - uses: docker/setup-buildx-action@v3
+      - name: Build (amd64, arm64; not pushed)
+        uses: docker/build-push-action@v6
+        with:
+          context: ctx
+          file: packaging/docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'release'
+        with:
+          name: image-context
+          path: ctx
+
+  publish:
+    if: github.event_name == 'release'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: image-context
+          path: ctx
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push (ghcr.io)
+        uses: docker/build-push-action@v6
+        with:
+          context: ctx
+          file: packaging/docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ github.event.release.tag_name }}
+            REVISION=${{ github.sha }}
+          tags: |
+            ${{ env.IMAGE }}:${{ github.event.release.tag_name }}
+            ${{ env.IMAGE }}:latest

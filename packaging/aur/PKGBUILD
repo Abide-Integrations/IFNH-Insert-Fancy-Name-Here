@@ -1,0 +1,28 @@
+# Maintainer: IFNH contributors <noreply@users.noreply.github.com>
+# Binary package of the released static musl build (ACTIVE_PLAN F-08). The
+# checksums below are SKIP in the repo because no release with the F-01 asset
+# names exists yet; scripts/bump-aur.sh <version> fills pkgver, the real sha256
+# values and .SRCINFO from a published release. Pushing to the AUR is manual.
+pkgname=ifnh-bin
+pkgver=0.1.7
+pkgrel=1
+pkgdesc="Lightweight agentic coding harness (prebuilt static binary)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/Abide-Integrations/IFNH-Insert-Fancy-Name-Here"
+license=('MIT')
+provides=('ifnh')
+conflicts=('ifnh')
+source_x86_64=("$pkgname-$pkgver-x86_64.tar.gz::$url/releases/download/v$pkgver/ifnh-$pkgver-linux-x86_64-musl.tar.gz")
+source_aarch64=("$pkgname-$pkgver-aarch64.tar.gz::$url/releases/download/v$pkgver/ifnh-$pkgver-linux-aarch64-musl.tar.gz")
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
+options=('!strip' '!debug')
+
+package() {
+  cd "$srcdir/ifnh-$pkgver-linux-$CARCH-musl"
+  install -Dm755 ifnh "$pkgdir/usr/bin/ifnh"
+  install -Dm644 share/man/man1/ifnh.1 "$pkgdir/usr/share/man/man1/ifnh.1"
+  install -Dm644 share/bash-completion/completions/ifnh "$pkgdir/usr/share/bash-completion/completions/ifnh"
+  install -Dm644 share/zsh/site-functions/_ifnh "$pkgdir/usr/share/zsh/site-functions/_ifnh"
+  install -Dm644 share/fish/vendor_completions.d/ifnh.fish "$pkgdir/usr/share/fish/vendor_completions.d/ifnh.fish"
+}

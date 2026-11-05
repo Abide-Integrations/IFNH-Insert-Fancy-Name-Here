@@ -38,3 +38,36 @@ if "$root/scripts/bump-homebrew.sh" 9.9.9 --dist-dir "$rel" --out "$T/c" 2> /dev
 echo "zz  ifnh-9.9.9-macos-x86_64.tar.gz" > "$rel/ifnh-9.9.9-macos-x86_64.tar.gz.sha256"
 if "$root/scripts/bump-homebrew.sh" 9.9.9 --dist-dir "$rel" --out "$T/c" 2> /dev/null; then fail "brew: bad digest accepted"; fi
 ok "homebrew: missing/bad .sha256 aborts"
+
+# --- AUR and Nix (fresh, valid fake release) ------------------------------------
+rel="$T/release2"
+mkdir -p "$rel"
+i=0
+for plat in macos-aarch64 macos-x86_64 linux-aarch64-musl linux-x86_64-musl; do
+  i=$((i + 1))
+  printf '%064d  ifnh-9.9.9-%s.tar.gz\n' "$i" "$plat" > "$rel/ifnh-9.9.9-$plat.tar.gz.sha256"
+done
+
+"$root/scripts/bump-aur.sh" 9.9.9 --dist-dir "$rel" --out "$T/aur" 2> /dev/null
+grep -q '^pkgver=9.9.9$' "$T/aur/PKGBUILD" || fail "aur: pkgver"
+grep -q "^sha256sums_x86_64=('$(printf '%064d' 4)')$" "$T/aur/PKGBUILD" || fail "aur: x86_64 hash"
+grep -q "^sha256sums_aarch64=('$(printf '%064d' 3)')$" "$T/aur/PKGBUILD" || fail "aur: aarch64 hash"
+grep -q "sha256sums_x86_64 = $(printf '%064d' 4)$" "$T/aur/.SRCINFO" || fail "aur: .SRCINFO x86_64 hash"
+grep -q 'pkgver = 9.9.9$' "$T/aur/.SRCINFO" || fail "aur: .SRCINFO pkgver"
+grep -q "^sha256sums.*SKIP" "$T/aur/PKGBUILD" && fail "aur: SKIP left in PKGBUILD"
+ok "aur: PKGBUILD and .SRCINFO"
+
+"$root/scripts/bump-nix.sh" 9.9.9 --dist-dir "$rel" --out "$T/nix/artifacts.nix" 2> /dev/null
+grep -q 'version = "9.9.9";' "$T/nix/artifacts.nix" || fail "nix: version"
+grep -q "x86_64-darwin = { suffix = \"macos-x86_64\"; sha256 = \"$(printf '%064d' 2)\"" "$T/nix/artifacts.nix" || fail "nix: darwin hash"
+grep -q PLACEHOLDER "$T/nix/artifacts.nix" && fail "nix: placeholder note on a real render"
+"$root/scripts/bump-nix.sh" --placeholder --out "$T/nix/p.nix" 2> /dev/null
+grep -q PLACEHOLDER "$T/nix/p.nix" || fail "nix: placeholder note missing"
+ok "nix: artifacts.nix and placeholder"
+
+rm "$rel/ifnh-9.9.9-linux-aarch64-musl.tar.gz.sha256"
+if "$root/scripts/bump-aur.sh" 9.9.9 --dist-dir "$rel" --out "$T/aur2" 2> /dev/null; then fail "aur: missing .sha256 accepted"; fi
+[ ! -e "$T/aur2/PKGBUILD" ] || fail "aur: wrote output despite failure"
+if "$root/scripts/bump-nix.sh" 9.9.9 --dist-dir "$rel" --out "$T/nix/q.nix" 2> /dev/null; then fail "nix: missing .sha256 accepted"; fi
+[ ! -e "$T/nix/q.nix" ] || fail "nix: wrote output despite failure"
+ok "aur/nix: missing .sha256 aborts"
