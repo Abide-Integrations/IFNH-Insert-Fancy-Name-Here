@@ -817,6 +817,76 @@ A hosted copy works too:
 curl -fsSL https://raw.githubusercontent.com/Abide-Integrations/IFNH-Insert-Fancy-Name-Here/main/uninstall.sh | sh
 ```
 
+### Package managers
+
+**None of these channels is published yet.** Each is driven by a workflow that
+runs when a tagged release is published, and each needs a one-time owner setup
+(accounts, secrets, a tap repository), so until the first tagged release has run
+them the commands below will fail. `install.sh` above is the only working path.
+
+```bash
+# Homebrew (macOS, Linux): tap Abide-Integrations/homebrew-ifnh
+brew install Abide-Integrations/ifnh/ifnh
+
+# Debian / Ubuntu: GPG-signed apt repository on GitHub Pages
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://abide-integrations.github.io/IFNH-Insert-Fancy-Name-Here/apt/ifnh-archive-keyring.gpg \
+  | sudo tee /etc/apt/keyrings/ifnh-archive-keyring.gpg > /dev/null
+echo "deb [signed-by=/etc/apt/keyrings/ifnh-archive-keyring.gpg] https://abide-integrations.github.io/IFNH-Insert-Fancy-Name-Here/apt stable main" \
+  | sudo tee /etc/apt/sources.list.d/ifnh.list
+sudo apt-get update && sudo apt-get install ifnh
+
+# Fedora / RHEL: signed dnf repository (same site)
+sudo tee /etc/yum.repos.d/ifnh.repo << 'EOF2'
+[ifnh]
+name=IFNH
+baseurl=https://abide-integrations.github.io/IFNH-Insert-Fancy-Name-Here/rpm
+enabled=1
+gpgcheck=0
+repo_gpgcheck=1
+gpgkey=https://abide-integrations.github.io/IFNH-Insert-Fancy-Name-Here/rpm/RPM-GPG-KEY-ifnh
+EOF2
+sudo dnf install ifnh
+
+# Snap (classic confinement: the agent runs your shell commands)
+sudo snap install ifnh --classic
+
+# Arch (AUR, prebuilt binary)
+yay -S ifnh-bin
+
+# Nix (flake; the checked-in hashes are placeholders until nix/artifacts.nix is
+# bumped for a release with scripts/bump-nix.sh, so `nix build` fails before then)
+nix run github:Abide-Integrations/IFNH-Insert-Fancy-Name-Here -- version
+
+# mise / asdf (GitHub-release backend, no plugin of our own)
+mise use -g github:Abide-Integrations/IFNH-Insert-Fancy-Name-Here@v0.1.7
+
+# Container image (static binary on scratch, no shell or git inside)
+docker run --rm ghcr.io/abide-integrations/ifnh version
+```
+
+The `.deb` and `.rpm` files are also attached to each release. The apt and dnf
+repositories carry only the current release (older versions drop out). The dnf
+repository metadata is signed (`repo_gpgcheck=1`); the individual rpm files are
+not, so `gpgcheck=0`.
+
+mise pins a project in `.mise.toml`:
+
+```toml
+[tools]
+"github:Abide-Integrations/IFNH-Insert-Fancy-Name-Here" = "0.1.7"
+```
+
+The mise path (asdf users: mise reads the same `.tool-versions` files) downloads the matching release tarball and needs no
+packaging of ours; the version in the pin is the release tag without the `v`.
+
+The container runs as root because it is meant for a bind-mounted project
+(`-v "$PWD":/work`): a fixed non-root uid usually cannot write a directory owned
+by the host user, and `scratch` has no `/etc/passwd` to map one. To write files
+as yourself, add `--user "$(id -u):$(id -g)" -e HOME=/work/.ifnh-home`. The image has no shell,
+git or coreutils, so the agent's `bash` and `git` tools cannot run inside it; it
+suits `ifnh ask` and other tool-free use.
+
 ### Package-managed installs
 
 If a package manager already provides `ifnh` (Homebrew, apt/dpkg, rpm, pacman or

@@ -32,6 +32,9 @@ e.g. `ifnh-0.1.7-linux-x86_64-musl.tar.gz`), each with a `.sha256` checksum, a
 verifies the checksum, and [docs/USAGE.md](docs/USAGE.md#14-distribution)
 shows how to verify the signature. It refuses to overwrite a package-managed
 `ifnh`, and `ifnh update` deliberately does nothing: IFNH never self-updates.
+Package-manager channels (Homebrew, apt/dnf, snap, AUR, Nix, mise, a container
+image) are wired up but **not published yet**; see
+[docs/USAGE.md](docs/USAGE.md#package-managers) for the commands and status.
 Or from source:
 
 ```bash

@@ -1,0 +1,18 @@
+pkgbase = ifnh-bin
+	pkgdesc = Lightweight agentic coding harness (prebuilt static binary)
+	pkgver = 0.1.7
+	pkgrel = 1
+	url = https://github.com/Abide-Integrations/IFNH-Insert-Fancy-Name-Here
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	provides = ifnh
+	conflicts = ifnh
+	options = !strip
+	options = !debug
+	source_x86_64 = ifnh-bin-0.1.7-x86_64.tar.gz::https://github.com/Abide-Integrations/IFNH-Insert-Fancy-Name-Here/releases/download/v0.1.7/ifnh-0.1.7-linux-x86_64-musl.tar.gz
+	sha256sums_x86_64 = SKIP
+	source_aarch64 = ifnh-bin-0.1.7-aarch64.tar.gz::https://github.com/Abide-Integrations/IFNH-Insert-Fancy-Name-Here/releases/download/v0.1.7/ifnh-0.1.7-linux-aarch64-musl.tar.gz
+	sha256sums_aarch64 = SKIP
+
+pkgname = ifnh-bin

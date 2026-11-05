@@ -1,0 +1,106 @@
+name: packages
+
+# Builds the .deb/.rpm (nfpm, from the released linux-musl tarballs: nothing is
+# compiled here) and the signed apt/dnf repository. Pull requests do not
+# trigger it. A manual run (workflow_dispatch, version of an existing release)
+# builds and uploads artifacts only. Attaching to the release and publishing the
+# repo happen only on a published release, and the repo only when the
+# GPG_PRIVATE_KEY secret exists (GPG_PASSPHRASE too, if the key has one).
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version to package (e.g. 0.1.7); the release must exist"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  VERSION: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.version }}
+  NFPM_VERSION: "2.48.0"
+  NFPM_SHA256: 6d7f9a28b2f397934403950fcbba83f598b08d02edbe79a0815b3b4897341750
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+      NFPM_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nfpm
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/nfpm.tgz" "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
+          echo "$NFPM_SHA256  $RUNNER_TEMP/nfpm.tgz" | sha256sum -c
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$RUNNER_TEMP/nfpm.tgz" -C "$RUNNER_TEMP/bin" nfpm
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Build .deb and .rpm (amd64, arm64)
+        run: |
+          ver="${VERSION#v}"
+          signing=""
+          if [ -n "$GPG_PRIVATE_KEY" ]; then
+            printf '%s\n' "$GPG_PRIVATE_KEY" > "$RUNNER_TEMP/sign.asc"
+            signing="--sign-key $RUNNER_TEMP/sign.asc"
+          fi
+          for arch in amd64 arm64; do
+            # shellcheck disable=SC2086
+            ./scripts/package-linux-pkgs.sh "$ver" "$arch" --out dist-pkgs $signing
+          done
+          rm -f "$RUNNER_TEMP/sign.asc"
+          ls -l dist-pkgs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: dist-pkgs/*
+          if-no-files-found: error
+
+  attach:
+    if: github.event_name == 'release'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-packages
+          path: dist-pkgs
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$VERSION" dist-pkgs/* --clobber --repo "$GITHUB_REPOSITORY"
+
+  apt-repo:
+    if: github.event_name == 'release'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # pushes the gh-pages branch
+    env:
+      GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+      GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+    steps:
+      - name: Check for the signing key
+        if: env.GPG_PRIVATE_KEY == ''
+        run: echo "::notice::GPG_PRIVATE_KEY is not set; the apt/dnf repository was not published."
+      - uses: actions/checkout@v4
+        if: env.GPG_PRIVATE_KEY != ''
+      - uses: actions/download-artifact@v4
+        if: env.GPG_PRIVATE_KEY != ''
+        with:
+          name: linux-packages
+          path: dist-pkgs
+      - name: Build, sign and publish the repository
+        if: env.GPG_PRIVATE_KEY != ''
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          sudo apt-get install -y --no-install-recommends apt-utils createrepo-c
+          printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          fpr=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr/{print $10; exit}')
+          ./scripts/publish-apt-repo.sh --pkg-dir dist-pkgs --out site --key "$fpr" --push
