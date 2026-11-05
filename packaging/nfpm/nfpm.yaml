@@ -1,0 +1,54 @@
+# nfpm template for the .deb and .rpm (ACTIVE_PLAN F-06). Driven by
+# scripts/package-linux-pkgs.sh, which exports:
+#   VERSION  release version, e.g. 0.1.7
+#   ARCH     amd64 | arm64 (nfpm maps it to x86_64 | aarch64 for the rpm)
+#   (run from inside the unpacked F-01 linux-musl tarball directory; src paths are relative to it)
+#   NFPM_KEY_FILE  optional armored private key; empty = unsigned package
+# The binary is static musl: no runtime dependencies are declared.
+name: ifnh
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+section: devel
+priority: optional
+maintainer: IFNH contributors <noreply@users.noreply.github.com>
+description: |
+  Lightweight agentic coding harness written in Zig.
+  Single static binary; provider-agnostic, with explicit permissions.
+vendor: Abide-Integrations
+homepage: https://github.com/Abide-Integrations/IFNH-Insert-Fancy-Name-Here
+license: MIT
+contents:
+  - src: ./ifnh
+    dst: /usr/bin/ifnh
+    file_info:
+      mode: 0755
+  - src: ./share/man/man1/ifnh.1
+    dst: /usr/share/man/man1/ifnh.1
+    file_info:
+      mode: 0644
+  - src: ./share/bash-completion/completions/ifnh
+    dst: /usr/share/bash-completion/completions/ifnh
+    file_info:
+      mode: 0644
+  # zsh: Debian packages use vendor-completions, Fedora/RHEL use site-functions.
+  - src: ./share/zsh/site-functions/_ifnh
+    dst: /usr/share/zsh/vendor-completions/_ifnh
+    packager: deb
+    file_info:
+      mode: 0644
+  - src: ./share/zsh/site-functions/_ifnh
+    dst: /usr/share/zsh/site-functions/_ifnh
+    packager: rpm
+    file_info:
+      mode: 0644
+  - src: ./share/fish/vendor_completions.d/ifnh.fish
+    dst: /usr/share/fish/vendor_completions.d/ifnh.fish
+    file_info:
+      mode: 0644
+deb:
+  signature:
+    key_file: ${NFPM_KEY_FILE}
+rpm:
+  signature:
+    key_file: ${NFPM_KEY_FILE}
