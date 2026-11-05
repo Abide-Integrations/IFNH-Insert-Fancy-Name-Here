@@ -24,6 +24,8 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+      - name: Version consistency
+        run: ./scripts/check-version.sh
       - name: Format check
         run: zig fmt --check src/
       - name: Test

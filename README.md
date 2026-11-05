@@ -26,6 +26,11 @@ interfaces and config keys may still move. Current work: [ACTIVE_PLAN.md](ACTIVE
 curl -fsSL https://raw.githubusercontent.com/Abide-Integrations/IFNH-Insert-Fancy-Name-Here/main/install.sh | sh
 ```
 The repository is planned to be renamed; the old path will redirect.
+Releases are `ifnh-<version>-<os>-<arch>.tar.gz` (Linux adds `-musl` or `-gnu`,
+e.g. `ifnh-0.1.7-linux-x86_64-musl.tar.gz`), each with a `.sha256` checksum, a
+`.spdx.json` SBOM and a keyless cosign `.cosign.bundle` signature; the installer
+verifies the checksum, and [docs/USAGE.md](docs/USAGE.md#14-distribution)
+shows how to verify the signature.
 Or from source:
 
 ```bash

@@ -1,48 +1,96 @@
 name: release
 
-# Tag-triggered release builds. All five targets cross-compile on ubuntu
-# runners; a final publish job attaches everything to the release in one
-# step (avoids concurrent-upload races between matrix jobs).
+# Release builds. Five targets cross-compile on ubuntu runners; each matrix job
+# packages, checksums, SBOMs and signs its own artifact (scripts/package-release.sh,
+# the same script scripts/release-dry-run.sh rehearses locally). A final publish
+# job attaches everything to the GitHub release in one step (avoids concurrent
+# upload races between matrix jobs).
+#
+# Triggers:
+#   push of a v* tag     build, package, sign, upload, then PUBLISH the release.
+#   workflow_dispatch    DRY RUN: the same build/package/sign/upload-artifact path,
+#                        but the publish job never runs, so no GitHub release is
+#                        created or modified. There is deliberately no "publish"
+#                        input: only a tag push publishes.
+#
+# Signatures are cosign keyless (Sigstore + this workflow's GitHub OIDC token);
+# there is no signing key or secret anywhere. See docs/USAGE.md "Release artifacts"
+# for the verification command.
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
+# A re-tag (or a re-dispatch on the same ref) cancels the superseded run.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: the build jobs only read the repo and mint an OIDC token for
+# cosign; only the publish job may write to the release.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # cosign keyless (OIDC)
     strategy:
+      fail-fast: false
       matrix:
         target: [x86_64-linux-musl, x86_64-linux-gnu, aarch64-linux-musl, aarch64-macos, x86_64-macos]
     steps:
       - uses: actions/checkout@v4
+      - name: Version consistency
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            ./scripts/check-version.sh --tag "$GITHUB_REF_NAME"
+          else
+            ./scripts/check-version.sh
+          fi
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-      - name: Build
-        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
-      - name: Package
+      - name: Install syft
         run: |
-          tar -czf "ifnh-${{ matrix.target }}.tar.gz" -C zig-out/bin ifnh
-          sha256sum "ifnh-${{ matrix.target }}.tar.gz" > "ifnh-${{ matrix.target }}.tar.gz.sha256"
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/v1.56.0/install.sh \
+            | sh -s -- -b "$RUNNER_TEMP/bin" v1.56.0
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - uses: sigstore/cosign-installer@v3
+      - name: Package (build, stage, tar.gz, sha256, SBOM)
+        id: pkg
+        run: |
+          name=$(IFNH_COMMIT="$(git rev-parse --short HEAD)" ./scripts/package-release.sh "${{ matrix.target }}" dist)
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+      - name: Sign (cosign keyless)
+        run: |
+          cosign sign-blob --yes \
+            --bundle "dist/${{ steps.pkg.outputs.name }}.tar.gz.cosign.bundle" \
+            "dist/${{ steps.pkg.outputs.name }}.tar.gz"
       - uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.target }}
-          path: |
-            ifnh-*.tar.gz
-            ifnh-*.tar.gz.sha256
+          path: dist/ifnh-*
+          if-no-files-found: error
 
   publish:
+    # Tag pushes only. workflow_dispatch never reaches this job.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum -c ./*.sha256
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+          fail_on_unmatched_files: true
