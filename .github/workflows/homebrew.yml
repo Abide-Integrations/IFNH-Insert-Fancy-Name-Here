@@ -1,0 +1,39 @@
+name: homebrew
+
+# Renders the Homebrew formula (scripts/bump-homebrew.sh) from a published
+# release's .sha256 files and uploads it as an artifact. It pushes to the tap
+# only on a published release AND when the HOMEBREW_TAP_TOKEN secret exists;
+# pull requests and manual runs never push.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version to render (e.g. 0.1.7); the release must exist"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  formula:
+    runs-on: ubuntu-latest
+    env:
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      VERSION: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Render formula
+        run: ./scripts/bump-homebrew.sh "$VERSION" --out dist
+      - name: Print formula
+        run: cat dist/Formula/ifnh.rb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: homebrew-formula
+          path: dist/Formula/ifnh.rb
+          if-no-files-found: error
+      - name: Push to tap
+        if: github.event_name == 'release' && env.HOMEBREW_TAP_TOKEN != ''
+        run: ./scripts/bump-homebrew.sh "$VERSION" --out dist --push
