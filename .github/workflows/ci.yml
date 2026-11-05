@@ -38,3 +38,7 @@ jobs:
         run: ./tests/integration-kill9.sh
       - name: libifnh smoke (C ABI)
         run: ./tests/smoke-lib.sh
+      - name: Install script smoke
+        run: |
+          ./tests/smoke-install.sh
+          ./tests/smoke-cli.sh

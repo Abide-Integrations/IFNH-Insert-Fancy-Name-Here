@@ -817,6 +817,29 @@ A hosted copy works too:
 curl -fsSL https://raw.githubusercontent.com/Abide-Integrations/IFNH-Insert-Fancy-Name-Here/main/uninstall.sh | sh
 ```
 
+### Package-managed installs
+
+If a package manager already provides `ifnh` (Homebrew, apt/dpkg, rpm, pacman or
+AUR, snap, Nix), `install.sh` refuses before downloading anything and prints
+the upgrade command, for example:
+
+```
+ifnh: refusing to overwrite a package-managed install (Homebrew); upgrade with brew upgrade ifnh
+```
+
+It checks the `ifnh` on your PATH and `$IFNH_PREFIX/ifnh` (paths under
+`/Cellar/`, `/homebrew/`, `/snap/`, `/nix/store/`, or owned according to
+`dpkg-query -S`, `rpm -qf`, `pacman -Qo`) and asks `brew` and `snap` whether
+they have the package. There is no `--force`, and `IFNH_PREFIX` does not
+bypass the check.
+
+Package-managed installs (Homebrew, apt/rpm, snap, AUR, Nix) own the binary,
+man page and completions only. They never create, modify or remove a project's
+`.ifnh/`, `~/.config/ifnh` (config and API keys) or `~/.local/state/ifnh`
+unless you, or the package's own uninstaller, do. The generated
+`ifnh-uninstall.sh` behaves the same: it leaves every `.ifnh/` alone and, without
+`--purge`, `~/.config/ifnh` too.
+
 ### Self-update
 
 IFNH never updates itself: the package manager (or `install.sh`) owns upgrades
@@ -903,7 +926,8 @@ without a checkout); override it with `zig build -Dcommit=<sha>`.
 CI is deliberately lean: `ci.yml` runs on ubuntu only (auto-cancel,
 docs-only changes skipped) — version consistency, fmt, tests, ReleaseSafe
 build, `scripts/bench.sh` budgets (size, startup, interactive cold start, TTFT,
-per-round overhead, peak RSS), integration harnesses. For a single
+per-round overhead, peak RSS), integration harnesses, and the offline install and
+CLI smoke scripts (`tests/smoke-install.sh`, `tests/smoke-cli.sh`). For a single
 machine:
 
 ```bash

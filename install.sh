@@ -11,6 +11,12 @@
 # Artifacts are ifnh-<version>-<os>-<arch>[-musl|-gnu].tar.gz with a .sha256
 # next to each (verified here; a mismatch aborts). Signatures (cosign keyless)
 # are an optional manual check, see docs/USAGE.md "Release artifacts".
+#
+# Package ownership: if a package manager (Homebrew, apt/dpkg, rpm, pacman/AUR,
+# snap, Nix) already provides ifnh, this script refuses and names the upgrade
+# command; there is no override. Neither this script nor those packages create,
+# modify or remove a project's .ifnh/, ~/.config/ifnh (config + API keys) or
+# ~/.local/state/ifnh; only the user, or the uninstaller they run, does.
 set -eu
 
 # CHANGE ME once the repo is pushed, or export IFNH_REPO:
@@ -30,6 +36,45 @@ case "$os" in
   Darwin) tos="macos" ;;
   *) echo "ifnh: unsupported OS '$os'" >&2; exit 1 ;;
 esac
+
+# --- refuse to overwrite a package-managed install (before any download) ---
+refuse() {
+  # refuse <manager> <upgrade command>
+  echo "ifnh: refusing to overwrite a package-managed install ($1); upgrade with $2" >&2
+  exit 1
+}
+
+check_path_owner() {
+  # check_path_owner <path to an ifnh binary>
+  real=$(readlink -f "$1" 2> /dev/null || true)
+  for p in "$1" "$real"; do
+    case "$p" in
+      */Cellar/*|*/homebrew/*) refuse Homebrew "brew upgrade ifnh" ;;
+      */snap/*) refuse snap "sudo snap refresh ifnh" ;;
+      */nix/store/*) refuse Nix "your Nix profile or flake (for example: nix profile upgrade)" ;;
+    esac
+  done
+  [ -n "$real" ] || real="$1"
+  if command -v dpkg-query > /dev/null 2>&1 && dpkg-query -S "$real" > /dev/null 2>&1; then
+    refuse apt "sudo apt install --only-upgrade ifnh"
+  fi
+  if command -v rpm > /dev/null 2>&1 && rpm -qf "$real" > /dev/null 2>&1; then
+    refuse rpm "sudo dnf upgrade ifnh"
+  fi
+  if command -v pacman > /dev/null 2>&1 && pacman -Qo "$real" > /dev/null 2>&1; then
+    refuse pacman "pacman -Syu ifnh (or your AUR helper)"
+  fi
+}
+
+for found in "$(command -v ifnh 2> /dev/null || true)" "$PREFIX/ifnh"; do
+  if [ -n "$found" ] && [ -e "$found" ]; then check_path_owner "$found"; fi
+done
+if command -v brew > /dev/null 2>&1 && brew list --formula ifnh > /dev/null 2>&1; then
+  refuse Homebrew "brew upgrade ifnh"
+fi
+if command -v snap > /dev/null 2>&1 && snap list ifnh > /dev/null 2>&1; then
+  refuse snap "sudo snap refresh ifnh"
+fi
 
 fetch() {
   # fetch <url> <outfile>
