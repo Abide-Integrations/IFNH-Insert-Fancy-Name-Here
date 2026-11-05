@@ -84,6 +84,8 @@ pub const Subcommand = enum {
     serve,
     /// `ifnh completions <bash|zsh|fish>` prints a completion script (F-02).
     completions,
+    /// `ifnh update`: always refuses; IFNH never self-updates (F-04).
+    update,
     /// Hidden: the Landlock re-exec helper (E-04). Not in `ifnh help`; it
     /// refuses to run unless the parent set `IFNH_SANDBOX_EXEC=1`.
     @"__sandbox-exec",
@@ -280,6 +282,8 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
         .serve
     else if (std.mem.eql(u8, cmd_name, "completions"))
         .completions
+    else if (std.mem.eql(u8, cmd_name, "update"))
+        .update
     else if (std.mem.eql(u8, cmd_name, "__sandbox-exec"))
         .@"__sandbox-exec"
     else
@@ -627,10 +631,11 @@ test "version accepts only --verbose" {
     try std.testing.expectEqual(Subcommand.version, (try parse(&.{ "version", "--verbose" })).subcommand);
 }
 
-test "completions needs exactly one known shell" {
+test "completions needs exactly one known shell; update is a subcommand" {
     try std.testing.expectEqual(Shell.zsh, try parseCompletions(&.{"zsh"}));
     try std.testing.expectError(error.MissingFlagValue, parseCompletions(&.{}));
     try std.testing.expectError(error.InvalidFlagValue, parseCompletions(&.{"powershell"}));
     try std.testing.expectError(error.TooManyArguments, parseCompletions(&.{ "bash", "fish" }));
     try std.testing.expectEqual(Subcommand.completions, (try parse(&.{ "completions", "bash" })).subcommand);
+    try std.testing.expectEqual(Subcommand.update, (try parse(&.{"update"})).subcommand);
 }

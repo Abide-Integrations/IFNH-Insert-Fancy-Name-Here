@@ -40,7 +40,7 @@ ok "version with another argument: exit 2"
 for sh in bash zsh fish; do
   rc_of ifnh completions "$sh"
   [ "$rc" = 0 ] && [ ! -s "$T/err" ] && [ -s "$T/out" ] || fail "completions $sh"
-  for sub in init config sessions resume fork cleanup ask doctor serve memory debug-bundle session replay completions help version; do
+  for sub in init config sessions resume fork cleanup ask doctor serve memory debug-bundle session replay completions update help version; do
     grep -q "$sub" "$T/out" || fail "completions $sh lacks $sub"
   done
   grep -q __sandbox-exec "$T/out" && fail "completions $sh leaks the hidden subcommand"
@@ -53,6 +53,12 @@ rc_of ifnh completions
 rc_of ifnh completions powershell
 [ "$rc" = 2 ] && [ ! -s "$T/out" ] && grep -q 'usage: ifnh completions' "$T/err" || fail "completions with unknown shell"
 ok "completions with no/unknown shell: exit 2, message on stderr"
+
+rc_of ifnh update
+[ "$rc" = 1 ] && [ ! -s "$T/out" ] || fail "update must exit 1 with empty stdout (rc=$rc)"
+grep -q '^ifnh: update is disabled; IFNH does not self-update\.$' "$T/err" || fail "update message"
+grep -q '^upgrade with: ' "$T/err" || fail "update names no upgrade route"
+ok "update: refuses, exit 1, route on stderr"
 
 [ -z "$(ls -A "$T/home")$(ls -A "$T/cwd")" ] || fail "commands created files"
 ok "HOME, XDG and cwd stayed empty"

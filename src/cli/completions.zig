@@ -34,6 +34,7 @@ const subcommands = [_]Entry{
     .{ .name = "session", .desc = "export a session as redacted NDJSON", .words = &.{"export"} },
     .{ .name = "replay", .desc = "print an exported session offline" },
     .{ .name = "completions", .desc = "print a shell completion script", .words = &.{ "bash", "zsh", "fish" } },
+    .{ .name = "update", .desc = "disabled, IFNH does not self-update" },
     .{ .name = "help", .desc = "show help" },
     .{ .name = "version", .desc = "print version, --verbose adds build details", .words = &.{"--verbose"} },
 };

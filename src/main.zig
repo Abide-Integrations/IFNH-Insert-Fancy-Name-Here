@@ -13,6 +13,7 @@ const repl = @import("cli/repl.zig");
 const ask_mod = @import("cli/ask.zig");
 const serve_mod = @import("cli/serve.zig");
 const completions_mod = @import("cli/completions.zig");
+const update_mod = @import("cli/update.zig");
 const session_mod = @import("core/session/store.zig");
 const config_mod = @import("core/config/config.zig");
 const config_schema = @import("core/config/schema.zig");
@@ -176,6 +177,14 @@ fn dispatch(
                 std.process.exit(2);
             };
             try printOut(io, arena, "{s}", .{try completions_mod.build(arena, shell)});
+        },
+        .update => {
+            var buf: [256]u8 = undefined;
+            var err_writer = std.Io.File.stderr().writer(io, &buf);
+            const exe = std.process.executablePathAlloc(io, arena) catch "";
+            const code = update_mod.run(&err_writer.interface, exe);
+            err_writer.interface.flush() catch {};
+            std.process.exit(code);
         },
         .@"__sandbox-exec" => {
             var buf: [256]u8 = undefined;
@@ -1110,6 +1119,7 @@ const help_text =
     \\  session     'ifnh session export <id> [--out <path>|-]' writes redacted NDJSON
     \\  replay      'ifnh replay <file> [--json]' prints an exported session offline
     \\  completions 'ifnh completions <bash|zsh|fish>' prints a shell completion script
+    \\  update      disabled (IFNH does not self-update; see USAGE)
     \\  help        show this text
     \\  version     print version; 'ifnh version --verbose' adds commit, target, mode
     \\
@@ -1146,6 +1156,7 @@ test {
     _ = @import("cli/args.zig");
     _ = @import("cli/serve.zig");
     _ = @import("cli/completions.zig");
+    _ = @import("cli/update.zig");
     _ = @import("core/config/config.zig");
     _ = @import("core/config/schema.zig");
     _ = @import("core/session/store.zig");

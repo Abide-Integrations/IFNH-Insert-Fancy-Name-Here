@@ -30,7 +30,8 @@ Releases are `ifnh-<version>-<os>-<arch>.tar.gz` (Linux adds `-musl` or `-gnu`,
 e.g. `ifnh-0.1.7-linux-x86_64-musl.tar.gz`), each with a `.sha256` checksum, a
 `.spdx.json` SBOM and a keyless cosign `.cosign.bundle` signature; the installer
 verifies the checksum, and [docs/USAGE.md](docs/USAGE.md#14-distribution)
-shows how to verify the signature.
+shows how to verify the signature. `ifnh update` deliberately does nothing:
+IFNH never self-updates.
 Or from source:
 
 ```bash

@@ -817,6 +817,16 @@ A hosted copy works too:
 curl -fsSL https://raw.githubusercontent.com/Abide-Integrations/IFNH-Insert-Fancy-Name-Here/main/uninstall.sh | sh
 ```
 
+### Self-update
+
+IFNH never updates itself: the package manager (or `install.sh`) owns upgrades
+and removal. `ifnh update` is a deliberate refusal, not a missing feature. It
+reads only its own path, makes no network call and writes nothing, prints to
+stderr why it is disabled and how to upgrade (`brew upgrade ifnh` for a
+Homebrew binary, `sudo snap refresh ifnh` for snap, your system package manager
+for `/usr/bin`, otherwise re-running `install.sh` or downloading the release),
+and exits 1.
+
 ### Release artifacts
 
 Every `v<version>` tag publishes, per platform, a tarball and three sidecars
