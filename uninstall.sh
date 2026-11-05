@@ -5,6 +5,7 @@
 # Project-local .ifnh/ directories are never touched.
 set -eu
 PREFIX="${IFNH_PREFIX:-$HOME/.local/bin}"
+SHARE="$(dirname "$PREFIX")/share"
 CONFIG_DIR="$HOME/.config/ifnh"
 STATE_DIR="$HOME/.local/state/ifnh"
 
@@ -18,7 +19,9 @@ done
 
 echo "ifnh uninstall:"
 removed=0
-for f in "$PREFIX/ifnh" "$PREFIX/ifnh-uninstall.sh"; do
+for f in "$PREFIX/ifnh" "$PREFIX/ifnh-uninstall.sh" "$SHARE/man/man1/ifnh.1" \
+  "$SHARE/bash-completion/completions/ifnh" "$SHARE/zsh/site-functions/_ifnh" \
+  "$SHARE/fish/vendor_completions.d/ifnh.fish"; do
   if [ -f "$f" ]; then
     rm -f "$f"
     echo "  removed $f"

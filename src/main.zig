@@ -12,6 +12,8 @@ const fsutil = @import("core/fsutil.zig");
 const repl = @import("cli/repl.zig");
 const ask_mod = @import("cli/ask.zig");
 const serve_mod = @import("cli/serve.zig");
+const completions_mod = @import("cli/completions.zig");
+const update_mod = @import("cli/update.zig");
 const session_mod = @import("core/session/store.zig");
 const config_mod = @import("core/config/config.zig");
 const config_schema = @import("core/config/schema.zig");
@@ -54,7 +56,15 @@ pub fn main(init: std.process.Init) !void {
     };
 
     if (parsed.flags.version or parsed.subcommand == .version) {
-        try printOut(io, arena, "ifnh {s}\n", .{version.version});
+        const verbose = if (parsed.subcommand == .version) cli_args.parseVersion(parsed.args) catch |err| {
+            try printErr(io, arena, "error: bad arguments: {s}\nusage: ifnh version [--verbose]\n", .{@errorName(err)});
+            std.process.exit(2);
+        } else false;
+        if (verbose) {
+            try printOut(io, arena, "{s}", .{try version.verbose(arena)});
+        } else {
+            try printOut(io, arena, "ifnh {s}\n", .{version.version});
+        }
         return;
     }
     if (parsed.flags.help or parsed.subcommand == .help) {
@@ -160,6 +170,21 @@ fn dispatch(
                 std.process.exit(2);
             };
             std.process.exit(serve_mod.run(io, environ, parsed.flags, serve_args, openWire(io, arena, environ, parsed.flags)));
+        },
+        .completions => {
+            const shell = cli_args.parseCompletions(parsed.args) catch |err| {
+                try printErr(io, arena, "error: bad arguments: {s}\nusage: ifnh completions <bash|zsh|fish>\n", .{@errorName(err)});
+                std.process.exit(2);
+            };
+            try printOut(io, arena, "{s}", .{try completions_mod.build(arena, shell)});
+        },
+        .update => {
+            var buf: [256]u8 = undefined;
+            var err_writer = std.Io.File.stderr().writer(io, &buf);
+            const exe = std.process.executablePathAlloc(io, arena) catch "";
+            const code = update_mod.run(&err_writer.interface, exe);
+            err_writer.interface.flush() catch {};
+            std.process.exit(code);
         },
         .@"__sandbox-exec" => {
             var buf: [256]u8 = undefined;
@@ -1093,8 +1118,10 @@ const help_text =
     \\  debug-bundle  write a redacted JSON bundle for bug reports (D-09)
     \\  session     'ifnh session export <id> [--out <path>|-]' writes redacted NDJSON
     \\  replay      'ifnh replay <file> [--json]' prints an exported session offline
+    \\  completions 'ifnh completions <bash|zsh|fish>' prints a shell completion script
+    \\  update      disabled (IFNH does not self-update; see USAGE)
     \\  help        show this text
-    \\  version     print version
+    \\  version     print version; 'ifnh version --verbose' adds commit, target, mode
     \\
     \\global flags:
     \\  --json                  machine-readable output
@@ -1128,6 +1155,8 @@ test {
     _ = @import("core/fsutil.zig");
     _ = @import("cli/args.zig");
     _ = @import("cli/serve.zig");
+    _ = @import("cli/completions.zig");
+    _ = @import("cli/update.zig");
     _ = @import("core/config/config.zig");
     _ = @import("core/config/schema.zig");
     _ = @import("core/session/store.zig");

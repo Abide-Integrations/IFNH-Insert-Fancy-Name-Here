@@ -3,8 +3,20 @@
 #   curl -fsSL https://raw.githubusercontent.com/Abide-Integrations/IFNH-Insert-Fancy-Name-Here/main/install.sh | sh
 # Env overrides:
 #   IFNH_REPO=<org>/<repo>   GitHub repo (see CHANGE ME below)
-#   IFNH_PREFIX=<dir>        install dir (default ~/.local/bin)
-#   IFNH_VERSION=<tag>       release tag (default: latest)
+#   IFNH_PREFIX=<dir>        install dir (default ~/.local/bin); man page and
+#                            completions go to <dir>/../share when writable
+#   IFNH_VERSION=<tag>       release tag, with or without the leading v
+#                            (default: the latest release)
+#
+# Artifacts are ifnh-<version>-<os>-<arch>[-musl|-gnu].tar.gz with a .sha256
+# next to each (verified here; a mismatch aborts). Signatures (cosign keyless)
+# are an optional manual check, see docs/USAGE.md "Release artifacts".
+#
+# Package ownership: if a package manager (Homebrew, apt/dpkg, rpm, pacman/AUR,
+# snap, Nix) already provides ifnh, this script refuses and names the upgrade
+# command; there is no override. Neither this script nor those packages create,
+# modify or remove a project's .ifnh/, ~/.config/ifnh (config + API keys) or
+# ~/.local/state/ifnh; only the user, or the uninstaller they run, does.
 set -eu
 
 # CHANGE ME once the repo is pushed, or export IFNH_REPO:
@@ -25,6 +37,45 @@ case "$os" in
   *) echo "ifnh: unsupported OS '$os'" >&2; exit 1 ;;
 esac
 
+# --- refuse to overwrite a package-managed install (before any download) ---
+refuse() {
+  # refuse <manager> <upgrade command>
+  echo "ifnh: refusing to overwrite a package-managed install ($1); upgrade with $2" >&2
+  exit 1
+}
+
+check_path_owner() {
+  # check_path_owner <path to an ifnh binary>
+  real=$(readlink -f "$1" 2> /dev/null || true)
+  for p in "$1" "$real"; do
+    case "$p" in
+      */Cellar/*|*/homebrew/*) refuse Homebrew "brew upgrade ifnh" ;;
+      */snap/*) refuse snap "sudo snap refresh ifnh" ;;
+      */nix/store/*) refuse Nix "your Nix profile or flake (for example: nix profile upgrade)" ;;
+    esac
+  done
+  [ -n "$real" ] || real="$1"
+  if command -v dpkg-query > /dev/null 2>&1 && dpkg-query -S "$real" > /dev/null 2>&1; then
+    refuse apt "sudo apt install --only-upgrade ifnh"
+  fi
+  if command -v rpm > /dev/null 2>&1 && rpm -qf "$real" > /dev/null 2>&1; then
+    refuse rpm "sudo dnf upgrade ifnh"
+  fi
+  if command -v pacman > /dev/null 2>&1 && pacman -Qo "$real" > /dev/null 2>&1; then
+    refuse pacman "pacman -Syu ifnh (or your AUR helper)"
+  fi
+}
+
+for found in "$(command -v ifnh 2> /dev/null || true)" "$PREFIX/ifnh"; do
+  if [ -n "$found" ] && [ -e "$found" ]; then check_path_owner "$found"; fi
+done
+if command -v brew > /dev/null 2>&1 && brew list --formula ifnh > /dev/null 2>&1; then
+  refuse Homebrew "brew upgrade ifnh"
+fi
+if command -v snap > /dev/null 2>&1 && snap list ifnh > /dev/null 2>&1; then
+  refuse snap "sudo snap refresh ifnh"
+fi
+
 fetch() {
   # fetch <url> <outfile>
   if command -v curl > /dev/null 2>&1; then
@@ -37,52 +88,88 @@ fetch() {
   fi
 }
 
-base="https://github.com/${REPO}/releases"
-if [ "${IFNH_VERSION:-}" != "" ]; then
-  dl="$base/download/${IFNH_VERSION}"
-else
-  dl="$base/latest/download"
-fi
-
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
+# --- version ---
+tag="${IFNH_VERSION:-}"
+if [ -z "$tag" ]; then
+  if fetch "https://api.github.com/repos/${REPO}/releases/latest" "$tmp/latest.json" 2> /dev/null; then
+    tag=$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$tmp/latest.json" | head -n 1)
+  fi
+  if [ -z "$tag" ]; then
+    echo "ifnh: could not resolve the latest release; set IFNH_VERSION (for example IFNH_VERSION=v0.1.7)" >&2
+    exit 1
+  fi
+fi
+case "$tag" in v*) ver="${tag#v}" ;; *) ver="$tag"; tag="v$tag" ;; esac
+dl="https://github.com/${REPO}/releases/download/${tag}"
+
+sha256_of() {
+  if command -v sha256sum > /dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum > /dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    echo "ifnh: need sha256sum or shasum to verify the download" >&2
+    exit 1
+  fi
+}
+
 # Prefer static musl builds on Linux (no glibc version coupling).
-candidates=""
 if [ "$tos" = "linux" ]; then
-  candidates="${tarch}-linux-musl ${tarch}-linux-gnu"
+  candidates="linux-${tarch}-musl linux-${tarch}-gnu"
 else
-  candidates="${tarch}-macos"
+  candidates="macos-${tarch}"
 fi
 
 installed=0
-for target in $candidates; do
-  url="$dl/ifnh-${target}.tar.gz"
+for plat in $candidates; do
+  name="ifnh-${ver}-${plat}"
+  url="$dl/$name.tar.gz"
   echo "ifnh: trying $url"
-  if fetch "$url" "$tmp/ifnh.tar.gz" 2>/dev/null; then
-    # Checksum verification when we can fetch the sum.
-    if fetch "$url.sha256" "$tmp/ifnh.tar.gz.sha256" 2>/dev/null; then
-      if command -v sha256sum > /dev/null 2>&1; then
-        (cd "$tmp" && echo "$(cat ifnh.tar.gz.sha256 | awk '{print $1}')  ifnh.tar.gz" | sha256sum -c - > /dev/null 2>&1) || {
-          echo "ifnh: checksum mismatch for $target" >&2
-          exit 1
-        }
-      fi
-    fi
-    tar -xzf "$tmp/ifnh.tar.gz" -C "$tmp"
+  if fetch "$url" "$tmp/ifnh.tar.gz" 2> /dev/null; then
+    fetch "$url.sha256" "$tmp/ifnh.tar.gz.sha256" 2> /dev/null || {
+      echo "ifnh: no checksum published for $name.tar.gz; refusing to install" >&2
+      exit 1
+    }
+    want=$(awk '{print $1}' "$tmp/ifnh.tar.gz.sha256")
+    [ "$(sha256_of "$tmp/ifnh.tar.gz")" = "$want" ] || {
+      echo "ifnh: checksum mismatch for $name.tar.gz" >&2
+      exit 1
+    }
+    mkdir -p "$tmp/x"
+    tar -xzf "$tmp/ifnh.tar.gz" -C "$tmp/x"
+    src="$tmp/x/$name"
+    [ -f "$src/ifnh" ] || { echo "ifnh: $name.tar.gz has no ifnh binary" >&2; exit 1; }
     mkdir -p "$PREFIX"
-    install -m 0755 "$tmp/ifnh" "$PREFIX/ifnh"
+    install -m 0755 "$src/ifnh" "$PREFIX/ifnh"
     installed=1
-    echo "ifnh: installed $target build -> $PREFIX/ifnh"
+    echo "ifnh: installed $plat build -> $PREFIX/ifnh"
     break
   fi
 done
 
 if [ "$installed" != 1 ]; then
-  echo "ifnh: no release artifact found (checked: $candidates)" >&2
+  echo "ifnh: no release artifact found for ${tag} (checked: $candidates)" >&2
   echo "      have you pushed a tag? see .github/workflows/release.yml" >&2
   exit 1
 fi
+
+# Man page and completions: <prefix>/../share, only where writable.
+share="$(dirname "$PREFIX")/share"
+put_share() {
+  # put_share <file in the tarball, relative to share/> ; quiet when not possible
+  [ -f "$src/share/$1" ] || return 0
+  d="$share/$(dirname "$1")"
+  if mkdir -p "$d" 2> /dev/null && [ -w "$d" ]; then
+    install -m 0644 "$src/share/$1" "$share/$1" 2> /dev/null || true
+  fi
+}
+put_share man/man1/ifnh.1
+put_share bash-completion/completions/ifnh
+put_share zsh/site-functions/_ifnh
+put_share fish/vendor_completions.d/ifnh.fish
 
 # Companion uninstaller (k3s pattern): installed next to the binary.
 cat > "$tmp/ifnh-uninstall.sh" <<'UNINSTALL'
@@ -90,8 +177,10 @@ cat > "$tmp/ifnh-uninstall.sh" <<'UNINSTALL'
 # IFNH uninstaller: removes the binary and runtime state.
 #   ifnh-uninstall.sh          keep ~/.config/ifnh (config + API keys)
 #   ifnh-uninstall.sh --purge  also delete ~/.config/ifnh
+# Project-local .ifnh/ directories are never touched.
 set -eu
 PREFIX="${IFNH_PREFIX:-$HOME/.local/bin}"
+SHARE="$(dirname "$PREFIX")/share"
 CONFIG_DIR="$HOME/.config/ifnh"
 STATE_DIR="$HOME/.local/state/ifnh"
 purge=0
@@ -103,7 +192,9 @@ for arg in "$@"; do
 done
 echo "ifnh uninstall:"
 removed=0
-for f in "$PREFIX/ifnh" "$PREFIX/ifnh-uninstall.sh"; do
+for f in "$PREFIX/ifnh" "$PREFIX/ifnh-uninstall.sh" "$SHARE/man/man1/ifnh.1" \
+  "$SHARE/bash-completion/completions/ifnh" "$SHARE/zsh/site-functions/_ifnh" \
+  "$SHARE/fish/vendor_completions.d/ifnh.fish"; do
   if [ -f "$f" ]; then rm -f "$f"; echo "  removed $f"; removed=1; fi
 done
 [ -d "$STATE_DIR" ] && { rm -rf "$STATE_DIR"; echo "  removed $STATE_DIR"; }

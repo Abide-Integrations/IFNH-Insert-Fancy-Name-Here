@@ -9,36 +9,27 @@ prefix="${IFNH_PREFIX:-$HOME/.local/bin}"
 repo="${IFNH_REPO:-Abide-Integrations/IFNH-Insert-Fancy-Name-Here}"
 
 need_download=0
-for arg in "$@"; do
-  case "$arg" in
+version=""
+while [ $# -gt 0 ]; do
+  case "$1" in
     --download) need_download=1 ;;
-    --version) shift_ver=1 ;;
+    --version) version="${2:?--version needs a tag}"; shift ;;
   esac
+  shift
 done
+
+# A release download is the root install.sh's job (artifact names, checksum,
+# package-manager check live there).
+if [ "$need_download" = 1 ]; then
+  exec env IFNH_PREFIX="$prefix" IFNH_REPO="$repo" IFNH_VERSION="$version" sh "$(dirname "$0")/../install.sh"
+fi
 
 mkdir -p "$prefix"
 
-arch=$(uname -m)
-os=$(uname -s)
-case "$arch" in x86_64) tarch="x86_64" ;; aarch64|arm64) tarch="aarch64" ;; *) echo "unsupported arch: $arch"; exit 1 ;; esac
-case "$os" in Linux) tos="linux" ;; Darwin) tos="macos" ;; *) echo "unsupported os: $os"; exit 1 ;; esac
-target="${tarch}-${tos}"
-
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
-
-if [ "$need_download" = 1 ]; then
-  url="https://github.com/${repo}/releases/latest/download/ifnh-${target}.tar.gz"
-  echo "downloading $url"
-  curl -fsSL "$url" -o "$tmp/ifnh.tar.gz"
-  tar -xzf "$tmp/ifnh.tar.gz" -C "$tmp"
-  src="$tmp/ifnh"
-else
-  src="./zig-out/bin/ifnh"
-  if [ ! -x "$src" ]; then
-    echo "no local build at $src — run 'zig build -Doptimize=ReleaseSafe' or use --download"
-    exit 1
-  fi
+src="./zig-out/bin/ifnh"
+if [ ! -x "$src" ]; then
+  echo "no local build at $src — run 'zig build -Doptimize=ReleaseSafe' or use --download"
+  exit 1
 fi
 
 install -m 0755 "$src" "$prefix/ifnh"

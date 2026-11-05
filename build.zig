@@ -4,6 +4,15 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // `version --verbose` reports the commit: `-Dcommit=<sha>` wins (CI),
+    // else `git rev-parse --short HEAD` at configure time, else `unknown`.
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "commit", b.option(
+        []const u8,
+        "commit",
+        "Commit id reported by `ifnh version --verbose` (default: git rev-parse --short HEAD)",
+    ) orelse gitShortHead(b));
+
     const module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -12,6 +21,8 @@ pub fn build(b: *std.Build) void {
         .omit_frame_pointer = optimize != .Debug,
         .error_tracing = false,
     });
+
+    module.addOptions("build_options", build_options);
 
     // The published JSON Schema lives in docs/ (outside src/); embed it by import.
     module.addAnonymousImport("config_schema", .{
@@ -65,6 +76,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .error_tracing = false,
     });
+    lib_module.addOptions("build_options", build_options);
     lib_module.addAnonymousImport("config_schema", .{
         .root_source_file = b.path("docs/config.schema.json"),
     });
@@ -93,4 +105,17 @@ pub fn build(b: *std.Build) void {
         .filters = if (test_filters.len > 0) test_filters else &.{"lib.test."},
     });
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
+}
+
+/// `git rev-parse --short HEAD` in the build root; `unknown` when git or
+/// `.git` is missing (source tarballs, unusual checkouts).
+fn gitShortHead(b: *std.Build) []const u8 {
+    var code: u8 = 0; // runAllowFail only sets it on failure
+    const out = b.runAllowFail(
+        &.{ "git", "-C", b.build_root.path orelse ".", "rev-parse", "--short", "HEAD" },
+        &code,
+        .ignore,
+    ) catch return "unknown";
+    const sha = std.mem.trim(u8, out, " \t\r\n");
+    return if (code == 0 and sha.len > 0) sha else "unknown";
 }

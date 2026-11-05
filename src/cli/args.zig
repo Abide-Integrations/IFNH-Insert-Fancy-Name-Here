@@ -82,6 +82,10 @@ pub const Subcommand = enum {
     memory,
     /// `ifnh serve [--framing ndjson|content-length]`: JSON-RPC 2.0 over stdio (E-06).
     serve,
+    /// `ifnh completions <bash|zsh|fish>` prints a completion script (F-02).
+    completions,
+    /// `ifnh update`: always refuses; IFNH never self-updates (F-04).
+    update,
     /// Hidden: the Landlock re-exec helper (E-04). Not in `ifnh help`; it
     /// refuses to run unless the parent set `IFNH_SANDBOX_EXEC=1`.
     @"__sandbox-exec",
@@ -154,6 +158,26 @@ pub fn parseServe(args: []const []const u8) ParseError!ServeArgs {
             return error.InvalidFlagValue;
     }
     return out;
+}
+
+/// Shells `ifnh completions` can generate for.
+pub const Shell = enum { bash, zsh, fish };
+
+/// Parse `ifnh version` arguments: only `--verbose`. Returns whether it was given.
+pub fn parseVersion(args: []const []const u8) ParseError!bool {
+    var verbose = false;
+    for (args) |arg| {
+        if (!std.mem.eql(u8, arg, "--verbose")) return error.UnknownFlag;
+        verbose = true;
+    }
+    return verbose;
+}
+
+/// Parse `ifnh completions <bash|zsh|fish>`: exactly one known shell name.
+pub fn parseCompletions(args: []const []const u8) ParseError!Shell {
+    if (args.len == 0) return error.MissingFlagValue;
+    if (args.len > 1) return error.TooManyArguments;
+    return std.meta.stringToEnum(Shell, args[0]) orelse error.InvalidFlagValue;
 }
 
 /// Most images one `ask` may attach.
@@ -256,6 +280,10 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
         .memory
     else if (std.mem.eql(u8, cmd_name, "serve"))
         .serve
+    else if (std.mem.eql(u8, cmd_name, "completions"))
+        .completions
+    else if (std.mem.eql(u8, cmd_name, "update"))
+        .update
     else if (std.mem.eql(u8, cmd_name, "__sandbox-exec"))
         .@"__sandbox-exec"
     else
@@ -593,4 +621,21 @@ test "parse memory list and purge" {
     try std.testing.expectError(error.UnknownFlag, parseMemory(&.{ "purge", "--json" }));
     try std.testing.expectError(error.InvalidFlagValue, parseMemory(&.{ "list", "--scope", "team" }));
     try std.testing.expectError(error.MissingFlagValue, parseMemory(&.{ "list", "--scope" }));
+}
+
+test "version accepts only --verbose" {
+    try std.testing.expect(!(try parseVersion(&.{})));
+    try std.testing.expect(try parseVersion(&.{"--verbose"}));
+    try std.testing.expectError(error.UnknownFlag, parseVersion(&.{"-v"}));
+    try std.testing.expectError(error.UnknownFlag, parseVersion(&.{ "--verbose", "extra" }));
+    try std.testing.expectEqual(Subcommand.version, (try parse(&.{ "version", "--verbose" })).subcommand);
+}
+
+test "completions needs exactly one known shell; update is a subcommand" {
+    try std.testing.expectEqual(Shell.zsh, try parseCompletions(&.{"zsh"}));
+    try std.testing.expectError(error.MissingFlagValue, parseCompletions(&.{}));
+    try std.testing.expectError(error.InvalidFlagValue, parseCompletions(&.{"powershell"}));
+    try std.testing.expectError(error.TooManyArguments, parseCompletions(&.{ "bash", "fish" }));
+    try std.testing.expectEqual(Subcommand.completions, (try parse(&.{ "completions", "bash" })).subcommand);
+    try std.testing.expectEqual(Subcommand.update, (try parse(&.{"update"})).subcommand);
 }

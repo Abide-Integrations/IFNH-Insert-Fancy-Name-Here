@@ -1,0 +1,214 @@
+.TH IFNH 1 "" "ifnh" "User Commands"
+.SH NAME
+ifnh \- a tiny, fast, developer-controlled agentic coding harness
+.SH SYNOPSIS
+.B ifnh
+.RB [ global\-flags ]
+.RI [ subcommand
+.RI [ args ...]]
+.br
+.B ifnh \-p
+.I prompt
+.SH DESCRIPTION
+.B ifnh
+runs a coding agent in your terminal against a model provider of your choice.
+With no subcommand it starts an interactive session in the current directory.
+Behaviour that can be expressed as JSON or Markdown (configuration, skills,
+commands, instructions) is read from disk at run time; project state lives in
+.B .ifnh/
+and is never created outside the directory you run it in.
+.PP
+Flags are kebab-case. Unknown flags are errors, not ignored values.
+.SH SUBCOMMANDS
+.TP
+.B (none)
+Start an interactive session.
+.TP
+.B init
+Create a
+.B .ifnh/
+project skeleton. Never overwrites existing files.
+.TP
+.B config validate | explain \fIkey\fR | get \fIkey\fR | set \fIkey value\fR | edit | path | schema
+Inspect and change configuration.
+.B set
+and
+.B edit
+write one file and validate before writing;
+.B set
+takes
+.B \-\-project
+(default) or
+.BR \-\-global .
+.TP
+.B sessions \fR[\fBlist\fR] [\fB\-\-json\fR]
+List recorded sessions.
+.TP
+.B resume \fIsession\-id\fR
+Resume a previous session.
+.TP
+.B fork \fIsession\-id\fR
+Branch a session into a new one.
+.B fork diff \fIa b\fR
+compares two sessions.
+.TP
+.B cleanup
+Enforce retention; list and remove worktrees.
+.TP
+.B ask \fR[\fIprompt\fR] [\fB\-\-json\fR] [\fB\-\-yes\fR | \fB\-\-deny\-all\fR | \fB\-\-policy\fR \fIask|allow|deny\fR] [\fB\-p\fR \fIprompt\fR] [\fB\-\-image\fR \fIpath\fR]...
+Run one headless turn. The prompt is an argument, or read from standard input
+when omitted or
+.BR \- .
+.B \-\-json
+prints NDJSON events and nothing else.
+.B \-\-yes
+approves every permission ask once;
+.B \-\-deny\-all
+denies every ask; they and
+.B \-\-policy
+are mutually exclusive. Without them, asks are answered on the terminal.
+.B \-\-image
+attaches a png, jpg, gif or webp (at most 5 MiB), up to eight times.
+.TP
+.B doctor
+Check environment health. Exits 1 if a check fails.
+.TP
+.B serve \fR[\fB\-\-framing\fR \fIndjson|content\-length\fR]
+Speak JSON-RPC 2.0 (ACP) over standard input and output.
+.TP
+.B memory list \fR[\fB\-\-scope\fR \fIproject|user\fR] [\fB\-\-json\fR]
+.TQ
+.B memory purge \fR[\fB\-\-scope\fR \fIproject|user\fR] [\fB\-\-yes\fR]
+List or purge stored memory. Both report that memory is off while
+.B memory.adapter
+is
+.BR none .
+.TP
+.B debug\-bundle \fR[\fB\-\-out\fR \fIpath\fR] [\fB\-\-json\fR]
+Write a redacted JSON bundle for bug reports.
+.TP
+.B session export \fIid\fR [\fB\-\-out\fR \fIpath\fR|\fB\-\fR]
+Write a session as redacted NDJSON.
+.TP
+.B replay \fIfile\fR [\fB\-\-json\fR]
+Print an exported session offline.
+.TP
+.B completions \fIbash|zsh|fish\fR
+Print a shell completion script to standard output. For example:
+.RS
+.nf
+ifnh completions bash > ~/.local/share/bash\-completion/completions/ifnh
+ifnh completions zsh > ~/.local/share/zsh/site\-functions/_ifnh
+ifnh completions fish > ~/.config/fish/completions/ifnh.fish
+.fi
+.RE
+.TP
+.B update
+Disabled. IFNH never replaces its own binary; it prints how to upgrade and
+exits 1. Package managers own upgrades and removal.
+.TP
+.B help
+Show the built-in help.
+.TP
+.B version \fR[\fB\-\-verbose\fR]
+Print the version. With
+.BR \-\-verbose ,
+also print the commit, target and build mode.
+.SH GLOBAL FLAGS
+.TP
+.B \-\-json
+Machine-readable output.
+.TP
+.B \-\-no\-color
+Disable color.
+.TP
+.BI \-\-log\-level " level"
+One of
+.BR err ,
+.BR info ,
+.B debug
+or
+.BR trace .
+.TP
+.BI \-\-profile " name"
+Apply
+.BI profiles. name
+from configuration.
+.TP
+.BI \-\-trace " path"
+Write a redacted NDJSON wire log (or set
+.BR IFNH_TRACE_LOG ).
+.TP
+.BI \-\-model " id\fR, " \-\-provider " name\fR, " \-\-base\-url " url\fR, " \-\-temperature " n"
+.TQ
+.BI \-\-max\-output\-tokens " n\fR, " \-\-context\-tokens " n\fR, " \-\-permission\-mode " mode"
+.TQ
+.B \-\-no\-footer
+Per-key configuration overrides, applied after
+.B \-\-profile
+as the highest-precedence layer.
+.TP
+.BI \-p " prompt"
+Headless one-shot prompt; the same as
+.B ifnh ask \-p
+.IR prompt .
+.TP
+.BR \-h ", " \-\-help
+Show help.
+.TP
+.BR \-V ", " \-\-version
+Print the version.
+.SH FILES
+.TP
+.I $XDG_CONFIG_HOME/ifnh
+.TQ
+.I ~/.config/ifnh
+User configuration (\fIconfig.json\fR), user skills and stored API keys. The first is used when
+.B XDG_CONFIG_HOME
+is set, otherwise the second. The same on Linux and macOS.
+.TP
+.I ~/.local/state/ifnh
+Logs and transient state.
+.TP
+.I .ifnh/
+Project configuration, instructions, skills, commands, plans and sessions. Package
+managers and the installer never create, modify or remove it.
+.SH ENVIRONMENT
+.TP
+.B XDG_CONFIG_HOME
+Base of the user configuration directory.
+.TP
+.BI IFNH_ SECTION __ KEY
+Override a configuration key, for example
+.BR IFNH_PERMISSIONS__DEFAULT_MODE=auto .
+.TP
+.B IFNH_TRACE_LOG
+Path of the redacted wire log (same as
+.BR \-\-trace ).
+.TP
+.BR ANTHROPIC_API_KEY ", " OPENAI_API_KEY ", " GEMINI_API_KEY
+Provider keys, when not stored in the user configuration directory.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Failure: provider or tool error that ended the turn, or a failed check.
+.TP
+.B 2
+Usage error: unknown flag, bad or missing value, missing prompt.
+.TP
+.B 3
+Denied: a tool call was denied during the turn (\fBask\fR).
+.TP
+.B 4
+Budget: \fBagents.budget_usd\fR was already spent (\fBask\fR).
+.TP
+.B 130
+Interrupted.
+.SH SEE ALSO
+Full guide: docs/USAGE.md in the source repository, or
+.B ifnh help
+for the built-in summary. Release artifacts and their verification are described
+in the section "Release artifacts" of that guide.
