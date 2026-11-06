@@ -142,4 +142,4 @@ No tag has been pushed and nothing is published yet.
   GitHub Actions dry run. See [ACTIVE_PLAN.md](ACTIVE_PLAN.md).
 - The Landlock backend cannot deny UDP or unix sockets, and denying TCP needs
   kernel 6.7 or newer.
-- The markdown renderer (C-07) and Esc-to-stop are not built.
+- Esc-to-stop is not built: interrupting a turn is Ctrl-C (A-06). The C-07 markdown renderer is implemented in `src/ui/render.zig` and used by the REPL, but its ACTIVE_PLAN row is still marked unverified.
