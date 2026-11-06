@@ -1,7 +1,11 @@
 # IFNH Usage Guide
 
-Everything you need to run, configure, and live in IFNH. Philosophy and
-decisions live in PLAN.md/DECISIONS.md; architecture in DESIGN.md.
+Everything you need to run, configure, and live in IFNH 0.1.x (pre-1.0:
+interfaces and config keys may still move; see the [CHANGELOG](../CHANGELOG.md)).
+Philosophy and decisions live in [PLAN.md](../PLAN.md) and
+[DECISIONS.md](../DECISIONS.md); architecture in [DESIGN.md](../DESIGN.md);
+interface and security decisions in [docs/adr/](adr/); what is verified and
+what is still open in [ACTIVE_PLAN.md](../ACTIVE_PLAN.md).
 
 ---
 
@@ -10,7 +14,7 @@ decisions live in PLAN.md/DECISIONS.md; architecture in DESIGN.md.
 Requires [Zig 0.16.0](https://ziglang.org/download/). No other toolchain.
 
 ```bash
-zig build -Doptimize=ReleaseSafe     # -> zig-out/bin/ifnh (~1.7 MiB)
+zig build -Doptimize=ReleaseSafe     # -> zig-out/bin/ifnh (~1.8 MiB; budget < 5 MiB)
 zig build test                       # unit tests
 ./scripts/bench.sh                   # verify size, startup, TTFT, per-round overhead, RSS budgets
 ```
@@ -163,7 +167,7 @@ is not a terminal or `TERM` is `dumb`: then nothing at all is written.
 | Command | Effect |
 |---|---|
 | `/help` | command list |
-| `/model <name>` | switch model for this session |
+| `/model <name>` | switch model for this session (beats a profile and `routing.parent`) |
 | `/config` | show resolved configuration |
 | `/context` | context x-ray: bytes and estimated tokens per source (`--json` for machines) |
 | `/undo` / `/redo` | step the file-mutation journal (works across restarts) |
@@ -174,14 +178,23 @@ is not a terminal or `TERM` is `dumb`: then nothing at all is written.
 | `/skills` | installed skills |
 | `/mcp` | MCP servers/tools |
 | `/memory` | memory scope, entry count and the newest notes (`/memory purge` deletes them, after approval) |
-| `/exec` | background executions |
+| `/exec` | background executions (id, command, state) |
+| `/provider [show]` | provider, model, base URL, whether the API key is found, tools on/off |
+| `/provider set <provider> <model> [base_url] [key_env]` | write the model block to `.ifnh/config.json` |
+| `/provider key <ENV_NAME> [value]` | store an API key in the user `env` file (mode 0600; hidden prompt when the value is omitted) |
+| `/provider tools <on\|off>` | chat-only mode for this session (`model.tools_enabled`) |
 | `/usage` | session token and dollar totals, with the budget and a per-model line when several models were used |
 | `/compact` | force context compaction |
 | `/image <path>` | attach an image to the next message (`/image` = queued count, `/image clear`) |
-| `/lifecycle run <file.json> [--from <n>]` | run a lifecycle |
+| `/lifecycle run <file.json> [--from <n>]` | run a lifecycle (section 12) |
 | `/review override <reason>` | developer-only override of a blocked review (audited) |
 | `/reconcile <path>` | reconciliation agent for conflicting edits |
 | `/quit` | exit |
+
+`/q` and `/h` are short forms of `/quit` and `/help`. `/sessions` lists
+sessions, but resuming and forking are subcommands, not slash commands:
+`ifnh resume <id>`, `ifnh fork <id>` (section 7). An unknown `/name` that has no
+file in `.ifnh/commands/` prints `unknown command /name (try /help)`.
 
 Custom commands: drop a Markdown file into `.ifnh/commands/<name>.md`
 (optional `---` frontmatter); `$ARGS` in the body is replaced by what you
@@ -273,8 +286,21 @@ ifnh config get model.model       # value only (script-friendly)
 ifnh config get ui.footer --json  # {"key","value","layer","source"}
 ifnh config path                  # user + project config paths
 ifnh config schema                # the published JSON Schema
-ifnh config validate
+ifnh config validate              # also what plain `ifnh config` runs
 ```
+
+| Subcommand | Flags | Output |
+|---|---|---|
+| `config path` | `--json` | the user config path and `.ifnh/config.json` |
+| `config get <key>` | `--json`, `--origin` | the value as JSON; `--json` adds `layer` and `source`; `--origin` prints the `explain` form |
+| `config explain <key>` | `--json` | `key = value`, then the layer (`builtin`, `user`, `project`, `session`, `env`, `cli`) and source file |
+| `config set <key> <value>` | `--global`, `--project`, `--json` | writes one file; `--json` prints `{"path","key","value"}` |
+| `config edit` | `--global`, `--project` | opens the file in `$VISUAL` / `$EDITOR` / `vi` (a missing file starts as `{}`) |
+| `config schema` | | the JSON Schema (`docs/config.schema.json`) |
+| `config validate` | | `config valid`, or one `error [key]: ...` line per problem and exit 1 |
+
+`--json` is also accepted as a global flag (`ifnh --json config get ...`). A key
+with no value prints `<unset> (no default)` (`get` and `explain`) or `null` (`--json`).
 
 Edit without hand-editing JSON:
 
@@ -288,10 +314,11 @@ ifnh config edit                                  # $VISUAL / $EDITOR / vi
 Values parse as JSON when they can (`false`, `0.3`, `["a"]`) and are stored as
 strings otherwise, so bare words work. `set` validates the whole file against
 the schema before writing and refuses on any error (`not written`), so a typo
-cannot break the next startup. `--global`/`--project` pick the file; the
-default is the project config. The schema itself lives in
+cannot break the next startup. `--global` picks the user config file;
+`--project` (the default) picks `.ifnh/config.json`. The schema itself lives in
 `docs/config.schema.json` and is embedded in the binary, so
-`ifnh config schema` always matches the defaults.
+`ifnh config schema` always matches the defaults
+([ADR-0006](adr/0006-config-cli-and-schema.md)).
 
 Per-key flags are CLI-layer overrides, applied after `--profile`, so they win
 over everything:
@@ -352,6 +379,27 @@ agents.budget_usd or /usage to inspect` and stays at the prompt (slash commands
 still work). The check is per turn: the turn that crosses the line completes,
 and subagent spend is not counted yet. `ui.footer` switches the status footer.
 
+Per-turn cost and the breaker in practice. Each completed turn appends one line
+to `.ifnh/sessions/<id>/usage.jsonl`:
+
+```json
+{"ts_ms":1762400000000,"input_tokens":1200,"output_tokens":345,"cache_read_tokens":0,"cache_write_tokens":0,"tool_calls":2,"model":"claude-sonnet-4-6","cost_usd":0.0123,"priced":true}
+```
+
+`/usage` folds that file into totals; with a budget set it shows what is left,
+and with more than one model it adds a `by model:` line (unpriced models show
+`n/a`):
+
+```
+session usage: 3 turns, 5400 tokens in, 980 tokens out, $0.0412 (budget $5.0000, $4.9588 remaining)
+by model: claude-sonnet-4-6 $0.0412 (2 turns), local-model n/a (1 turns)
+```
+
+The breaker is a `>=` check before a turn, so `agents.budget_usd: 0` refuses every
+turn. In `ifnh ask` it ends the run with exit code 4 before any request is sent;
+over `ifnh serve` a refused prompt stops with `refusal`; through `libifnh` it is
+return code 4.
+
 `NO_COLOR` / `--no-color` disable styling.
 
 ### Profiles, aliases and routing
@@ -380,7 +428,8 @@ ifnh --profile offline ask -p "hi"
 An unknown name is a startup error (`unknown profile 'x'; known profiles: a, b`)
 with exit code 2; `/model` still wins over a profile. A profile may set any
 config key, including `models` and `routing` — the merged result is validated
-the same way a hand-written config is.
+the same way a hand-written config is. Rationale:
+[ADR-0005](adr/0005-profiles-routing-provider-options.md).
 
 Model aliases name a provider/model pair once and reuse it:
 
@@ -522,6 +571,72 @@ or several matches. Three upgrades:
   result says `matched ignoring whitespace differences`. Several candidates
   fail with the multiple-matches error plus a whitespace-insensitive hint.
   An exact match always wins, and `replace_all` never uses the fallback.
+
+### Custom tools (`.ifnh/tools/*.json`)
+
+A project can give the model its own verbs as data: a shell command template
+with a name, a description and an argument schema. No code and no rebuild;
+commit the files with the project. Design and rationale:
+[ADR-0004](adr/0004-custom-tools-as-data.md).
+
+```json
+{
+  "name": "run-tests",
+  "description": "Run the unit tests matching a pattern",
+  "parameters": {
+    "type": "object",
+    "properties": { "pattern": { "type": "string" } },
+    "required": ["pattern"]
+  },
+  "command": "zig build test -Dtest-filter={pattern}",
+  "permission": "exec",
+  "timeout_s": 300
+}
+```
+
+A file holds one such object or an array of them. Files are read from
+`.ifnh/tools/` only (not recursively), `*.json` in filename order, once at
+startup, so a new definition needs a new run. Child agents inherit the set.
+Custom tools are advertised after the builtins.
+
+| Field | Required | Rule |
+|---|---|---|
+| `name` | yes | `^[a-z][a-z0-9_-]{0,63}$`; unique (the first definition wins) |
+| `description` | yes | string, shown to the model |
+| `parameters` | yes | a JSON object, normally a JSON Schema (`type: object`); sent to the model as the input schema |
+| `command` | yes | non-empty string, run by `/bin/sh -c` after substitution |
+| `permission` | yes | `read`, `write` or `exec` |
+| `timeout_s` | no | integer 1..3600, default 60; it can only tighten the session limit (`agents.timeout_tool_s`) |
+
+`permission` is validated but is metadata only today: it is not sent to the
+model and does not change how the call is gated.
+
+Placeholders: `{name}` in `command` is replaced by the argument of that name,
+wrapped in single quotes with embedded `'` written as `'\''`, so one argument is
+always one shell word and cannot inject syntax. Do not add your own quotes
+around a placeholder. Strings, numbers and booleans are accepted; a missing
+argument, `null`, an object or an array fails the call with
+`error: custom tool '<name>': ...` and nothing runs. `{{` and `}}` produce
+literal braces; an unclosed `{`, an empty `{}` or a stray `}` fails the call.
+
+Every call is gated like a `bash` call: the rendered command goes through the
+permission engine (`command_allow`, `command_deny`, ask). An ask is shown as
+`run custom tool` with the tool name and the full command, and a denial or
+declined prompt returns `permission denied`. Execution (timeouts, output cap,
+journal, sandbox) is the `bash` path. A custom tool is never batched as
+read-only.
+
+Limits and rejections. At most 64 tools in total and 64 KiB per file. A tool is
+skipped with a `warning: ...` line (never a fatal error) when its JSON is
+invalid, a required field is missing or has the wrong type, `timeout_s` is out
+of range, the name is malformed or already taken, or the name is reserved. Reserved are the
+builtins (`read`, `glob`, `grep`, `edit`, `write`, `bash`, `git`, `agent`,
+`exec`, `skill`, `read_tool_result`, `memory_recall`, `memory_remember`,
+`memory_forget`) and anything starting with `mcp_`. A missing `.ifnh/tools/`
+directory is normal. `"tools": {"external": false}` is the kill switch: no
+definition is loaded and one warning says so (the same switch makes search use
+the built-in walker instead of `rg`/`fd`). `.ifnh/tools/` is a protected path:
+agents cannot write to it, even with approval. `ifnh init` creates the directory.
 
 Policies in this section are enforced by the permission engine, never by
 the model's judgment. `.ifnh/` policy files are agent-write-denied; a
@@ -709,25 +824,45 @@ Optional, advisory notes that survive between sessions. **Off by default**
 } }
 ```
 
-Events (all ten of P212): `session_start/end`, `before/after_agent`,
-`before/after_stage`, `before/after_tool`, `before/after_merge`. Each event
-takes a command, a list of commands, or a list of objects with `command`,
-`matcher` (`|`-separated exact tool names, `*` or omitted = every tool) and
-`timeout_s` (1..300, default 30). Every hook runs under `/bin/sh` in the
-workspace.
+Events (all ten of P212):
 
-The event payload arrives as JSON on stdin and as `IFNH_EVENT`,
-`IFNH_SESSION_ID` and `IFNH_TOOL_NAME` in the environment. A `before_*`
-hook can steer the call from its stdout, using the last non-empty line:
+| Event | Gate? | Fires |
+|---|---|---|
+| `session_start`, `session_end` | no | when a session starts and ends (REPL and `ifnh ask`) |
+| `before_agent`, `after_agent` | `before_agent` | around each agent turn; a blocked `before_agent` skips the turn |
+| `before_stage`, `after_stage` | `before_stage` | around a lifecycle stage (payload has `stage`) |
+| `before_tool`, `after_tool` | `before_tool` | around every tool call (payload has `tool_name`, `tool_input`) |
+| `before_merge`, `after_merge` | `before_merge` | around a `bash` call whose command contains `git merge` |
+
+Each event takes a command, a list of commands, or a list of objects with
+`command`, `matcher` (`|`-separated exact tool names, `*` or omitted = every
+tool; only `before_tool`/`after_tool` consult it) and `timeout_s` (1..300,
+default 30). Every hook runs under `/bin/sh` in the workspace; at most 64 KiB of
+each output stream is kept.
+
+The event payload arrives as JSON on stdin; empty fields are left out:
+
+```json
+{"event":"before_tool","session_id":"s_abc123","tool_name":"edit","tool_input":{"path":"a.txt","old_string":"x","new_string":"y"}}
+```
+
+`IFNH_EVENT`, `IFNH_SESSION_ID` and `IFNH_TOOL_NAME` carry the same identity in
+the environment. A non-zero exit or a timeout blocks a `before_*` event and is
+advisory for every other event.
+
+Only `before_tool` can also steer the call from its stdout. The last non-empty
+line is read, and anything that is not one of these two objects means "run":
 
 ```jsonc
 {"decision": "deny", "reason": "no pushes on Fridays"}   // blocks the call
 {"decision": "rewrite", "arguments": {"path": "b.txt"}} // replaces tool input
 ```
 
-Rewrites chain through the remaining `before_tool` hooks; `after_*` hooks
-never block, whatever they print. A non-zero exit or a timeout still blocks
-`before_*` and is advisory everywhere else. Hooks never trigger hooks.
+Hooks run in the order configured. A `rewrite` replaces the tool input for the
+hooks after it (their stdin payload shows the rewritten `tool_input`) and for
+the call itself, so rewrites chain and the last one wins; a later `deny` still
+blocks. `after_*` hooks never block, whatever they print, and hooks never
+trigger hooks. Protocol rationale: [ADR-0007](adr/0007-hook-protocol-v2.md).
 
 ## 12. Lifecycles
 
@@ -750,7 +885,7 @@ Run with `/lifecycle run .ifnh/lifecycle/ship.json` (resume with
 ## 13. Observability
 
 - `ifnh doctor` — environment health.
-- `/usage` — session token totals; per-turn records in the session dir.
+- `/usage` — session token and dollar totals; per-turn records in `usage.jsonl` (section 5).
 - Logs: `--log-level err|info|debug|trace` (debug/trace redact secrets at
   write time).
 - `ifnh --trace <path> ask ...` (or `IFNH_TRACE_LOG=<path>`) — NDJSON wire log
@@ -1012,6 +1147,7 @@ zig build -Doptimize=ReleaseSafe && scripts/install.sh
 ├── config.d/            # committed — split config
 ├── instructions/        # committed — extra project instructions
 ├── commands/            # committed — custom slash commands
+├── tools/               # committed — custom tool definitions (*.json)
 ├── skills/              # committed — project skills (`/skills install` clones here)
 ├── skills.lock.json     # committed — pinned source/commit of installed skills
 ├── memory/              # advisory notes of the file memory adapter (opt-in)
