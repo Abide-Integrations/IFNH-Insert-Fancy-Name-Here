@@ -55,7 +55,7 @@ pub fn fetchModels(
     while (page < max_pages and all.items.len < max_models) : (page += 1) {
         const base = modelListUrl(arena, base_url, style);
         const url = if (token) |t|
-            std.fmt.allocPrint(arena, "{s}&pageToken={s}", .{ base, t }) catch return .{ .failure = "out of memory" }
+            pageUrl(arena, base, t) catch return .{ .failure = "out of memory" }
         else
             base;
         const body = switch (fetchPage(arena, &client, url, api_key, style)) {
@@ -68,6 +68,21 @@ pub fn fetchModels(
     }
     if (all.items.len == 0) return .{ .failure = "provider returned no models" };
     return .{ .models = all.items };
+}
+
+/// `base` plus an opaque `pageToken`, percent-encoded (tokens can hold `+`, `&`, `=`).
+fn pageUrl(arena: std.mem.Allocator, base: []const u8, token: []const u8) std.mem.Allocator.Error![]const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    try buf.appendSlice(arena, base);
+    try buf.appendSlice(arena, "&pageToken=");
+    for (token) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '.' or c == '_' or c == '~') {
+            try buf.append(arena, c);
+        } else {
+            try buf.print(arena, "%{X:0>2}", .{c});
+        }
+    }
+    return buf.items;
 }
 
 const Page = union(enum) { body: []const u8, failure: []const u8 };
@@ -241,6 +256,17 @@ test "model list url construction" {
     try std.testing.expectEqualStrings("http://localhost:11434/v1/models", modelListUrl(a, "http://localhost:11434/v1/", .openai));
     try std.testing.expectEqualStrings("https://api.anthropic.com/v1/models?limit=100", modelListUrl(a, "https://api.anthropic.com", .anthropic));
     try std.testing.expectEqualStrings("https://generativelanguage.googleapis.com/v1beta/models?pageSize=100", modelListUrl(a, "https://generativelanguage.googleapis.com/v1beta/", .gemini));
+}
+
+test "page token is percent-encoded in the query string" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    try std.testing.expectEqualStrings(
+        "https://h/v1beta/models?pageSize=100&pageToken=ab%2Bc%26d%3D%2F-_.~",
+        try pageUrl(a, "https://h/v1beta/models?pageSize=100", "ab+c&d=/-_.~"),
+    );
 }
 
 test "parse Gemini model pages: strip the models/ prefix, skip embedders, follow the token" {

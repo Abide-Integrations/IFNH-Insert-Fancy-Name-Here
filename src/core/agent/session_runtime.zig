@@ -256,7 +256,7 @@ pub const SessionRuntime = struct {
     /// Re-run skill discovery so `/skills install` and `/skills remove` take
     /// effect without a restart. The catalog lives in `arena` (REPL lifetime).
     pub fn rescanSkills(self: *SessionRuntime, arena: std.mem.Allocator, cwd: std.Io.Dir) void {
-        const user_dir = config_mod.userSkillsDir(arena, self.process_environ) orelse return;
+        const user_dir = config_mod.userSkillsDir(arena, self.process_environ);
         self.skills = skills_mod.discover(cwd, self.io, arena, user_dir) catch return;
     }
 
