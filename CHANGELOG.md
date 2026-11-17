@@ -8,9 +8,11 @@ The source of truth for what landed and what is still awaiting verification on
 the owner's host is [ACTIVE_PLAN.md](ACTIVE_PLAN.md); this entry summarizes its
 phases A-F and session log.
 
-## [0.1.7] - unreleased
+## [0.1.8] - unreleased
 
-No tag has been pushed and nothing is published yet.
+No tag has been pushed and nothing is published yet. The `v0.1.7` tag predates
+this work and uses the old asset names (`ifnh-<arch>-<os>.tar.gz`), which the
+current `install.sh` does not read; 0.1.8 is the first release with the new names.
 
 ### Added
 

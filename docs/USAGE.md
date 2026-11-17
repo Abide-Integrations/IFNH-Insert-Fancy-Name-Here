@@ -1103,9 +1103,9 @@ Releasing: `src/version.zig` is the only place the version is edited; set the
 same value as `.version` in `build.zig.zon`, then check and tag:
 
 ```bash
-scripts/check-version.sh --tag v0.1.7   # version.zig == build.zig.zon == tag
+scripts/check-version.sh --tag v0.1.8   # version.zig == build.zig.zon == tag
 scripts/release-dry-run.sh              # local rehearsal: builds, packages, checksums, SBOMs
-git tag v0.1.7 && git push origin v0.1.7
+git tag v0.1.8 && git push origin v0.1.8
 ```
 
 `release.yml` also runs on `workflow_dispatch` as a dry run (builds, packages,
