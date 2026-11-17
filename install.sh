@@ -22,7 +22,6 @@ set -eu
 # CHANGE ME once the repo is pushed, or export IFNH_REPO:
 REPO="${IFNH_REPO:-Abide-Integrations/IFNH-Insert-Fancy-Name-Here}"
 PREFIX="${IFNH_PREFIX:-$HOME/.local/bin}"
-IFNH_VERSION=1.0.8
 
 # --- platform detection ---
 arch=$(uname -m)
