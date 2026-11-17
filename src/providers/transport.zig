@@ -38,6 +38,7 @@ pub fn openConnection(
         .plain => 80,
         .tls => 443,
     };
+    if (protocol == .tls) try ensureCaBundle(client);
 
     const connection = try client.connectTcpOptions(.{
         .host = host,
@@ -47,6 +48,32 @@ pub fn openConnection(
     });
     applyIdleTimeout(connection, limits.idle_s);
     return connection;
+}
+
+/// Load the system root certificates once per client. `Client.request` does
+/// this itself, but `connectTcpOptions` does not, and its TLS handshake
+/// unwraps `client.now`: a fresh client would panic on the first HTTPS
+/// connection. Mirrors the std 0.16 `Client.request` block.
+fn ensureCaBundle(client: *std.http.Client) !void {
+    if (std.http.Client.disable_tls) return;
+    const io = client.io;
+    {
+        try client.ca_bundle_lock.lockShared(io);
+        defer client.ca_bundle_lock.unlockShared(io);
+        if (client.now != null) return;
+    }
+    var bundle: std.crypto.Certificate.Bundle = .empty;
+    defer bundle.deinit(client.allocator);
+    const now = std.Io.Clock.real.now(io);
+    bundle.rescan(client.allocator, io, now) catch |err| switch (err) {
+        error.Canceled => |e| return e,
+        else => return error.CertificateBundleLoadFailure,
+    };
+    try client.ca_bundle_lock.lock(io);
+    defer client.ca_bundle_lock.unlock(io);
+    if (client.now != null) return;
+    client.now = now;
+    std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &bundle);
 }
 
 fn timeoutFromSeconds(seconds: u32) std.Io.Timeout {
@@ -326,4 +353,15 @@ test "transport error classification" {
     const failure = failureFor(error.ConnectionRefused, null);
     try std.testing.expectEqual(core_types.ProviderFailureKind.network, failure.kind);
     try std.testing.expectEqualStrings("ConnectionRefused", failure.message);
+}
+
+test "ensureCaBundle loads roots once so connectTcpOptions can do TLS" {
+    if (std.http.Client.disable_tls) return error.SkipZigTest;
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    try std.testing.expect(client.now == null);
+    try ensureCaBundle(&client);
+    const first = client.now.?;
+    try ensureCaBundle(&client);
+    try std.testing.expectEqual(first.nanoseconds, client.now.?.nanoseconds);
 }
