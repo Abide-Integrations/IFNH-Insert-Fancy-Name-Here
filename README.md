@@ -11,7 +11,7 @@ llama.cpp, vLLM, OpenRouter) through `model.base_url`.
 
 ## Status: 0.1.x, pre-1.0
 
-Version 0.1.7 is feature-complete for the planned scope (phases A-F of
+Version 0.1.8 is feature-complete for the planned scope (phases A-F of
 [ACTIVE_PLAN.md](ACTIVE_PLAN.md)), but it is not a stable 1.0:
 
 - Interfaces, config keys and on-disk formats may still move before 1.0.
@@ -131,7 +131,7 @@ tools here because none were run.
 | [docs/USAGE.md](docs/USAGE.md) | Usage guide: REPL, `ifnh ask`, configuration, tools, MCP, skills, hooks, sandbox, server mode, embedding, distribution |
 | [docs/config.schema.json](docs/config.schema.json) | JSON Schema for configuration (also `ifnh config schema`) |
 | [docs/adr/](docs/adr/) | Architecture decision records |
-| [CHANGELOG.md](CHANGELOG.md) | What the 0.1.7 release contains |
+| [CHANGELOG.md](CHANGELOG.md) | What the 0.1.8 release contains |
 | [ACTIVE_PLAN.md](ACTIVE_PLAN.md) | Work queue, verification status, known residuals |
 | [PLAN.md](PLAN.md) | Product philosophy, constraints, decision ledger |
 | [DECISIONS.md](DECISIONS.md) | Resolved discovery backlog (Q1-Q310) and meta-decisions |

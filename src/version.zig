@@ -5,7 +5,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 
-pub const version = "0.1.7";
+pub const version = "0.1.8";
 
 pub const user_agent = "ifnh/" ++ version;
 
